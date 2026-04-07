@@ -7,6 +7,8 @@
 #include "video/out/vo.h"
 #include "video/out/starfish/starfish_ctx.h"
 
+#include <stdlib.h>
+
 struct priv {
     struct mp_image *next_image;
     struct mp_hwdec_ctx hwctx;
@@ -27,8 +29,12 @@ static int preinit(struct vo *vo)
         .hw_imgfmt = IMGFMT_STARFISH,
         .conversion_config = p->ctx,
     };
-    if (vo->opts->WinID > 0)
+    const char *window_id = getenv("STARFISH_WINDOW_ID");
+    if (window_id && window_id[0]) {
+        starfish_ctx_set_window_id(p->ctx, window_id);
+    } else if (vo->opts->WinID > 0) {
         starfish_ctx_set_numeric_window_id(p->ctx, vo->opts->WinID);
+    }
     hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
     starfish_ctx_set_current(p->ctx);
     return 0;
