@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include <glib.h>
 #include <appswitching-control-block/AcbAPI.h>
 #include <player-factory/custompipeline.hpp>
 #include <player-factory/customplayer.hpp>
@@ -146,6 +147,7 @@ static bool ensure_media(struct starfish_ctx *ctx)
     if (ctx->media)
         return true;
     ctx->media = std::make_unique<StarfishMediaAPIs>();
+    ctx->media->setExternalContext(g_main_context_default());
     return !!ctx->media;
 }
 
@@ -181,7 +183,7 @@ static int maybe_start_load(struct starfish_ctx *ctx)
         if (ctx->loaded)
             return STARFISH_FEED_OK;
         if (ctx->load_requested)
-            return STARFISH_FEED_AGAIN;
+            return STARFISH_FEED_OK;
         if (ctx->video_codec.empty() || ctx->width <= 0 || ctx->height <= 0) {
             mp_err(ctx->log, "Starfish video pipeline not configured yet\n");
             return STARFISH_FEED_ERROR;
@@ -211,10 +213,17 @@ static int maybe_start_load(struct starfish_ctx *ctx)
         ctx->ready_frames.clear();
     }
 
+    mp_info(ctx->log, "Starting Starfish load: video=%s audio=%s size=%dx%d fps=%d/%d window=%s\n",
+            params.video_codec ? params.video_codec : "(none)",
+            params.audio_codec ? params.audio_codec : "(none)",
+            params.width, params.height, params.fps_num, params.fps_den,
+            have_window ? params.window_id : "(acb)");
+
     if (!ctx->media->notifyForeground())
         mp_warn(ctx->log, "Starfish notifyForeground failed\n");
 
     std::string payload = starfish_json_build_load(&params);
+    mp_verbose(ctx->log, "Starfish Load payload: %s\n", payload.c_str());
     if (!ctx->media->Load(payload.c_str(), &player_callback, ctx)) {
         std::lock_guard<std::mutex> lock(ctx->lock);
         ctx->load_requested = false;
@@ -222,7 +231,7 @@ static int maybe_start_load(struct starfish_ctx *ctx)
         return STARFISH_FEED_ERROR;
     }
 
-    return STARFISH_FEED_AGAIN;
+    return STARFISH_FEED_OK;
 }
 
 static void player_callback(int32_t type, int64_t numValue, const char *strValue, void *opaque)
@@ -230,6 +239,9 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
     struct starfish_ctx *ctx = static_cast<struct starfish_ctx *>(opaque);
     bool wake_video = false;
     bool wake_audio = false;
+
+    mp_info(ctx->log, "Starfish callback type=%d num=%" PRId64 " str=%s\n",
+            type, numValue, strValue ? strValue : "");
 
     switch (type) {
     case PF_EVENT_TYPE_FRAMEREADY: {
@@ -354,8 +366,10 @@ void starfish_ctx_unref(struct starfish_ctx *ctx)
         return;
     if (ctx->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
-    if (ctx->media)
+    if (ctx->media) {
+        ctx->media->unsetExternalContext();
         ctx->media->Unload();
+    }
     if (ctx->acb_id) {
         if (ctx->acb_initialized)
             AcbAPI_finalize(ctx->acb_id);
@@ -438,6 +452,22 @@ bool starfish_ctx_set_video_geometry(struct starfish_ctx *ctx, int width, int he
     return true;
 }
 
+bool starfish_ctx_set_display_window(struct starfish_ctx *ctx,
+                                     int src_x, int src_y, int src_w, int src_h,
+                                     int dst_x, int dst_y, int dst_w, int dst_h)
+{
+    std::lock_guard<std::mutex> lock(ctx->lock);
+    if (!ctx->window_id.empty())
+        return true;
+    if (!ensure_acb(ctx))
+        return false;
+
+    return AcbAPI_setCustomDisplayWindow(ctx->acb_id,
+                                         src_x, src_y, src_w, src_h,
+                                         dst_x, dst_y, dst_w, dst_h,
+                                         false, &ctx->acb_task_id);
+}
+
 bool starfish_ctx_configure_video(struct starfish_ctx *ctx,
                                   const struct mp_codec_params *codec)
 {
@@ -487,6 +517,8 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data, size_t s
     const int64_t pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
     std::string payload = starfish_json_build_feed(STARFISH_STREAM_VIDEO, data, size, pts_ns);
     std::string result = ctx->media->Feed(payload.c_str());
+    mp_info(ctx->log, "Starfish video feed: size=%zu pts=%" PRId64 " result=%s\n",
+            size, pts_ns, result.c_str());
     if (result.find("Ok") != std::string::npos)
         return STARFISH_FEED_OK;
     if (result.find("BufferFull") != std::string::npos)
@@ -505,6 +537,8 @@ int starfish_ctx_feed_audio(struct starfish_ctx *ctx, const void *data, size_t s
 
     std::string payload = starfish_json_build_feed(STARFISH_STREAM_AUDIO, data, size, pts_ns);
     std::string result = ctx->media->Feed(payload.c_str());
+    mp_info(ctx->log, "Starfish audio feed: size=%zu pts=%" PRId64 " result=%s\n",
+            size, pts_ns, result.c_str());
     if (result.find("Ok") != std::string::npos)
         return STARFISH_FEED_OK;
     if (result.find("BufferFull") != std::string::npos)

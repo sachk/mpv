@@ -175,6 +175,8 @@ static bool feed_pending(struct mp_filter *f)
     }
 
     int r = starfish_ctx_feed_video(p->ctx, data, size, p->pending->pts);
+    MP_INFO(p, "vd_starfish feed_pending size=%zu pts=%f status=%d\n",
+            size, p->pending->pts, r);
     if (r == STARFISH_FEED_OK) {
         clear_pending(p);
         return true;
@@ -208,6 +210,8 @@ static void process_input(struct mp_filter *f)
     }
 
     p->pending = frame.data;
+    MP_INFO(p, "vd_starfish queued packet size=%zu pts=%f dts=%f\n",
+            p->pending->len, p->pending->pts, p->pending->dts);
 }
 
 static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg)
@@ -261,7 +265,9 @@ static void vd_starfish_destroy(struct mp_filter *f)
 
 static void wake_decoder(void *opaque)
 {
-    mp_filter_wakeup(opaque);
+    struct mp_filter *f = opaque;
+    MP_INFO(f, "vd_starfish wake_decoder\n");
+    mp_filter_wakeup(f);
 }
 
 static const struct mp_filter_info vd_starfish_filter = {
@@ -298,6 +304,8 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->public.control = control;
 
     starfish_ctx_set_wakeup_cb(p->ctx, STARFISH_STREAM_VIDEO, wake_decoder, vd);
+    MP_INFO(vd, "vd_starfish create codec=%s decoder=%s\n",
+            codec->codec ? codec->codec : "(null)", decoder ? decoder : "(null)");
     if (!starfish_ctx_configure_video(p->ctx, codec)) {
         talloc_free(vd);
         return NULL;

@@ -75,6 +75,8 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct priv *p = vo->priv;
     starfish_ctx_set_video_geometry(p->ctx, params->w, params->h, 0);
+    starfish_ctx_set_display_window(p->ctx, 0, 0, params->w, params->h,
+                                    0, 0, params->w, params->h);
     return 0;
 }
 
