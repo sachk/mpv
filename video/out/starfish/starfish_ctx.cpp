@@ -16,6 +16,7 @@
 #include <starfish-media-pipeline/StarfishMediaAPIs.h>
 
 extern "C" {
+#define _Atomic
 #include <libavcodec/avcodec.h>
 
 #include "audio/chmap.h"
@@ -26,6 +27,7 @@ extern "C" {
 #include "demux/stheader.h"
 #include "mpv_talloc.h"
 #include "video/hwdec.h"
+#undef _Atomic
 }
 
 #include "starfish_json.h"
@@ -308,12 +310,10 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
         wake_audio = true;
         break;
     case PF_EVENT_TYPE_STR_AUDIO_INFO:
-        if (ctx->acb_id && strValue)
-            AcbAPI_setMediaAudioData(ctx->acb_id, strValue, &ctx->acb_task_id);
         break;
     case PF_EVENT_TYPE_STR_VIDEO_INFO:
         if (ctx->acb_id && strValue)
-            AcbAPI_setMediaVideoData(ctx->acb_id, strValue, &ctx->acb_task_id);
+            AcbAPI_setMediaVideoData(ctx->acb_id, strValue);
         break;
     case PF_EVENT_TYPE_INT_ERROR:
     case PF_EVENT_TYPE_STR_ERROR:
