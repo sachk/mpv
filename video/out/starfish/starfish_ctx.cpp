@@ -513,6 +513,13 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data, size_t s
     int load_status = maybe_start_load(ctx);
     if (load_status != STARFISH_FEED_OK)
         return load_status;
+    {
+        std::lock_guard<std::mutex> lock(ctx->lock);
+        if (!ctx->loaded) {
+            mp_verbose(ctx->log, "Deferring Starfish video feed until load completes\n");
+            return STARFISH_FEED_AGAIN;
+        }
+    }
 
     const int64_t pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
     std::string payload = starfish_json_build_feed(STARFISH_STREAM_VIDEO, data, size, pts_ns);
@@ -534,6 +541,13 @@ int starfish_ctx_feed_audio(struct starfish_ctx *ctx, const void *data, size_t s
     int load_status = maybe_start_load(ctx);
     if (load_status != STARFISH_FEED_OK)
         return load_status;
+    {
+        std::lock_guard<std::mutex> lock(ctx->lock);
+        if (!ctx->loaded) {
+            mp_verbose(ctx->log, "Deferring Starfish audio feed until load completes\n");
+            return STARFISH_FEED_AGAIN;
+        }
+    }
 
     std::string payload = starfish_json_build_feed(STARFISH_STREAM_AUDIO, data, size, pts_ns);
     std::string result = ctx->media->Feed(payload.c_str());
