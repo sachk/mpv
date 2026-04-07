@@ -147,7 +147,6 @@ static bool ensure_media(struct starfish_ctx *ctx)
     if (ctx->media)
         return true;
     ctx->media = std::make_unique<StarfishMediaAPIs>();
-    ctx->media->setExternalContext(g_main_context_default());
     return !!ctx->media;
 }
 
@@ -367,7 +366,6 @@ void starfish_ctx_unref(struct starfish_ctx *ctx)
     if (ctx->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
     if (ctx->media) {
-        ctx->media->unsetExternalContext();
         ctx->media->Unload();
     }
     if (ctx->acb_id) {
