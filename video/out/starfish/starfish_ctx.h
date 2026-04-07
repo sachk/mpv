@@ -9,6 +9,10 @@ struct mp_chmap;
 struct mp_hwdec_ctx;
 struct mp_log;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct starfish_ctx;
 
 enum starfish_stream_type {
@@ -67,3 +71,7 @@ bool starfish_ctx_has_ended(struct starfish_ctx *ctx);
 int starfish_ctx_get_video_width(struct starfish_ctx *ctx);
 int starfish_ctx_get_video_height(struct starfish_ctx *ctx);
 double starfish_ctx_get_video_fps(struct starfish_ctx *ctx);
+
+#ifdef __cplusplus
+}
+#endif

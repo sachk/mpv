@@ -332,6 +332,8 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
         wake_stream(ctx, STARFISH_STREAM_AUDIO);
 }
 
+extern "C" {
+
 struct starfish_ctx *starfish_ctx_create(struct mp_log *log)
 {
     struct starfish_ctx *ctx = new starfish_ctx();
@@ -609,3 +611,5 @@ double starfish_ctx_get_video_fps(struct starfish_ctx *ctx)
     std::lock_guard<std::mutex> lock(ctx->lock);
     return ctx->fps;
 }
+
+} // extern "C"
