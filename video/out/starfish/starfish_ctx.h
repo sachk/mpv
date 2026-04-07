@@ -50,6 +50,9 @@ bool starfish_ctx_set_window_id(struct starfish_ctx *ctx, const char *window_id)
 bool starfish_ctx_set_numeric_window_id(struct starfish_ctx *ctx, int64_t wid);
 bool starfish_ctx_set_video_geometry(struct starfish_ctx *ctx, int width, int height,
                                      double fps);
+bool starfish_ctx_set_display_window(struct starfish_ctx *ctx,
+                                     int src_x, int src_y, int src_w, int src_h,
+                                     int dst_x, int dst_y, int dst_w, int dst_h);
 bool starfish_ctx_configure_video(struct starfish_ctx *ctx,
                                   const struct mp_codec_params *codec);
 bool starfish_ctx_configure_audio_passthrough(struct starfish_ctx *ctx, int format,
