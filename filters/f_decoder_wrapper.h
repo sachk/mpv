@@ -110,6 +110,7 @@ struct mp_decoder_fns {
 };
 
 extern const struct mp_decoder_fns vd_lavc;
+extern const struct mp_decoder_fns vd_starfish;
 extern const struct mp_decoder_fns ad_lavc;
 extern const struct mp_decoder_fns ad_spdif;
 

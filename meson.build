@@ -52,6 +52,12 @@ features = {
     'libplacebo': true,
 }
 
+starfish_deps = []
+starfish_opt = get_option('starfish')
+if not starfish_opt.disabled()
+    add_languages('cpp', required: starfish_opt)
+endif
+
 
 # generic sources
 sources = files(
@@ -495,6 +501,41 @@ if features['android']
                      'osdep/android/strnlen.c',
                      'video/out/android_common.c',
                      'video/out/vo_mediacodec_embed.c')
+endif
+
+if starfish_opt.disabled()
+    features += {'starfish': false}
+else
+    cpp = meson.get_compiler('cpp')
+    starfish_playerapis = dependency('libplayerAPIs', required: false)
+    if not starfish_playerapis.found() and cpp.has_header('starfish-media-pipeline/StarfishMediaAPIs.h')
+        starfish_playerapis = cc.find_library('playerAPIs', required: starfish_opt)
+    endif
+    starfish_playerfactory = dependency('libpf-1.0', required: false)
+    if not starfish_playerfactory.found() and cpp.has_header('player-factory/common.hpp')
+        starfish_playerfactory = cc.find_library('pf-1.0', required: starfish_opt)
+    endif
+    starfish_acb = dependency('libAcbAPI', required: false)
+    if not starfish_acb.found() and cc.has_header('appswitching-control-block/AcbAPI.h')
+        starfish_acb = cc.find_library('AcbAPI', required: starfish_opt)
+    endif
+    starfish_gobject = dependency('gobject-2.0', required: starfish_opt)
+    features += {'starfish': starfish_playerapis.found() and
+                              starfish_playerfactory.found() and
+                              starfish_acb.found() and
+                              starfish_gobject.found()}
+    if features['starfish']
+        starfish_deps = [starfish_playerapis, starfish_playerfactory,
+                         starfish_acb, starfish_gobject]
+        dependencies += starfish_deps
+        sources += files(
+            'audio/out/ao_starfish.c',
+            'video/decode/vd_starfish.c',
+            'video/out/starfish/starfish_ctx.cpp',
+            'video/out/starfish/starfish_json.cpp',
+            'video/out/vo_starfish.c',
+        )
+    endif
 endif
 
 uwp_opt = get_option('uwp').require(
