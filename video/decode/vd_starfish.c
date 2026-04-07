@@ -40,12 +40,15 @@ static struct starfish_ctx *get_ctx(struct mp_filter *parent)
 {
     struct mp_stream_info *info = mp_filter_find_stream_info(parent);
     if (!info || !info->hwdec_devs)
-        return NULL;
+        return starfish_ctx_get_current();
 
     struct mp_hwdec_ctx *hwctx =
         hwdec_devices_get_by_imgfmt_and_type(info->hwdec_devs, IMGFMT_STARFISH,
                                              AV_HWDEVICE_TYPE_NONE);
-    return starfish_ctx_from_hwdec(hwctx);
+    if (hwctx)
+        return starfish_ctx_from_hwdec(hwctx);
+
+    return starfish_ctx_get_current();
 }
 
 static int init_bsf(struct priv *p)

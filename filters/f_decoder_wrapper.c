@@ -46,6 +46,9 @@
 #include "video/out/vo.h"
 #include "video/hwdec.h"
 #include "video/csputils.h"
+#if HAVE_STARFISH
+#include "video/out/starfish/starfish_ctx.h"
+#endif
 
 #include "demux/stheader.h"
 
@@ -441,13 +444,22 @@ static bool reinit_decoder(struct priv *p)
     if (p->codec->type == STREAM_VIDEO) {
         driver = &vd_lavc;
 #if HAVE_STARFISH
+        bool use_starfish = false;
         if (p->stream_info.hwdec_devs &&
             hwdec_devices_get_by_imgfmt_and_type(p->stream_info.hwdec_devs,
                                                  IMGFMT_STARFISH,
                                                  AV_HWDEVICE_TYPE_NONE))
         {
-            driver = &vd_starfish;
+            use_starfish = true;
+        } else {
+            struct starfish_ctx *ctx = starfish_ctx_get_current();
+            if (ctx) {
+                use_starfish = true;
+                starfish_ctx_unref(ctx);
+            }
         }
+        if (use_starfish)
+            driver = &vd_starfish;
 #endif
         user_list = p->opts->video_decoders;
         fallback = "h264";
