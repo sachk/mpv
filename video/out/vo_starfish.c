@@ -27,6 +27,8 @@ static int preinit(struct vo *vo)
         .hw_imgfmt = IMGFMT_STARFISH,
         .conversion_config = p->ctx,
     };
+    if (vo->opts->WinID > 0)
+        starfish_ctx_set_numeric_window_id(p->ctx, vo->opts->WinID);
     hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
     starfish_ctx_set_current(p->ctx);
     return 0;
@@ -55,11 +57,24 @@ static int query_format(struct vo *vo, int format)
 
 static int control(struct vo *vo, uint32_t request, void *data)
 {
-    return VO_NOTIMPL;
+    struct priv *p = vo->priv;
+
+    switch (request) {
+    case VOCTRL_RESET:
+        return starfish_ctx_flush(p->ctx, 0) ? VO_TRUE : VO_ERROR;
+    case VOCTRL_PAUSE:
+        return starfish_ctx_pause(p->ctx) ? VO_TRUE : VO_ERROR;
+    case VOCTRL_RESUME:
+        return starfish_ctx_resume(p->ctx) ? VO_TRUE : VO_ERROR;
+    default:
+        return VO_NOTIMPL;
+    }
 }
 
 static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
+    struct priv *p = vo->priv;
+    starfish_ctx_set_video_geometry(p->ctx, params->w, params->h, 0);
     return 0;
 }
 
