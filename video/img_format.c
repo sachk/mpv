@@ -59,6 +59,12 @@ struct mp_imgfmt_entry {
 
 static const struct mp_imgfmt_entry mp_imgfmt_list[] = {
     // not in ffmpeg
+    [IMGFMT_STARFISH - IMGFMT_CUST_BASE] = {
+        .name = "starfish",
+        .desc = {
+            .flags = MP_IMGFLAG_NE | MP_IMGFLAG_RGB | MP_IMGFLAG_HWACCEL,
+        },
+    },
     [IMGFMT_VDPAU_OUTPUT - IMGFMT_CUST_BASE] = {
         .name = "vdpau_output",
         .desc = {

@@ -282,6 +282,8 @@ enum mp_imgfmt {
     // Some may still map to AV_PIX_FMT_*.
     IMGFMT_CUST_BASE,
 
+    IMGFMT_STARFISH,
+
     // Planar gray/alpha.
     IMGFMT_YAP8,
     IMGFMT_YAP16,
