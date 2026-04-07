@@ -24,6 +24,7 @@
 
 #include <libavutil/buffer.h>
 #include <libavutil/common.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/rational.h>
 
 #include "options/options.h"
@@ -43,6 +44,7 @@
 
 #include "audio/aframe.h"
 #include "video/out/vo.h"
+#include "video/hwdec.h"
 #include "video/csputils.h"
 
 #include "demux/stheader.h"
@@ -408,6 +410,9 @@ static void decf_destroy(struct mp_filter *f)
 struct mp_decoder_list *video_decoder_list(void)
 {
     struct mp_decoder_list *list = talloc_zero(NULL, struct mp_decoder_list);
+#if HAVE_STARFISH
+    vd_starfish.add_decoders(list);
+#endif
     vd_lavc.add_decoders(list);
     return list;
 }
@@ -435,6 +440,15 @@ static bool reinit_decoder(struct priv *p)
 
     if (p->codec->type == STREAM_VIDEO) {
         driver = &vd_lavc;
+#if HAVE_STARFISH
+        if (p->stream_info.hwdec_devs &&
+            hwdec_devices_get_by_imgfmt_and_type(p->stream_info.hwdec_devs,
+                                                 IMGFMT_STARFISH,
+                                                 AV_HWDEVICE_TYPE_NONE))
+        {
+            driver = &vd_starfish;
+        }
+#endif
         user_list = p->opts->video_decoders;
         fallback = "h264";
     } else if (p->codec->type == STREAM_AUDIO) {
