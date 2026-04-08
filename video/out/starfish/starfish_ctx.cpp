@@ -511,19 +511,16 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data, size_t s
     int load_status = maybe_start_load(ctx);
     if (load_status != STARFISH_FEED_OK)
         return load_status;
-    {
-        std::lock_guard<std::mutex> lock(ctx->lock);
-        if (!ctx->loaded) {
-            mp_verbose(ctx->log, "Deferring Starfish video feed until load completes\n");
-            return STARFISH_FEED_AGAIN;
-        }
-    }
 
     const int64_t pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
     std::string payload = starfish_json_build_feed(STARFISH_STREAM_VIDEO, data, size, pts_ns);
     std::string result = ctx->media->Feed(payload.c_str());
     mp_info(ctx->log, "Starfish video feed: size=%zu pts=%" PRId64 " result=%s\n",
             size, pts_ns, result.c_str());
+    if (result.empty()) {
+        mp_warn(ctx->log, "Starfish video Feed returned empty response; continuing\n");
+        return STARFISH_FEED_OK;
+    }
     if (result.find("Ok") != std::string::npos)
         return STARFISH_FEED_OK;
     if (result.find("BufferFull") != std::string::npos)
@@ -539,18 +536,15 @@ int starfish_ctx_feed_audio(struct starfish_ctx *ctx, const void *data, size_t s
     int load_status = maybe_start_load(ctx);
     if (load_status != STARFISH_FEED_OK)
         return load_status;
-    {
-        std::lock_guard<std::mutex> lock(ctx->lock);
-        if (!ctx->loaded) {
-            mp_verbose(ctx->log, "Deferring Starfish audio feed until load completes\n");
-            return STARFISH_FEED_AGAIN;
-        }
-    }
 
     std::string payload = starfish_json_build_feed(STARFISH_STREAM_AUDIO, data, size, pts_ns);
     std::string result = ctx->media->Feed(payload.c_str());
     mp_info(ctx->log, "Starfish audio feed: size=%zu pts=%" PRId64 " result=%s\n",
             size, pts_ns, result.c_str());
+    if (result.empty()) {
+        mp_warn(ctx->log, "Starfish audio Feed returned empty response; continuing\n");
+        return STARFISH_FEED_OK;
+    }
     if (result.find("Ok") != std::string::npos)
         return STARFISH_FEED_OK;
     if (result.find("BufferFull") != std::string::npos)
