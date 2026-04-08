@@ -42,6 +42,8 @@ namespace {
 
 constexpr size_t VIDEO_QUEUE_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_QUEUE_LIMIT = 2 * 1024 * 1024;
+constexpr size_t VIDEO_INFLIGHT_LIMIT = 8 * 1024 * 1024;
+constexpr size_t AUDIO_INFLIGHT_LIMIT = 2 * 1024 * 1024;
 
 enum class pipeline_state {
     IDLE,
@@ -54,7 +56,7 @@ enum class pipeline_state {
 };
 
 struct queued_packet {
-    std::vector<uint8_t> data;
+    std::shared_ptr<std::vector<uint8_t>> data;
     int64_t pts_ns = 0;
 };
 
@@ -150,8 +152,12 @@ struct starfish_ctx {
 
     std::deque<queued_packet> video_queue;
     std::deque<queued_packet> audio_queue;
+    std::deque<queued_packet> video_inflight;
+    std::deque<queued_packet> audio_inflight;
     size_t video_queue_bytes = 0;
     size_t audio_queue_bytes = 0;
+    size_t video_inflight_bytes = 0;
+    size_t audio_inflight_bytes = 0;
     std::deque<struct starfish_video_frame> ready_frames;
 
     starfish_wakeup_cb video_wakeup = nullptr;
@@ -268,26 +274,10 @@ static void update_adaptive_caps(struct starfish_ctx *ctx)
         return;
     }
 
-    int width = 0;
-    int height = 0;
-    int framerate = 0;
-    if (smp::util::getMaxVideoResolution(ctx->video_codec, &width, &height, &framerate) &&
-        width > 0 && height > 0 && framerate > 0) {
-        ctx->adaptive_resolution = true;
-        ctx->max_width = width;
-        ctx->max_height = height;
-        ctx->max_framerate = framerate;
-        mp_info(ctx->log, "Starfish adaptive caps: codec=%s max=%dx%d@%d\n",
-                ctx->video_codec.c_str(), width, height, framerate);
-        return;
-    }
-
-    ctx->adaptive_resolution = ctx->width > 0 && ctx->height > 0 && ctx->fps > 0.0;
-    ctx->max_width = ctx->width;
-    ctx->max_height = ctx->height;
-    ctx->max_framerate = ctx->fps > 0.0 ? (int)(ctx->fps + 0.5) : 0;
-    mp_warn(ctx->log, "Starfish max resolution query failed for codec=%s, using stream size %dx%d@%d\n",
-            ctx->video_codec.c_str(), ctx->max_width, ctx->max_height, ctx->max_framerate);
+    ctx->adaptive_resolution = false;
+    ctx->max_width = 0;
+    ctx->max_height = 0;
+    ctx->max_framerate = 0;
 }
 
 static bool ensure_acb(struct starfish_ctx *ctx)
@@ -369,12 +359,12 @@ static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type 
         ctx->need_segment = false;
     }
 
-    std::string payload = starfish_json_build_feed(stream, packet.data.data(),
-                                                   packet.data.size(), packet.pts_ns);
+    std::string payload = starfish_json_build_feed(stream, packet.data->data(),
+                                                   packet.data->size(), packet.pts_ns);
     std::string result = ctx->media->Feed(payload.c_str());
     mp_info(ctx->log, "Starfish %s feed: size=%zu pts=%" PRId64 " result=%s\n",
             stream == STARFISH_STREAM_VIDEO ? "video" : "audio",
-            packet.data.size(), packet.pts_ns, result.c_str());
+            packet.data->size(), packet.pts_ns, result.c_str());
 
     if (result.find("Ok") != std::string::npos)
         return true;
@@ -405,8 +395,12 @@ static void apply_flush(struct starfish_ctx *ctx)
         std::lock_guard<std::mutex> lock(ctx->lock);
         ctx->video_queue.clear();
         ctx->audio_queue.clear();
+        ctx->video_inflight.clear();
+        ctx->audio_inflight.clear();
         ctx->video_queue_bytes = 0;
         ctx->audio_queue_bytes = 0;
+        ctx->video_inflight_bytes = 0;
+        ctx->audio_inflight_bytes = 0;
         ctx->ready_frames.clear();
         ctx->ended = false;
         ctx->eos_sent = false;
@@ -509,7 +503,14 @@ static void worker_loop(struct starfish_ctx *ctx)
                 bool ok = try_feed_packet(ctx, STARFISH_STREAM_VIDEO, packet, &buffer_full);
                 lock.lock();
                 if (ok) {
-                    ctx->video_queue_bytes -= packet.data.size();
+                    ctx->video_queue_bytes -= packet.data->size();
+                    ctx->video_inflight_bytes += packet.data->size();
+                    ctx->video_inflight.push_back(packet);
+                    while (ctx->video_inflight_bytes > VIDEO_INFLIGHT_LIMIT &&
+                           !ctx->video_inflight.empty()) {
+                        ctx->video_inflight_bytes -= ctx->video_inflight.front().data->size();
+                        ctx->video_inflight.pop_front();
+                    }
                     ctx->video_queue.pop_front();
                     starfish_wakeup_cb cb = ctx->video_wakeup;
                     void *opaque = ctx->video_wakeup_opaque;
@@ -532,7 +533,14 @@ static void worker_loop(struct starfish_ctx *ctx)
                 bool ok = try_feed_packet(ctx, STARFISH_STREAM_AUDIO, packet, &buffer_full);
                 lock.lock();
                 if (ok) {
-                    ctx->audio_queue_bytes -= packet.data.size();
+                    ctx->audio_queue_bytes -= packet.data->size();
+                    ctx->audio_inflight_bytes += packet.data->size();
+                    ctx->audio_inflight.push_back(packet);
+                    while (ctx->audio_inflight_bytes > AUDIO_INFLIGHT_LIMIT &&
+                           !ctx->audio_inflight.empty()) {
+                        ctx->audio_inflight_bytes -= ctx->audio_inflight.front().data->size();
+                        ctx->audio_inflight.pop_front();
+                    }
                     ctx->audio_queue.pop_front();
                     starfish_wakeup_cb cb = ctx->audio_wakeup;
                     void *opaque = ctx->audio_wakeup_opaque;
@@ -638,6 +646,10 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
             ctx->eos_pending = false;
             ctx->need_segment = false;
             ctx->ready_frames.clear();
+            ctx->video_inflight.clear();
+            ctx->audio_inflight.clear();
+            ctx->video_inflight_bytes = 0;
+            ctx->audio_inflight_bytes = 0;
             if (ctx->acb_id) {
                 AcbAPI_setState(ctx->acb_id, APPSTATE_FOREGROUND, PLAYSTATE_UNLOADED,
                                 &ctx->acb_task_id);
@@ -867,7 +879,8 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data, size_t s
         return STARFISH_FEED_AGAIN;
 
     queued_packet packet;
-    packet.data.assign((const uint8_t *)data, (const uint8_t *)data + size);
+    packet.data = std::make_shared<std::vector<uint8_t>>((const uint8_t *)data,
+                                                         (const uint8_t *)data + size);
     packet.pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
     ctx->video_queue_bytes += size;
     ctx->video_queue.push_back(std::move(packet));
@@ -887,7 +900,8 @@ int starfish_ctx_feed_audio(struct starfish_ctx *ctx, const void *data, size_t s
         return STARFISH_FEED_AGAIN;
 
     queued_packet packet;
-    packet.data.assign((const uint8_t *)data, (const uint8_t *)data + size);
+    packet.data = std::make_shared<std::vector<uint8_t>>((const uint8_t *)data,
+                                                         (const uint8_t *)data + size);
     packet.pts_ns = pts_ns;
     ctx->audio_queue_bytes += size;
     ctx->audio_queue.push_back(std::move(packet));
