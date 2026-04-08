@@ -114,8 +114,7 @@ std::string starfish_json_build_load(const struct starfish_json_load_params *par
             << "}";
     }
 
-    out << ""
-        << "}"
+    out << "}"
         << "}"
         << "}]}";
     return out.str();

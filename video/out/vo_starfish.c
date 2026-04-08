@@ -96,6 +96,9 @@ static int resize(struct vo *vo)
     struct priv *p = vo->priv;
     struct vo_wayland_state *wl = vo->wl;
 
+    if (!wl)
+        return VO_TRUE;
+
     const int32_t width = mp_rect_w(wl->geometry);
     const int32_t height = mp_rect_h(wl->geometry);
     if (width <= 0 || height <= 0)
@@ -118,12 +121,14 @@ static int resize(struct vo *vo)
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    const char *window_id = getenv("STARFISH_WINDOW_ID");
+    bool external_window = (window_id && window_id[0]) || vo->opts->WinID > 0;
 
     p->ctx = starfish_ctx_create(vo->log);
     if (!p->ctx)
         return -1;
 
-    if (!vo_wayland_init(vo))
+    if (!external_window && !vo_wayland_init(vo))
         goto err;
 
     vo->hwdec_devs = hwdec_devices_create();
@@ -133,7 +138,6 @@ static int preinit(struct vo *vo)
         .conversion_config = p->ctx,
     };
 
-    const char *window_id = getenv("STARFISH_WINDOW_ID");
     if (window_id && window_id[0]) {
         p->window_ready = true;
         p->window_id = talloc_strdup(NULL, window_id);
@@ -141,7 +145,7 @@ static int preinit(struct vo *vo)
     } else if (vo->opts->WinID > 0) {
         p->window_ready = true;
         starfish_ctx_set_numeric_window_id(p->ctx, vo->opts->WinID);
-    } else if (vo->wl->webos_foreign) {
+    } else if (vo->wl && vo->wl->webos_foreign) {
         p->exported = wl_webos_foreign_export_element(
             vo->wl->webos_foreign, vo->wl->video_surface,
             WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT);
@@ -169,7 +173,8 @@ err:
         starfish_ctx_unref(p->ctx);
         p->ctx = NULL;
     }
-    vo_wayland_uninit(vo);
+    if (vo->wl)
+        vo_wayland_uninit(vo);
     return -1;
 }
 
@@ -214,7 +219,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
     }
 
     int events = 0;
-    int ret = vo_wayland_control(vo, &events, request, data);
+    int ret = vo->wl ? vo_wayland_control(vo, &events, request, data) : VO_NOTIMPL;
     if (events & VO_EVENT_RESIZE)
         ret = resize(vo);
     if (events & VO_EVENT_EXPOSE) {
@@ -229,9 +234,11 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 {
     struct priv *p = vo->priv;
 
-    if (!vo_wayland_reconfig(vo))
+    if (vo->wl && !vo_wayland_reconfig(vo))
         return -1;
     starfish_ctx_set_video_geometry(p->ctx, params->w, params->h, 0);
+    if (!vo->wl)
+        return 0;
     return resize(vo) < 0 ? -1 : 0;
 }
 
@@ -257,7 +264,20 @@ static void uninit(struct vo *vo)
         vo->hwdec_devs = NULL;
     }
     starfish_ctx_unref(p->ctx);
-    vo_wayland_uninit(vo);
+    if (vo->wl)
+        vo_wayland_uninit(vo);
+}
+
+static void wakeup(struct vo *vo)
+{
+    if (vo->wl)
+        vo_wayland_wakeup(vo);
+}
+
+static void wait_events(struct vo *vo, int64_t until_time_ns)
+{
+    if (vo->wl)
+        vo_wayland_wait_events(vo, until_time_ns);
 }
 
 const struct vo_driver video_out_starfish = {
@@ -271,8 +291,8 @@ const struct vo_driver video_out_starfish = {
     .draw_frame = draw_frame,
     .flip_page = flip_page,
     .get_vsync = get_vsync,
-    .wakeup = vo_wayland_wakeup,
-    .wait_events = vo_wayland_wait_events,
+    .wakeup = wakeup,
+    .wait_events = wait_events,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
 };

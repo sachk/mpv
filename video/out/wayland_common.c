@@ -2792,7 +2792,7 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
     int found = 1;
     struct vo_wayland_state *wl = data;
 
-    if (!strcmp(interface, wl_compositor_interface.name) && (ver >= 4) && found++) {
+    if (!strcmp(interface, wl_compositor_interface.name) && (ver >= 1) && found++) {
         ver = MPMIN(ver, 6); /* Cap at 6 in case new events are added later. */
         wl->compositor = wl_registry_bind(reg, id, &wl_compositor_interface, ver);
         wl->surface = wl_compositor_create_surface(wl->compositor);
