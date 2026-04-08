@@ -102,7 +102,19 @@ std::string starfish_json_build_load(const struct starfish_json_load_params *par
         << "\"srcBufferLevelVideo\":{\"minimum\":1048576,\"maximum\":8388608},"
         << "\"qBufferLevelAudio\":0,"
         << "\"srcBufferLevelAudio\":{\"minimum\":1048576,\"maximum\":2097152}"
-        << "}"
+        << "}";
+
+    if (params->adaptive_resolution &&
+        params->max_width > 0 && params->max_height > 0 && params->max_framerate > 0) {
+        out << ",\"adaptiveStreaming\":{"
+            << "\"adaptiveResolution\":true,"
+            << "\"maxWidth\":" << params->max_width << ','
+            << "\"maxHeight\":" << params->max_height << ','
+            << "\"maxFrameRate\":" << params->max_framerate
+            << "}";
+    }
+
+    out << ""
         << "}"
         << "}"
         << "}]}";
