@@ -1,5 +1,6 @@
 #include "starfish_json.h"
 
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 
@@ -79,8 +80,20 @@ std::string starfish_json_build_load(const struct starfish_json_load_params *par
     if (params->need_audio && params->audio_codec && params->audio_codec[0])
         out << ",\"audio\":\"" << json_escape(params->audio_codec) << "\"";
 
-    out << "},"
-        << "\"esInfo\":{"
+    out << "}";
+
+    if (params->need_audio && params->audio_codec && strcmp(params->audio_codec, "AAC") == 0) {
+        out << ",\"aacInfo\":{"
+            << "\"channels\":" << params->audio_channels << ','
+            << "\"profile\":" << (params->audio_profile + 1) << ','
+            << "\"format\":\"" << (params->audio_raw ? "raw" : "adts") << "\","
+            << "\"frequency\":" << std::fixed << std::setprecision(3)
+            << (params->audio_samplerate / 1000.0)
+            << std::defaultfloat
+            << "}";
+    }
+
+    out << ",\"esInfo\":{"
         << "\"pauseAtDecodeTime\":true,"
         << "\"seperatedPTS\":true,"
         << "\"ptsToDecode\":" << params->pts_to_decode_ns << ','

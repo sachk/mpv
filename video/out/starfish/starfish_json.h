@@ -10,6 +10,10 @@ struct starfish_json_load_params {
     const char *window_id;
     const char *video_codec;
     const char *audio_codec;
+    int audio_channels;
+    int audio_profile;
+    int audio_samplerate;
+    bool audio_raw;
     int width;
     int height;
     int fps_num;
