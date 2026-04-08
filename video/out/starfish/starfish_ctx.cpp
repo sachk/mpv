@@ -487,8 +487,7 @@ static void worker_loop(struct starfish_ctx *ctx)
                 continue;
             }
 
-            if (ctx->play_requested &&
-                (ctx->state == pipeline_state::PAUSED || ctx->state == pipeline_state::LOADED)) {
+            if (ctx->play_requested && ctx->state == pipeline_state::PAUSED) {
                 lock.unlock();
                 if (!ctx->media->Play())
                     mp_warn(ctx->log, "Starfish Play failed\n");
@@ -570,10 +569,9 @@ static void worker_loop(struct starfish_ctx *ctx)
         ctx->cv.wait(lock, [&] {
             return ctx->stop || ctx->flush_requested || should_start_load_locked(ctx) ||
                    (is_loaded_state(ctx->state) &&
-                    ((!ctx->video_queue.empty()) || (!ctx->audio_queue.empty()) ||
+                   ((!ctx->video_queue.empty()) || (!ctx->audio_queue.empty()) ||
                      (ctx->eos_pending && !ctx->eos_sent))) ||
-                   (ctx->play_requested && (ctx->state == pipeline_state::PAUSED ||
-                                            ctx->state == pipeline_state::LOADED)) ||
+                   (ctx->play_requested && ctx->state == pipeline_state::PAUSED) ||
                    (!ctx->play_requested && ctx->state == pipeline_state::PLAYING);
         });
     }
