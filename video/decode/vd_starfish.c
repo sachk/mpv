@@ -30,10 +30,17 @@ struct priv {
     AVPacket *avpkt;
     AVPacket *filtered_pkt;
     struct demux_packet *pending;
+    void *submitted_head;
     bool have_filtered;
     bool input_eof;
     bool sent_eof;
     struct mp_decoder public;
+};
+
+struct submitted_buf {
+    struct submitted_buf *next;
+    size_t size;
+    unsigned char data[];
 };
 
 static struct starfish_ctx *get_ctx(struct mp_filter *parent)
@@ -97,6 +104,17 @@ static void clear_pending(struct priv *p)
     p->have_filtered = false;
     if (p->filtered_pkt)
         av_packet_unref(p->filtered_pkt);
+}
+
+static void free_submitted(struct priv *p)
+{
+    struct submitted_buf *buf = p->submitted_head;
+    while (buf) {
+        struct submitted_buf *next = buf->next;
+        talloc_free(buf);
+        buf = next;
+    }
+    p->submitted_head = NULL;
 }
 
 static bool prepare_filtered_packet(struct priv *p)
@@ -174,13 +192,25 @@ static bool feed_pending(struct mp_filter *f)
         size = p->filtered_pkt->size;
     }
 
-    int r = starfish_ctx_feed_video(p->ctx, data, size, p->pending->pts);
+    struct submitted_buf *owned = talloc_size(NULL, sizeof(*owned) + size);
+    if (!owned) {
+        mp_filter_internal_mark_failed(f);
+        return false;
+    }
+    owned->next = NULL;
+    owned->size = size;
+    memcpy(owned->data, data, size);
+
+    int r = starfish_ctx_feed_video(p->ctx, owned->data, size, p->pending->pts);
     MP_INFO(p, "vd_starfish feed_pending size=%zu pts=%f status=%d\n",
             size, p->pending->pts, r);
     if (r == STARFISH_FEED_OK) {
+        owned->next = p->submitted_head;
+        p->submitted_head = owned;
         clear_pending(p);
         return true;
     }
+    talloc_free(owned);
     if (r == STARFISH_FEED_ERROR)
         mp_filter_internal_mark_failed(f);
     return false;
@@ -248,6 +278,7 @@ static void vd_starfish_reset(struct mp_filter *f)
     p->sent_eof = false;
     if (p->bsf)
         av_bsf_flush(p->bsf);
+    free_submitted(p);
     starfish_ctx_flush(p->ctx, 0);
 }
 
@@ -256,6 +287,7 @@ static void vd_starfish_destroy(struct mp_filter *f)
     struct priv *p = f->priv;
 
     clear_pending(p);
+    free_submitted(p);
     av_packet_free(&p->filtered_pkt);
     av_packet_free(&p->avpkt);
     av_bsf_free(&p->bsf);
