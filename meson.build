@@ -1114,15 +1114,21 @@ if features['d3d11']
 endif
 
 wayland = {
-    'deps': [dependency('wayland-client', version: '>= 1.23.0', required: get_option('wayland')),
-             dependency('wayland-cursor', version: '>= 1.23.0', required: get_option('wayland')),
-             dependency('wayland-protocols', version: '>= 1.38', required: get_option('wayland')),
+    'deps': [dependency('wayland-client', version: '>= 1.11.0', required: get_option('wayland')),
+             dependency('wayland-cursor', version: '>= 1.11.0', required: get_option('wayland')),
              dependency('xkbcommon', version: '>= 0.3.0', required: get_option('wayland'))],
-    'header': cc.has_header('linux/input-event-codes.h', required: get_option('wayland'),
-                            # Pass CFLAGS from a related package as a hint for non-Linux
-                            dependencies: dependency('wayland-client', required: get_option('wayland'))),
-    'scanner': find_program('wayland-scanner', version: '>= 1.23.0', required: get_option('wayland')),
+    'scanner': find_program('wayland-scanner', required: get_option('wayland'),
+                            dirs: ['/tmp/webos-sdk/arm-webos-linux-gnueabi_sdk-buildroot/bin',
+                                   '/tmp/webos-sdk/arm-webos-linux-gnueabi_sdk-buildroot/arm-webos-linux-gnueabi/sysroot/usr/bin']),
 }
+wayland += {'header':
+    cc.has_header('linux/input-event-codes.h',
+                  dependencies: wayland['deps'][0], required: false) or
+    cc.has_header('linux/input.h',
+                  dependencies: wayland['deps'][0], required: get_option('wayland'))}
+pkgconf_native = find_program('pkg-config', native: true, required: get_option('wayland'))
+wayland += {'protocol_dir': run_command(pkgconf_native, '--variable=pkgdatadir',
+                                        'wayland-protocols', check: false).stdout().strip()}
 wayland_deps = true
 foreach dep: wayland['deps']
     if not dep.found()
@@ -1130,7 +1136,8 @@ foreach dep: wayland['deps']
         break
     endif
 endforeach
-features += {'wayland': wayland_deps and wayland['header'] and wayland['scanner'].found()}
+features += {'wayland': wayland_deps and wayland['header'] and
+                        wayland['scanner'].found() and wayland['protocol_dir'] != ''}
 
 if features['wayland']
     subdir(join_paths('video', 'out'))

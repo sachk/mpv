@@ -1,4 +1,4 @@
-wl_protocol_dir = wayland['deps'][2].get_variable(pkgconfig: 'pkgdatadir', internal: 'pkgdatadir')
+wl_protocol_dir = wayland['protocol_dir']
 protocols = [[wl_protocol_dir, 'stable/linux-dmabuf/linux-dmabuf-v1.xml'],
              [wl_protocol_dir, 'stable/presentation-time/presentation-time.xml'],
              [wl_protocol_dir, 'stable/viewporter/viewporter.xml'],
@@ -14,12 +14,16 @@ protocols = [[wl_protocol_dir, 'stable/linux-dmabuf/linux-dmabuf-v1.xml'],
              [wl_protocol_dir, 'staging/cursor-shape/cursor-shape-v1.xml'],
              [wl_protocol_dir, 'staging/fifo/fifo-v1.xml']
 ]
+
+if features['starfish']
+    protocols += [[meson.project_source_root() / 'video/out/protocols', 'webos-foreign.xml']]
+endif
 wl_protocols_source = []
 wl_protocols_headers = []
 
 foreach v: ['1.39', '1.41', '1.44', '1.47', '1.48']
     features += {'wayland-protocols-' + v.replace('.', '-'):
-        wayland['deps'][2].version().version_compare('>=' + v)}
+        wl_protocol_dir != ''}
 endforeach
 
 if features['wayland-protocols-1-39']

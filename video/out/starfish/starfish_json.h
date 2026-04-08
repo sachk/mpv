@@ -14,6 +14,10 @@ struct starfish_json_load_params {
     int height;
     int fps_num;
     int fps_den;
+    int max_width;
+    int max_height;
+    int max_framerate;
+    bool adaptive_resolution;
     int64_t pts_to_decode_ns;
     bool need_audio;
 };
