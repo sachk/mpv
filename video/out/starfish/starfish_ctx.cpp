@@ -44,8 +44,6 @@ constexpr size_t VIDEO_QUEUE_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_QUEUE_LIMIT = 2 * 1024 * 1024;
 constexpr size_t VIDEO_INFLIGHT_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_INFLIGHT_LIMIT = 2 * 1024 * 1024;
-constexpr auto AUDIO_CONFIG_GRACE = std::chrono::milliseconds(50);
-
 enum class pipeline_state {
     IDLE,
     WAIT_WINDOW,
@@ -65,6 +63,12 @@ const char *get_app_id()
 {
     const char *app_id = getenv("APPID");
     return app_id && app_id[0] ? app_id : "mpv";
+}
+
+bool env_wants_audio_hint()
+{
+    const char *hint = getenv("STARFISH_AUDIO_HINT");
+    return hint && hint[0] && strcmp(hint, "0") != 0;
 }
 
 const char *video_codec_name(enum AVCodecID codec)
@@ -142,8 +146,6 @@ struct starfish_ctx {
     int max_framerate = 0;
     bool adaptive_resolution = false;
     bool need_audio = false;
-    bool audio_wait_armed = false;
-    std::chrono::steady_clock::time_point audio_wait_deadline;
 
     pipeline_state state = pipeline_state::IDLE;
     bool play_requested = true;
@@ -321,11 +323,8 @@ static bool should_start_load_locked(struct starfish_ctx *ctx)
         return false;
     if (!have_load_config_locked(ctx) || ctx->video_queue.empty())
         return false;
-    if (!ctx->need_audio && ctx->audio_wait_armed &&
-        std::chrono::steady_clock::now() < ctx->audio_wait_deadline)
-    {
+    if (ctx->need_audio && ctx->audio_queue.empty())
         return false;
-    }
     if (!ctx->window_id.empty())
         return true;
     return ensure_acb(ctx);
@@ -741,6 +740,14 @@ struct starfish_ctx *starfish_ctx_create(struct mp_log *log)
 {
     struct starfish_ctx *ctx = new starfish_ctx();
     ctx->log = mp_log_new(nullptr, log, "starfish");
+    if (env_wants_audio_hint()) {
+        ctx->audio_codec = "AAC";
+        ctx->audio_channels = 2;
+        ctx->audio_samplerate = 48000;
+        ctx->audio_profile = AV_PROFILE_AAC_LOW;
+        ctx->audio_raw = true;
+        ctx->need_audio = true;
+    }
     ctx->worker = std::thread(worker_loop, ctx);
     return ctx;
 }
@@ -905,11 +912,12 @@ bool starfish_ctx_configure_audio_passthrough(struct starfish_ctx *ctx, int form
         return false;
 
     std::lock_guard<std::mutex> lock(ctx->lock);
+    if (ctx->audio_codec == name && ctx->need_audio)
+        return true;
     if (ctx->state == pipeline_state::LOADING || is_loaded_state(ctx->state))
         return false;
     ctx->audio_codec = name;
     ctx->need_audio = true;
-    ctx->audio_wait_armed = false;
     return true;
 }
 
@@ -917,6 +925,15 @@ bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx, int channels,
                                       int samplerate, int profile, bool raw)
 {
     std::lock_guard<std::mutex> lock(ctx->lock);
+    if (ctx->audio_codec == "AAC" &&
+        ctx->audio_channels == channels &&
+        ctx->audio_samplerate == samplerate &&
+        ctx->audio_profile == profile &&
+        ctx->audio_raw == raw &&
+        ctx->need_audio)
+    {
+        return true;
+    }
     if (ctx->state == pipeline_state::LOADING || is_loaded_state(ctx->state))
         return false;
     ctx->audio_codec = "AAC";
@@ -925,7 +942,6 @@ bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx, int channels,
     ctx->audio_profile = profile;
     ctx->audio_raw = raw;
     ctx->need_audio = true;
-    ctx->audio_wait_armed = false;
     return true;
 }
 
@@ -944,10 +960,6 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data, size_t s
     packet.data = std::make_shared<std::vector<uint8_t>>((const uint8_t *)data,
                                                          (const uint8_t *)data + size);
     packet.pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
-    if (ctx->video_queue.empty() && !ctx->need_audio) {
-        ctx->audio_wait_armed = true;
-        ctx->audio_wait_deadline = std::chrono::steady_clock::now() + AUDIO_CONFIG_GRACE;
-    }
     ctx->video_queue_bytes += size;
     ctx->video_queue.push_back(std::move(packet));
     if (ctx->window_id.empty() && !ctx->acb_id)
