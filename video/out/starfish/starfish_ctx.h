@@ -39,6 +39,8 @@ struct starfish_video_frame {
 };
 
 typedef void (*starfish_wakeup_cb)(void *opaque);
+typedef void (*starfish_overlay_present_cb)(void *opaque, const uint8_t *pixels,
+                                            int width, int height, int stride);
 
 STARFISH_CTX_API struct starfish_ctx *starfish_ctx_create(struct mp_log *log);
 STARFISH_CTX_API struct starfish_ctx *starfish_ctx_retain(struct starfish_ctx *ctx);
@@ -48,6 +50,8 @@ STARFISH_CTX_API struct starfish_ctx *starfish_ctx_from_hwdec(struct mp_hwdec_ct
 
 STARFISH_CTX_API bool starfish_ctx_set_current(struct starfish_ctx *ctx);
 STARFISH_CTX_API struct starfish_ctx *starfish_ctx_get_current(void);
+STARFISH_CTX_API void starfish_overlay_set_present_cb(starfish_overlay_present_cb cb,
+                                                      void *opaque);
 
 STARFISH_CTX_API void starfish_ctx_set_wakeup_cb(struct starfish_ctx *ctx,
                                                  enum starfish_stream_type stream,
