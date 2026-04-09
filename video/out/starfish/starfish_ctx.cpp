@@ -44,6 +44,7 @@ constexpr size_t VIDEO_QUEUE_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_QUEUE_LIMIT = 2 * 1024 * 1024;
 constexpr size_t VIDEO_INFLIGHT_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_INFLIGHT_LIMIT = 2 * 1024 * 1024;
+constexpr auto AUDIO_CONFIG_GRACE = std::chrono::milliseconds(500);
 
 enum class pipeline_state {
     IDLE,
@@ -141,6 +142,8 @@ struct starfish_ctx {
     int max_framerate = 0;
     bool adaptive_resolution = false;
     bool need_audio = false;
+    bool audio_wait_armed = false;
+    std::chrono::steady_clock::time_point audio_wait_deadline;
 
     pipeline_state state = pipeline_state::IDLE;
     bool play_requested = true;
@@ -318,6 +321,11 @@ static bool should_start_load_locked(struct starfish_ctx *ctx)
         return false;
     if (!have_load_config_locked(ctx) || ctx->video_queue.empty())
         return false;
+    if (!ctx->need_audio && ctx->audio_wait_armed &&
+        std::chrono::steady_clock::now() < ctx->audio_wait_deadline)
+    {
+        return false;
+    }
     if (!ctx->window_id.empty())
         return true;
     return ensure_acb(ctx);
@@ -901,6 +909,7 @@ bool starfish_ctx_configure_audio_passthrough(struct starfish_ctx *ctx, int form
         return false;
     ctx->audio_codec = name;
     ctx->need_audio = true;
+    ctx->audio_wait_armed = false;
     return true;
 }
 
@@ -916,6 +925,7 @@ bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx, int channels,
     ctx->audio_profile = profile;
     ctx->audio_raw = raw;
     ctx->need_audio = true;
+    ctx->audio_wait_armed = false;
     return true;
 }
 
@@ -934,6 +944,10 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data, size_t s
     packet.data = std::make_shared<std::vector<uint8_t>>((const uint8_t *)data,
                                                          (const uint8_t *)data + size);
     packet.pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
+    if (ctx->video_queue.empty() && !ctx->need_audio) {
+        ctx->audio_wait_armed = true;
+        ctx->audio_wait_deadline = std::chrono::steady_clock::now() + AUDIO_CONFIG_GRACE;
+    }
     ctx->video_queue_bytes += size;
     ctx->video_queue.push_back(std::move(packet));
     if (ctx->window_id.empty() && !ctx->acb_id)
