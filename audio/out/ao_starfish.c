@@ -2,6 +2,7 @@
  * This file is part of mpv.
  */
 
+#include <inttypes.h>
 #include <stdbool.h>
 
 #include <libavcodec/avcodec.h>
@@ -27,8 +28,15 @@ struct priv {
     bool playing;
     double last_time;
     double buffered;
+    int latency_samples;
+    int outburst;
     int64_t written_samples;
+    bool primed;
+    bool logged_write;
 };
+
+#define STARFISH_AUDIO_TARGET_LATENCY_SEC 1.0
+#define STARFISH_AUDIO_BUFFER_SEC 3.0
 
 static void uninit(struct ao *ao);
 
@@ -72,6 +80,11 @@ static bool feed_encoded_packet(struct ao *ao, const uint8_t *data, size_t size,
 
     for (int tries = 0; tries < 10; tries++) {
         int r = starfish_ctx_feed_audio(p->ctx, data, size, pts_ns);
+        if (tries == 0 || r != STARFISH_FEED_AGAIN) {
+            MP_INFO(ao, "ao_starfish feed_encoded_packet ctx=%p size=%zu pts=%" PRId64
+                    " try=%d result=%d\n",
+                    p->ctx, size, pts_ns, tries + 1, r);
+        }
         if (r == STARFISH_FEED_OK)
             return true;
         if (r == STARFISH_FEED_ERROR)
@@ -141,6 +154,8 @@ static bool encode_pending_audio(struct ao *ao, bool flush_tail)
             if (p->packet->pts != AV_NOPTS_VALUE)
                 pts_ns = av_rescale_q(p->packet->pts, p->encoder->time_base,
                                       (AVRational){1, 1000000000});
+            if (pts_ns < 0)
+                pts_ns = 0;
 
             if (!feed_encoded_packet(ao, p->packet->data, p->packet->size, pts_ns)) {
                 av_packet_unref(p->packet);
@@ -156,6 +171,68 @@ static bool encode_pending_audio(struct ao *ao, bool flush_tail)
     return true;
 }
 
+static int encode_silence_frame(struct ao *ao, int samples)
+{
+    struct priv *p = ao->priv;
+    int packets = 0;
+
+    AVFrame *frame = av_frame_alloc();
+    if (!frame)
+        return -1;
+
+    frame->nb_samples = samples;
+    frame->format = p->encoder->sample_fmt;
+    frame->sample_rate = p->encoder->sample_rate;
+    if (av_channel_layout_copy(&frame->ch_layout, &p->encoder->ch_layout) < 0) {
+        av_frame_free(&frame);
+        return -1;
+    }
+    if (av_frame_get_buffer(frame, 0) < 0 || av_frame_make_writable(frame) < 0) {
+        av_frame_free(&frame);
+        return -1;
+    }
+
+    av_samples_set_silence(frame->extended_data, 0, samples,
+                           p->encoder->ch_layout.nb_channels,
+                           p->encoder->sample_fmt);
+
+    frame->pts = p->written_samples;
+    p->written_samples += samples;
+
+    if (avcodec_send_frame(p->encoder, frame) < 0) {
+        av_frame_free(&frame);
+        return -1;
+    }
+    av_frame_free(&frame);
+
+    for (;;) {
+        int ret = avcodec_receive_packet(p->encoder, p->packet);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            break;
+        if (ret < 0)
+            return -1;
+
+        int64_t pts_ns = 0;
+        if (p->packet->pts != AV_NOPTS_VALUE)
+            pts_ns = av_rescale_q(p->packet->pts, p->encoder->time_base,
+                                  (AVRational){1, 1000000000});
+        if (pts_ns < 0)
+            pts_ns = 0;
+
+        if (!feed_encoded_packet(ao, p->packet->data, p->packet->size, pts_ns)) {
+            av_packet_unref(p->packet);
+            return -1;
+        }
+
+        drain(ao);
+        p->buffered += samples;
+        packets++;
+        av_packet_unref(p->packet);
+    }
+
+    return packets;
+}
+
 static int init(struct ao *ao)
 {
     struct priv *p = ao->priv;
@@ -168,6 +245,7 @@ static int init(struct ao *ao)
         MP_VERBOSE(ao, "No active Starfish context\n");
         return -1;
     }
+    MP_INFO(ao, "ao_starfish init ctx=%p\n", p->ctx);
 
     if (!codec) {
         MP_VERBOSE(ao, "AAC encoder is not available\n");
@@ -210,8 +288,10 @@ static int init(struct ao *ao)
     }
 
     p->frame_samples = p->encoder->frame_size > 0 ? p->encoder->frame_size : 1024;
+    p->outburst = p->frame_samples;
+    p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
     p->fifo = av_audio_fifo_alloc(p->encoder->sample_fmt, p->encoder->ch_layout.nb_channels,
-                                  p->frame_samples * 4);
+                                  ao->samplerate * STARFISH_AUDIO_BUFFER_SEC);
     if (!p->fifo) {
         MP_ERR(ao, "Failed to allocate AAC FIFO\n");
         uninit(ao);
@@ -225,9 +305,36 @@ static int init(struct ao *ao)
         return -1;
     }
 
+    MP_INFO(ao, "ao_starfish init samplerate=%d channels=%d frame_samples=%d\n",
+            ao->samplerate, ao->channels.num, p->frame_samples);
     starfish_ctx_set_wakeup_cb(p->ctx, STARFISH_STREAM_AUDIO, wake_ao, ao);
-    ao->device_buffer = ao->samplerate / 4;
+    if (!p->primed) {
+        p->primed = true;
+        int primed_packets = 0;
+        int primed_frames = 0;
+        for (int n = 0; n < 4; n++) {
+            int ret = encode_silence_frame(ao, p->frame_samples);
+            if (ret < 0) {
+                MP_WARN(ao, "Failed to pre-prime Starfish audio with AAC silence\n");
+                break;
+            }
+            primed_frames++;
+            primed_packets += ret;
+        }
+        if (primed_packets > 0) {
+            MP_INFO(ao,
+                    "Pre-primed Starfish audio with %d silent samples across %d frames (%d packets)\n",
+                    primed_frames * p->frame_samples, primed_frames, primed_packets);
+        } else {
+            MP_WARN(ao, "AAC prime produced no output packets after %d silent frames\n",
+                    primed_frames);
+        }
+    }
+    ao->device_buffer = p->latency_samples +
+                        ao->samplerate * STARFISH_AUDIO_BUFFER_SEC;
     p->last_time = mp_time_sec();
+    MP_INFO(ao, "ao_starfish buffering latency=%d device_buffer=%d\n",
+            p->latency_samples, ao->device_buffer);
     return 0;
 }
 
@@ -262,6 +369,8 @@ static void reset(struct ao *ao)
     p->playing = false;
     p->buffered = 0;
     p->written_samples = 0;
+    p->primed = false;
+    p->logged_write = false;
     if (p->fifo)
         av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
     if (p->encoder)
@@ -277,6 +386,7 @@ static void start(struct ao *ao)
     p->paused = false;
     p->playing = true;
     p->last_time = mp_time_sec();
+    MP_INFO(ao, "ao_starfish start\n");
     if (p->ctx)
         starfish_ctx_resume(p->ctx);
 }
@@ -299,21 +409,37 @@ static bool set_pause(struct ao *ao, bool paused)
 static bool audio_write(struct ao *ao, void **data, int samples)
 {
     struct priv *p = ao->priv;
+    if (!p->logged_write) {
+        MP_INFO(ao, "ao_starfish first write samples=%d\n", samples);
+        p->logged_write = true;
+    }
     if (av_audio_fifo_realloc(p->fifo, av_audio_fifo_size(p->fifo) + samples) < 0)
         return false;
     if (av_audio_fifo_write(p->fifo, data, samples) < samples)
         return false;
-    return encode_pending_audio(ao, false);
+    if (!encode_pending_audio(ao, false))
+        return false;
+    if (p->buffered <= 0)
+        p->buffered = p->latency_samples;
+    return true;
 }
 
 static void get_state(struct ao *ao, struct mp_pcm_state *state)
 {
     struct priv *p = ao->priv;
+    int queued_fifo = p->fifo ? av_audio_fifo_size(p->fifo) : 0;
+    double queued_total;
 
     drain(ao);
-    state->queued_samples = p->buffered;
-    state->free_samples = MPMAX(ao->device_buffer - state->queued_samples, 0);
-    state->delay = p->buffered / ao->samplerate;
+    queued_total = p->buffered + queued_fifo;
+    state->queued_samples = queued_total;
+    state->free_samples = MPMAX(ao->device_buffer - p->latency_samples -
+                                state->queued_samples, 0);
+    state->free_samples = state->free_samples / p->outburst * p->outburst;
+    state->delay = queued_total;
+    if (state->delay < p->latency_samples)
+        state->delay = p->latency_samples;
+    state->delay /= ao->samplerate;
     state->playing = p->playing && p->buffered > 0;
 }
 
