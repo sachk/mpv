@@ -123,8 +123,11 @@ struct starfish_ctx {
     std::atomic<int> refs{1};
     struct mp_log *log = nullptr;
     std::mutex lock;
+    std::mutex media_lock;
     std::condition_variable cv;
     std::thread worker;
+    std::thread video_worker;
+    std::thread audio_worker;
     bool stop = false;
 
     std::unique_ptr<StarfishMediaAPIs> media;
@@ -183,6 +186,8 @@ static struct starfish_ctx *g_current_ctx;
 static void player_callback(int32_t type, int64_t numValue, const char *strValue,
                             void *opaque);
 static void worker_loop(struct starfish_ctx *ctx);
+static void video_worker_loop(struct starfish_ctx *ctx);
+static void audio_worker_loop(struct starfish_ctx *ctx);
 
 static const char *event_name(int32_t type)
 {
@@ -323,7 +328,7 @@ static bool should_start_load_locked(struct starfish_ctx *ctx)
         return false;
     if (!have_load_config_locked(ctx) || ctx->video_queue.empty())
         return false;
-    if (ctx->need_audio && ctx->audio_queue.empty())
+    if (ctx->need_audio && ctx->audio_codec.empty())
         return false;
     if (!ctx->window_id.empty())
         return true;
@@ -357,9 +362,12 @@ static bool set_time_to_decode(struct starfish_ctx *ctx, int64_t pts_ns)
 }
 
 static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type stream,
-                            const queued_packet &packet, bool *buffer_full)
+                            const queued_packet &packet, bool send_segment,
+                            bool *buffer_full)
 {
-    if (stream == STARFISH_STREAM_VIDEO && ctx->need_segment) {
+    std::lock_guard<std::mutex> media_lock(ctx->media_lock);
+
+    if (stream == STARFISH_STREAM_VIDEO && send_segment) {
         set_time_to_decode(ctx, packet.pts_ns);
         auto *player = static_cast<mediapipeline::CustomPlayer *>(ctx->media->player.get());
         auto *pipeline =
@@ -367,7 +375,6 @@ static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type 
                    : nullptr;
         if (pipeline)
             pipeline->sendSegmentEvent();
-        ctx->need_segment = false;
     }
 
     std::string payload = starfish_json_build_feed(stream, packet.data->data(),
@@ -391,64 +398,71 @@ static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type 
     return false;
 }
 
-enum class feed_attempt_result {
-    NO_PACKET,
-    SUBMITTED,
-    BLOCKED,
-};
-
-static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
-                                            std::unique_lock<std::mutex> &lock,
-                                            enum starfish_stream_type stream)
+static void stream_worker_loop(struct starfish_ctx *ctx, enum starfish_stream_type stream)
 {
-    std::deque<queued_packet> *queue = stream == STARFISH_STREAM_VIDEO
-                                       ? &ctx->video_queue
-                                       : &ctx->audio_queue;
-    std::deque<queued_packet> *inflight = stream == STARFISH_STREAM_VIDEO
-                                          ? &ctx->video_inflight
-                                          : &ctx->audio_inflight;
-    size_t *queue_bytes = stream == STARFISH_STREAM_VIDEO
-                          ? &ctx->video_queue_bytes
-                          : &ctx->audio_queue_bytes;
-    size_t *inflight_bytes = stream == STARFISH_STREAM_VIDEO
-                             ? &ctx->video_inflight_bytes
-                             : &ctx->audio_inflight_bytes;
-    const size_t inflight_limit = stream == STARFISH_STREAM_VIDEO
-                                  ? VIDEO_INFLIGHT_LIMIT
-                                  : AUDIO_INFLIGHT_LIMIT;
-    starfish_wakeup_cb cb = stream == STARFISH_STREAM_VIDEO
-                            ? ctx->video_wakeup
-                            : ctx->audio_wakeup;
-    void *opaque = stream == STARFISH_STREAM_VIDEO
-                   ? ctx->video_wakeup_opaque
-                   : ctx->audio_wakeup_opaque;
+    auto *queue = stream == STARFISH_STREAM_VIDEO ? &ctx->video_queue : &ctx->audio_queue;
+    auto *inflight = stream == STARFISH_STREAM_VIDEO ? &ctx->video_inflight : &ctx->audio_inflight;
+    auto *queue_bytes =
+        stream == STARFISH_STREAM_VIDEO ? &ctx->video_queue_bytes : &ctx->audio_queue_bytes;
+    auto *inflight_bytes = stream == STARFISH_STREAM_VIDEO ? &ctx->video_inflight_bytes
+                                                           : &ctx->audio_inflight_bytes;
+    const size_t inflight_limit =
+        stream == STARFISH_STREAM_VIDEO ? VIDEO_INFLIGHT_LIMIT : AUDIO_INFLIGHT_LIMIT;
 
-    if (queue->empty())
-        return feed_attempt_result::NO_PACKET;
+    std::unique_lock<std::mutex> lock(ctx->lock);
+    while (!ctx->stop) {
+        ctx->cv.wait(lock, [&] {
+            return ctx->stop || ctx->flush_requested || ctx->state == pipeline_state::FAILED ||
+                   (is_loaded_state(ctx->state) && !queue->empty());
+        });
 
-    queued_packet packet = queue->front();
-    lock.unlock();
-    bool buffer_full = false;
-    bool ok = try_feed_packet(ctx, stream, packet, &buffer_full);
-    lock.lock();
+        if (ctx->stop)
+            break;
+        if (ctx->flush_requested || ctx->state == pipeline_state::FAILED)
+            continue;
+        if (!is_loaded_state(ctx->state) || queue->empty())
+            continue;
 
-    if (ok) {
-        *queue_bytes -= packet.data->size();
-        *inflight_bytes += packet.data->size();
-        inflight->push_back(packet);
-        while (*inflight_bytes > inflight_limit && !inflight->empty()) {
-            *inflight_bytes -= inflight->front().data->size();
-            inflight->pop_front();
+        queued_packet packet = queue->front();
+        bool send_segment = false;
+        if (stream == STARFISH_STREAM_VIDEO && ctx->need_segment) {
+            ctx->need_segment = false;
+            send_segment = true;
         }
-        queue->pop_front();
-        lock.unlock();
-        if (cb)
-            cb(opaque);
-        lock.lock();
-        return feed_attempt_result::SUBMITTED;
-    }
+        starfish_wakeup_cb cb = stream == STARFISH_STREAM_VIDEO ? ctx->video_wakeup
+                                                                : ctx->audio_wakeup;
+        void *opaque = stream == STARFISH_STREAM_VIDEO ? ctx->video_wakeup_opaque
+                                                       : ctx->audio_wakeup_opaque;
 
-    return feed_attempt_result::BLOCKED;
+        lock.unlock();
+        bool buffer_full = false;
+        bool ok = try_feed_packet(ctx, stream, packet, send_segment, &buffer_full);
+        lock.lock();
+
+        if (ctx->flush_requested || ctx->stop)
+            continue;
+
+        if (ok) {
+            *queue_bytes -= packet.data->size();
+            *inflight_bytes += packet.data->size();
+            inflight->push_back(packet);
+            while (*inflight_bytes > inflight_limit && !inflight->empty()) {
+                *inflight_bytes -= inflight->front().data->size();
+                inflight->pop_front();
+            }
+            queue->pop_front();
+
+            lock.unlock();
+            if (cb)
+                cb(opaque);
+            lock.lock();
+            continue;
+        }
+
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        lock.lock();
+    }
 }
 
 static void apply_flush(struct starfish_ctx *ctx)
@@ -459,8 +473,11 @@ static void apply_flush(struct starfish_ctx *ctx)
         loaded = is_loaded_state(ctx->state);
     }
 
-    if (loaded && !ctx->media->flush())
-        mp_warn(ctx->log, "Starfish flush() failed\n");
+    if (loaded) {
+        std::lock_guard<std::mutex> media_lock(ctx->media_lock);
+        if (!ctx->media->flush())
+            mp_warn(ctx->log, "Starfish flush() failed\n");
+    }
 
     {
         std::lock_guard<std::mutex> lock(ctx->lock);
@@ -526,6 +543,10 @@ static void worker_loop(struct starfish_ctx *ctx)
                     params.audio_codec ? params.audio_codec : "(none)",
                     params.width, params.height, params.fps_num, params.fps_den,
                     params.window_id ? params.window_id : "(acb)");
+            mp_info(ctx->log,
+                    "Starfish load queues: video_packets=%zu video_bytes=%zu audio_packets=%zu audio_bytes=%zu need_audio=%d\n",
+                    ctx->video_queue.size(), ctx->video_queue_bytes,
+                    ctx->audio_queue.size(), ctx->audio_queue_bytes, ctx->need_audio);
             mp_verbose(ctx->log, "Starfish Load payload: %s\n", payload.c_str());
 
             lock.unlock();
@@ -535,9 +556,13 @@ static void worker_loop(struct starfish_ctx *ctx)
                 wake_all(ctx);
                 continue;
             }
-            if (!ctx->media->notifyForeground())
-                mp_warn(ctx->log, "Starfish notifyForeground failed\n");
-            bool ok = ctx->media->Load(payload.c_str(), &player_callback, ctx);
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> media_lock(ctx->media_lock);
+                if (!ctx->media->notifyForeground())
+                    mp_warn(ctx->log, "Starfish notifyForeground failed\n");
+                ok = ctx->media->Load(payload.c_str(), &player_callback, ctx);
+            }
             mp_info(ctx->log, "Starfish Load returned: %s\n", ok ? "success" : "failure");
             lock.lock();
             if (!ok) {
@@ -556,56 +581,42 @@ static void worker_loop(struct starfish_ctx *ctx)
         if (is_loaded_state(ctx->state)) {
             if (!ctx->play_requested && ctx->state == pipeline_state::PLAYING) {
                 lock.unlock();
-                if (!ctx->media->Pause())
-                    mp_warn(ctx->log, "Starfish Pause failed\n");
+                {
+                    std::lock_guard<std::mutex> media_lock(ctx->media_lock);
+                    if (!ctx->media->Pause())
+                        mp_warn(ctx->log, "Starfish Pause failed\n");
+                }
                 lock.lock();
                 continue;
             }
 
             if (ctx->play_requested && ctx->state == pipeline_state::PAUSED) {
                 lock.unlock();
-                if (!ctx->media->Play())
-                    mp_warn(ctx->log, "Starfish Play failed\n");
+                {
+                    std::lock_guard<std::mutex> media_lock(ctx->media_lock);
+                    if (!ctx->media->Play())
+                        mp_warn(ctx->log, "Starfish Play failed\n");
+                }
                 lock.lock();
                 continue;
             }
 
-            if (!ctx->video_queue.empty() || !ctx->audio_queue.empty()) {
-                const bool have_video = !ctx->video_queue.empty();
-                const bool have_audio = !ctx->audio_queue.empty();
-                const bool prefer_audio =
-                    have_audio &&
-                    (!have_video ||
-                     ctx->audio_queue.front().pts_ns <= ctx->video_queue.front().pts_ns);
-                const enum starfish_stream_type first =
-                    prefer_audio ? STARFISH_STREAM_AUDIO : STARFISH_STREAM_VIDEO;
-                const enum starfish_stream_type second =
-                    prefer_audio ? STARFISH_STREAM_VIDEO : STARFISH_STREAM_AUDIO;
-
-                bool blocked = false;
-                feed_attempt_result result = try_drain_stream(ctx, lock, first);
-                if (result == feed_attempt_result::SUBMITTED)
-                    continue;
-                blocked |= result == feed_attempt_result::BLOCKED;
-
-                result = try_drain_stream(ctx, lock, second);
-                if (result == feed_attempt_result::SUBMITTED)
-                    continue;
-                blocked |= result == feed_attempt_result::BLOCKED;
-
-                if (blocked) {
-                    lock.unlock();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    lock.lock();
+            if (ctx->eos_pending && !ctx->eos_sent) {
+                if (!ctx->video_queue.empty() || !ctx->audio_queue.empty()) {
+                    ctx->cv.wait(lock, [&] {
+                        return ctx->stop || ctx->flush_requested ||
+                               ctx->state == pipeline_state::FAILED ||
+                               (ctx->video_queue.empty() && ctx->audio_queue.empty());
+                    });
                     continue;
                 }
-            }
-
-            if (ctx->eos_pending && !ctx->eos_sent) {
                 ctx->eos_sent = true;
                 lock.unlock();
-                if (!ctx->media->pushEOS())
-                    mp_warn(ctx->log, "Starfish pushEOS failed\n");
+                {
+                    std::lock_guard<std::mutex> media_lock(ctx->media_lock);
+                    if (!ctx->media->pushEOS())
+                        mp_warn(ctx->log, "Starfish pushEOS failed\n");
+                }
                 lock.lock();
                 ctx->eos_pending = false;
                 continue;
@@ -614,13 +625,21 @@ static void worker_loop(struct starfish_ctx *ctx)
 
         ctx->cv.wait(lock, [&] {
             return ctx->stop || ctx->flush_requested || should_start_load_locked(ctx) ||
-                   (is_loaded_state(ctx->state) &&
-                   ((!ctx->video_queue.empty()) || (!ctx->audio_queue.empty()) ||
-                     (ctx->eos_pending && !ctx->eos_sent))) ||
+                   (is_loaded_state(ctx->state) && (ctx->eos_pending && !ctx->eos_sent)) ||
                    (ctx->play_requested && ctx->state == pipeline_state::PAUSED) ||
                    (!ctx->play_requested && ctx->state == pipeline_state::PLAYING);
         });
     }
+}
+
+static void video_worker_loop(struct starfish_ctx *ctx)
+{
+    stream_worker_loop(ctx, STARFISH_STREAM_VIDEO);
+}
+
+static void audio_worker_loop(struct starfish_ctx *ctx)
+{
+    stream_worker_loop(ctx, STARFISH_STREAM_AUDIO);
 }
 
 static void player_callback(int32_t type, int64_t numValue, const char *strValue, void *opaque)
@@ -725,8 +744,12 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
         }
     }
 
-    if (call_play && !ctx->media->Play())
-        mp_err(ctx->log, "Starfish Play failed after load\n");
+    if (call_play) {
+        mp_info(ctx->log, "Issuing Starfish Play after load\n");
+        std::lock_guard<std::mutex> media_lock(ctx->media_lock);
+        if (!ctx->media->Play())
+            mp_err(ctx->log, "Starfish Play failed after load\n");
+    }
     ctx->cv.notify_all();
     if (wake_video)
         wake_stream(ctx, STARFISH_STREAM_VIDEO);
@@ -748,7 +771,10 @@ struct starfish_ctx *starfish_ctx_create(struct mp_log *log)
         ctx->audio_raw = true;
         ctx->need_audio = true;
     }
+    mp_info(ctx->log, "Created Starfish ctx=%p\n", ctx);
     ctx->worker = std::thread(worker_loop, ctx);
+    ctx->video_worker = std::thread(video_worker_loop, ctx);
+    ctx->audio_worker = std::thread(audio_worker_loop, ctx);
     return ctx;
 }
 
@@ -773,9 +799,15 @@ void starfish_ctx_unref(struct starfish_ctx *ctx)
     ctx->cv.notify_all();
     if (ctx->worker.joinable())
         ctx->worker.join();
+    if (ctx->video_worker.joinable())
+        ctx->video_worker.join();
+    if (ctx->audio_worker.joinable())
+        ctx->audio_worker.join();
 
-    if (ctx->media)
+    if (ctx->media) {
+        std::lock_guard<std::mutex> media_lock(ctx->media_lock);
         ctx->media->Unload();
+    }
     if (ctx->acb_id) {
         if (ctx->acb_initialized)
             AcbAPI_finalize(ctx->acb_id);
@@ -795,6 +827,8 @@ bool starfish_ctx_set_current(struct starfish_ctx *ctx)
     std::lock_guard<std::mutex> lock(g_current_lock);
     if (ctx == g_current_ctx)
         return true;
+    if (ctx && ctx->log)
+        mp_info(ctx->log, "Setting current Starfish ctx=%p (old=%p)\n", ctx, g_current_ctx);
     starfish_ctx_retain(ctx);
     starfish_ctx_unref(g_current_ctx);
     g_current_ctx = ctx;
@@ -918,6 +952,9 @@ bool starfish_ctx_configure_audio_passthrough(struct starfish_ctx *ctx, int form
         return false;
     ctx->audio_codec = name;
     ctx->need_audio = true;
+    mp_info(ctx->log, "Configured Starfish passthrough audio: codec=%s samplerate=%d channels=%d\n",
+            name, samplerate, channels ? channels->num : 0);
+    ctx->cv.notify_all();
     return true;
 }
 
@@ -942,6 +979,9 @@ bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx, int channels,
     ctx->audio_profile = profile;
     ctx->audio_raw = raw;
     ctx->need_audio = true;
+    mp_info(ctx->log, "Configured Starfish AAC audio: channels=%d samplerate=%d profile=%d raw=%d\n",
+            channels, samplerate, profile, raw);
+    ctx->cv.notify_all();
     return true;
 }
 
@@ -983,6 +1023,8 @@ int starfish_ctx_feed_audio(struct starfish_ctx *ctx, const void *data, size_t s
     packet.pts_ns = pts_ns;
     ctx->audio_queue_bytes += size;
     ctx->audio_queue.push_back(std::move(packet));
+    mp_info(ctx->log, "Queued Starfish audio packet: ctx=%p queued=%zu size=%zu pts=%" PRId64 "\n",
+            ctx, ctx->audio_queue.size(), size, pts_ns);
     ctx->cv.notify_all();
     return STARFISH_FEED_OK;
 }
