@@ -44,7 +44,7 @@ constexpr size_t VIDEO_QUEUE_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_QUEUE_LIMIT = 2 * 1024 * 1024;
 constexpr size_t VIDEO_INFLIGHT_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_INFLIGHT_LIMIT = 2 * 1024 * 1024;
-constexpr auto AUDIO_CONFIG_GRACE = std::chrono::milliseconds(500);
+constexpr auto AUDIO_CONFIG_GRACE = std::chrono::milliseconds(50);
 
 enum class pipeline_state {
     IDLE,
