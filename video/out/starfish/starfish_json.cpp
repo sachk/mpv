@@ -82,6 +82,15 @@ std::string starfish_json_build_load(const struct starfish_json_load_params *par
 
     out << "}";
 
+    if (params->dolby_vision) {
+        out << ",\"DolbyHdrInfo\":{"
+            << "\"encryptionType\":\"clear\","
+            << "\"profileId\":" << params->dolby_vision_profile << ','
+            << "\"trackType\":\"" << (params->dolby_vision_dual_layer ? "dual" : "single")
+            << "\"";
+        out << "}";
+    }
+
     if (params->need_audio && params->audio_codec && strcmp(params->audio_codec, "AAC") == 0) {
         out << ",\"aacInfo\":{"
             << "\"channels\":" << params->audio_channels << ','
@@ -130,6 +139,39 @@ std::string starfish_json_build_load(const struct starfish_json_load_params *par
 
     out << "}"
         << "}]}";
+    return out.str();
+}
+
+std::string starfish_json_build_hdr_info(const struct starfish_json_hdr_info_params *params)
+{
+    std::ostringstream out;
+    out << '{'
+        << "\"hdrType\":\"" << json_escape(params->hdr_type ? params->hdr_type : "none")
+        << "\","
+        << "\"sei\":{"
+        << "\"displayPrimariesX0\":" << params->display_primaries_x0 << ','
+        << "\"displayPrimariesY0\":" << params->display_primaries_y0 << ','
+        << "\"displayPrimariesX1\":" << params->display_primaries_x1 << ','
+        << "\"displayPrimariesY1\":" << params->display_primaries_y1 << ','
+        << "\"displayPrimariesX2\":" << params->display_primaries_x2 << ','
+        << "\"displayPrimariesY2\":" << params->display_primaries_y2 << ','
+        << "\"whitePointX\":" << params->white_point_x << ','
+        << "\"whitePointY\":" << params->white_point_y << ','
+        << "\"minDisplayMasteringLuminance\":"
+        << params->min_display_mastering_luminance << ','
+        << "\"maxDisplayMasteringLuminance\":"
+        << params->max_display_mastering_luminance << ','
+        << "\"maxContentLightLevel\":" << params->max_content_light_level << ','
+        << "\"maxPicAverageLightLevel\":" << params->max_pic_average_light_level
+        << "},"
+        << "\"vui\":{"
+        << "\"transferCharacteristics\":" << params->transfer_characteristics << ','
+        << "\"colorPrimaries\":" << params->color_primaries << ','
+        << "\"matrixCoeffs\":" << params->matrix_coeffs << ','
+        << "\"videoFullRangeFlag\":"
+        << (params->video_full_range_flag ? "true" : "false")
+        << "}"
+        << '}';
     return out.str();
 }
 

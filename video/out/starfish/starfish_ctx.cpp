@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -24,7 +25,10 @@
 extern "C" {
 #define _Atomic
 #include <libavcodec/avcodec.h>
+#include <libavutil/dovi_meta.h>
 #include <libavutil/rational.h>
+#define PL_LIBAV_IMPLEMENTATION 0
+#include <libplacebo/utils/libav.h>
 
 #include "audio/chmap.h"
 #include "audio/format.h"
@@ -55,6 +59,13 @@ enum class pipeline_state {
     FAILED,
 };
 
+enum class dovi_policy {
+    AUTO,
+    PASSTHROUGH,
+    P7_FALLBACK,
+    HDR10,
+};
+
 struct queued_packet {
     std::shared_ptr<std::vector<uint8_t>> data;
     int64_t pts_ns = 0;
@@ -70,6 +81,35 @@ bool env_wants_audio_hint()
 {
     const char *hint = getenv("STARFISH_AUDIO_HINT");
     return hint && hint[0] && strcmp(hint, "0") != 0;
+}
+
+dovi_policy get_dovi_policy()
+{
+    const char *value = getenv("STARFISH_DOVI_POLICY");
+    if (!value || !value[0] || strcmp(value, "auto") == 0)
+        return dovi_policy::AUTO;
+    if (strcmp(value, "passthrough") == 0)
+        return dovi_policy::PASSTHROUGH;
+    if (strcmp(value, "p7-fallback") == 0)
+        return dovi_policy::P7_FALLBACK;
+    if (strcmp(value, "hdr10") == 0)
+        return dovi_policy::HDR10;
+    return dovi_policy::AUTO;
+}
+
+const char *dovi_policy_name(dovi_policy policy)
+{
+    switch (policy) {
+    case dovi_policy::AUTO:
+        return "auto";
+    case dovi_policy::PASSTHROUGH:
+        return "passthrough";
+    case dovi_policy::P7_FALLBACK:
+        return "p7-fallback";
+    case dovi_policy::HDR10:
+        return "hdr10";
+    }
+    return "auto";
 }
 
 const char *video_codec_name(enum AVCodecID codec)
@@ -133,6 +173,7 @@ struct starfish_ctx {
     std::string window_id;
     std::string video_codec;
     std::string audio_codec;
+    unsigned int video_codec_tag = 0;
     int audio_channels = 0;
     int audio_samplerate = 0;
     int audio_profile = 0;
@@ -147,6 +188,17 @@ struct starfish_ctx {
     int max_framerate = 0;
     bool adaptive_resolution = false;
     bool need_audio = false;
+    dovi_policy dovi_mode = dovi_policy::AUTO;
+    bool source_dovi = false;
+    bool effective_dovi = false;
+    uint8_t dv_profile = 0;
+    uint8_t dv_level = 0;
+    uint8_t dv_bl_signal_compatibility_id = 0;
+    bool dv_rpu_present = false;
+    bool dv_el_present = false;
+    bool dv_bl_present = false;
+    struct pl_color_space video_color = pl_color_space_unknown;
+    struct pl_color_repr video_repr = pl_color_repr_unknown;
 
     pipeline_state state = pipeline_state::IDLE;
     bool play_requested = true;
@@ -349,6 +401,130 @@ static void update_adaptive_caps(struct starfish_ctx *ctx)
     ctx->max_width = 0;
     ctx->max_height = 0;
     ctx->max_framerate = 0;
+}
+
+static const AVDOVIDecoderConfigurationRecord *find_dovi_config(
+    const struct mp_codec_params *codec)
+{
+    if (!codec || !codec->lav_codecpar)
+        return nullptr;
+
+    for (int n = 0; n < codec->lav_codecpar->nb_coded_side_data; n++) {
+        const AVPacketSideData *side_data = &codec->lav_codecpar->coded_side_data[n];
+        if (side_data->type == AV_PKT_DATA_DOVI_CONF &&
+            side_data->size >= (int)sizeof(AVDOVIDecoderConfigurationRecord))
+        {
+            return reinterpret_cast<const AVDOVIDecoderConfigurationRecord *>(side_data->data);
+        }
+    }
+
+    return nullptr;
+}
+
+static bool dovi_track_is_dual_layer(const struct starfish_ctx *ctx)
+{
+    return ctx->dv_el_present;
+}
+
+static bool resolve_effective_dovi_locked(struct starfish_ctx *ctx)
+{
+    if (!ctx->source_dovi)
+        return false;
+
+    switch (ctx->dovi_mode) {
+    case dovi_policy::HDR10:
+        return false;
+    case dovi_policy::PASSTHROUGH:
+        return true;
+    case dovi_policy::AUTO:
+    case dovi_policy::P7_FALLBACK:
+        if (ctx->dv_profile == 7 && dovi_track_is_dual_layer(ctx)) {
+            mp_warn(ctx->log,
+                    "Dolby Vision profile 7 dual-layer stream needs conversion; "
+                    "falling back to HDR10 in current fork\n");
+            return false;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static const char *hdr_type_name_locked(const struct starfish_ctx *ctx)
+{
+    switch (ctx->video_color.transfer) {
+    case PL_COLOR_TRC_PQ:
+        return "hdr10";
+    case PL_COLOR_TRC_HLG:
+        return "hlg";
+    default:
+        return "none";
+    }
+}
+
+static bool hdr_sei_available_locked(const struct starfish_ctx *ctx)
+{
+    const struct pl_hdr_metadata *hdr = &ctx->video_color.hdr;
+    const struct pl_raw_primaries *prim = &hdr->prim;
+    return hdr->min_luma > 0.0f || hdr->max_luma > 0.0f ||
+           hdr->max_cll > 0.0f || hdr->max_fall > 0.0f ||
+           prim->red.x > 0.0f || prim->red.y > 0.0f ||
+           prim->green.x > 0.0f || prim->green.y > 0.0f ||
+           prim->blue.x > 0.0f || prim->blue.y > 0.0f ||
+           prim->white.x > 0.0f || prim->white.y > 0.0f;
+}
+
+static int scale_chromaticity(float value)
+{
+    return value > 0.0f ? (int)llrintf(value * 50000.0f) : 0;
+}
+
+static int scale_luminance(float value)
+{
+    return value > 0.0f ? (int)llrintf(value * 10000.0f) : 0;
+}
+
+static int scale_content_light(float value)
+{
+    return value > 0.0f ? (int)llrintf(value) : 0;
+}
+
+static bool apply_hdr_info(struct starfish_ctx *ctx)
+{
+    struct starfish_json_hdr_info_params params = {};
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->lock);
+        params.hdr_type = hdr_type_name_locked(ctx);
+        params.has_sei = hdr_sei_available_locked(ctx);
+        if (strcmp(params.hdr_type, "none") == 0 || !params.has_sei)
+            return false;
+
+        const struct pl_hdr_metadata *hdr = &ctx->video_color.hdr;
+        params.display_primaries_x0 = scale_chromaticity(hdr->prim.green.x);
+        params.display_primaries_y0 = scale_chromaticity(hdr->prim.green.y);
+        params.display_primaries_x1 = scale_chromaticity(hdr->prim.blue.x);
+        params.display_primaries_y1 = scale_chromaticity(hdr->prim.blue.y);
+        params.display_primaries_x2 = scale_chromaticity(hdr->prim.red.x);
+        params.display_primaries_y2 = scale_chromaticity(hdr->prim.red.y);
+        params.white_point_x = scale_chromaticity(hdr->prim.white.x);
+        params.white_point_y = scale_chromaticity(hdr->prim.white.y);
+        params.min_display_mastering_luminance = scale_luminance(hdr->min_luma);
+        params.max_display_mastering_luminance = scale_luminance(hdr->max_luma);
+        params.max_content_light_level = scale_content_light(hdr->max_cll);
+        params.max_pic_average_light_level = scale_content_light(hdr->max_fall);
+        params.transfer_characteristics = pl_transfer_to_av(ctx->video_color.transfer);
+        params.color_primaries = pl_primaries_to_av(ctx->video_color.primaries);
+        params.matrix_coeffs = pl_system_to_av(ctx->video_repr.sys);
+        params.video_full_range_flag =
+            pl_levels_to_av(ctx->video_repr.levels) == AVCOL_RANGE_JPEG;
+    }
+
+    std::string payload = starfish_json_build_hdr_info(&params);
+    mp_info(ctx->log, "Starfish setHdrInfo payload: %s\n", payload.c_str());
+    if (!media_call_bool(ctx, "setHdrInfo", [&] { return ctx->media->setHdrInfo(payload.c_str()); }))
+        mp_warn(ctx->log, "Starfish setHdrInfo failed\n");
+    return true;
 }
 
 static bool ensure_acb(struct starfish_ctx *ctx)
@@ -608,6 +784,9 @@ static void worker_loop(struct starfish_ctx *ctx)
                 .window_id = ctx->window_id.empty() ? nullptr : ctx->window_id.c_str(),
                 .video_codec = ctx->video_codec.c_str(),
                 .audio_codec = ctx->need_audio ? ctx->audio_codec.c_str() : nullptr,
+                .dolby_vision = ctx->effective_dovi,
+                .dolby_vision_profile = ctx->dv_profile,
+                .dolby_vision_dual_layer = dovi_track_is_dual_layer(ctx),
                 .audio_channels = ctx->audio_channels,
                 .audio_profile = ctx->audio_profile,
                 .audio_samplerate = ctx->audio_samplerate,
@@ -630,11 +809,15 @@ static void worker_loop(struct starfish_ctx *ctx)
             ctx->eos_pending = false;
             ctx->ready_frames.clear();
 
-            mp_info(ctx->log, "Starting Starfish load: video=%s audio=%s size=%dx%d fps=%d/%d window=%s\n",
+            mp_info(ctx->log,
+                    "Starting Starfish load: video=%s audio=%s size=%dx%d fps=%d/%d "
+                    "window=%s dovi=%d profile=%u policy=%s\n",
                     params.video_codec ? params.video_codec : "(none)",
                     params.audio_codec ? params.audio_codec : "(none)",
                     params.width, params.height, params.fps_num, params.fps_den,
-                    params.window_id ? params.window_id : "(acb)");
+                    params.window_id ? params.window_id : "(acb)",
+                    params.dolby_vision, ctx->dv_profile,
+                    dovi_policy_name(ctx->dovi_mode));
             mp_verbose(ctx->log, "Starfish Load payload: %s\n", payload.c_str());
 
             lock.unlock();
@@ -650,6 +833,8 @@ static void worker_loop(struct starfish_ctx *ctx)
             bool ok = media_call_bool(ctx, "Load",
                                       [&] { return ctx->media->Load(payload.c_str(), &player_callback, ctx); });
             mp_info(ctx->log, "Starfish Load returned: %s\n", ok ? "success" : "failure");
+            if (ok)
+                apply_hdr_info(ctx);
             lock.lock();
             if (!ok) {
                 set_failed_locked(ctx, -1, "Starfish Load failed");
@@ -1018,11 +1203,33 @@ bool starfish_ctx_configure_video(struct starfish_ctx *ctx,
     if (!name)
         return false;
 
+    const AVDOVIDecoderConfigurationRecord *dovi = find_dovi_config(codec);
     std::lock_guard<std::mutex> lock(ctx->lock);
     if (ctx->state == pipeline_state::LOADING || is_loaded_state(ctx->state))
         return false;
 
+    ctx->dovi_mode = get_dovi_policy();
     ctx->video_codec = name;
+    ctx->video_codec_tag = codec->codec_tag;
+    ctx->video_color = codec->color;
+    ctx->video_repr = codec->repr;
+    ctx->source_dovi = codec->dovi;
+    ctx->dv_profile = codec->dv_profile;
+    ctx->dv_level = codec->dv_level;
+    ctx->dv_rpu_present = false;
+    ctx->dv_el_present = false;
+    ctx->dv_bl_present = false;
+    ctx->dv_bl_signal_compatibility_id = 0;
+    if (dovi) {
+        ctx->source_dovi = true;
+        ctx->dv_profile = dovi->dv_profile;
+        ctx->dv_level = dovi->dv_level;
+        ctx->dv_rpu_present = dovi->rpu_present_flag;
+        ctx->dv_el_present = dovi->el_present_flag;
+        ctx->dv_bl_present = dovi->bl_present_flag;
+        ctx->dv_bl_signal_compatibility_id = dovi->dv_bl_signal_compatibility_id;
+    }
+    ctx->effective_dovi = resolve_effective_dovi_locked(ctx);
     if (codec->lav_codecpar) {
         ctx->width = codec->lav_codecpar->width;
         ctx->height = codec->lav_codecpar->height;
@@ -1034,6 +1241,12 @@ bool starfish_ctx_configure_video(struct starfish_ctx *ctx,
         ctx->fps_den = r.den;
     }
     update_adaptive_caps(ctx);
+    mp_info(ctx->log,
+            "Configured Starfish video: codec=%s codec_tag=0x%x trc=%d dovi=%d/%d "
+            "profile=%u level=%u compat=%u policy=%s\n",
+            ctx->video_codec.c_str(), ctx->video_codec_tag, ctx->video_color.transfer,
+            ctx->source_dovi, ctx->effective_dovi, ctx->dv_profile, ctx->dv_level,
+            ctx->dv_bl_signal_compatibility_id, dovi_policy_name(ctx->dovi_mode));
     return true;
 }
 
