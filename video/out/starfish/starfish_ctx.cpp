@@ -153,6 +153,8 @@ struct starfish_ctx {
     bool need_segment = false;
     bool flush_requested = false;
     int64_t flush_pts_ns = 0;
+    bool have_segment_target = false;
+    int64_t segment_target_pts_ns = 0;
     bool eos_sent = false;
     bool eos_pending = false;
     bool ended = false;
@@ -177,6 +179,11 @@ struct starfish_ctx {
 
     int failed_code = 0;
     std::string failed_reason;
+    uint64_t flush_count = 0;
+    uint64_t segment_restart_count = 0;
+    uint64_t bufferfull_count = 0;
+    uint64_t bufferlow_count = 0;
+    uint64_t seekdone_count = 0;
 };
 
 static std::mutex g_current_lock;
@@ -240,8 +247,14 @@ static const char *event_name(int32_t type)
         return "PLAYING";
     case PF_EVENT_TYPE_STR_STATE_UPDATE__PAUSED:
         return "PAUSED";
+    case PF_EVENT_TYPE_STR_STATE_UPDATE__SEEKDONE:
+        return "SEEKDONE";
     case PF_EVENT_TYPE_STR_STATE_UPDATE__ENDOFSTREAM:
         return "ENDOFSTREAM";
+    case PF_EVENT_TYPE_INT_BUFFER_RANGE_INFO:
+        return "BUFFER_RANGE_INFO";
+    case PF_EVENT_TYPE_INT_BUFFERLOW:
+        return "INT_BUFFERLOW";
     case PF_EVENT_TYPE_STR_BUFFERFULL:
         return "BUFFERFULL";
     case PF_EVENT_TYPE_STR_BUFFERLOW:
@@ -419,14 +432,25 @@ static bool set_time_to_decode(struct starfish_ctx *ctx, int64_t pts_ns)
         mp_err(ctx->log, "Starfish setContentInfo threw unknown exception\n");
         return false;
     }
-    return false;
+    return true;
 }
 
 static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type stream,
                             const queued_packet &packet, bool *buffer_full)
 {
     if (stream == STARFISH_STREAM_VIDEO && ctx->need_segment) {
-        set_time_to_decode(ctx, packet.pts_ns);
+        const int64_t segment_pts =
+            ctx->have_segment_target ? ctx->segment_target_pts_ns : packet.pts_ns;
+        mp_info(ctx->log,
+                "Starfish segment restart #%" PRIu64 ": target=%" PRId64
+                " packet_pts=%" PRId64 " source=%s\n",
+                ctx->segment_restart_count + 1, segment_pts, packet.pts_ns,
+                ctx->have_segment_target ? "seek-target" : "packet");
+        if (!set_time_to_decode(ctx, segment_pts)) {
+            mp_warn(ctx->log, "Starfish setTimeToDecode failed for segment target %" PRId64
+                              "\n",
+                    segment_pts);
+        }
         auto *player = static_cast<mediapipeline::CustomPlayer *>(ctx->media->player.get());
         auto *pipeline =
             player ? static_cast<mediapipeline::CustomPipeline *>(player->getPipeline().get())
@@ -444,7 +468,9 @@ static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type 
                 return false;
             }
         }
+        ctx->segment_restart_count += 1;
         ctx->need_segment = false;
+        ctx->have_segment_target = false;
     }
 
     std::string payload = starfish_json_build_feed(stream, packet.data->data(),
@@ -459,6 +485,7 @@ static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type 
         return true;
 
     if (result.find("BufferFull") != std::string::npos) {
+        ctx->bufferfull_count += 1;
         *buffer_full = true;
         return false;
     }
@@ -556,6 +583,10 @@ static void apply_flush(struct starfish_ctx *ctx)
         ctx->eos_pending = false;
         ctx->need_segment = true;
         ctx->flush_requested = false;
+        ctx->flush_count += 1;
+        mp_info(ctx->log,
+                "Starfish apply_flush #%" PRIu64 ": have_target=%d target=%" PRId64 "\n",
+                ctx->flush_count, ctx->have_segment_target, ctx->segment_target_pts_ns);
     }
 }
 
@@ -737,6 +768,20 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
                                 &ctx->acb_task_id);
             }
             call_play = ctx->play_requested;
+            wake_video = true;
+            wake_audio = true;
+            break;
+        case PF_EVENT_TYPE_STR_STATE_UPDATE__SEEKDONE:
+            ctx->seekdone_count += 1;
+            wake_video = true;
+            wake_audio = true;
+            break;
+        case PF_EVENT_TYPE_INT_BUFFER_RANGE_INFO:
+            mp_info(ctx->log, "Starfish buffer range info=%" PRId64 "\n", numValue);
+            break;
+        case PF_EVENT_TYPE_INT_BUFFERLOW:
+        case PF_EVENT_TYPE_STR_BUFFERLOW:
+            ctx->bufferlow_count += 1;
             wake_video = true;
             wake_audio = true;
             break;
@@ -1112,7 +1157,11 @@ bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts)
     {
         std::lock_guard<std::mutex> lock(ctx->lock);
         ctx->flush_requested = true;
-        ctx->flush_pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
+        if (pts != MP_NOPTS_VALUE) {
+            ctx->flush_pts_ns = (int64_t)(pts * 1e9);
+            ctx->segment_target_pts_ns = ctx->flush_pts_ns;
+            ctx->have_segment_target = true;
+        }
     }
     ctx->cv.notify_all();
     return true;
