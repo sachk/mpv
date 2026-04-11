@@ -45,6 +45,7 @@ typedef void (*starfish_overlay_present_cb)(void *opaque, const uint8_t *pixels,
 STARFISH_CTX_API struct starfish_ctx *starfish_ctx_create(struct mp_log *log);
 STARFISH_CTX_API struct starfish_ctx *starfish_ctx_retain(struct starfish_ctx *ctx);
 STARFISH_CTX_API void starfish_ctx_unref(struct starfish_ctx *ctx);
+STARFISH_CTX_API bool starfish_ctx_prime_media(void);
 
 STARFISH_CTX_API struct starfish_ctx *starfish_ctx_from_hwdec(struct mp_hwdec_ctx *hwctx);
 
