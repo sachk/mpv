@@ -10,6 +10,9 @@ struct starfish_json_load_params {
     const char *window_id;
     const char *video_codec;
     const char *audio_codec;
+    bool dolby_vision;
+    int dolby_vision_profile;
+    bool dolby_vision_dual_layer;
     int audio_channels;
     int audio_profile;
     int audio_samplerate;
@@ -26,7 +29,29 @@ struct starfish_json_load_params {
     bool need_audio;
 };
 
+struct starfish_json_hdr_info_params {
+    const char *hdr_type;
+    bool has_sei;
+    int display_primaries_x0;
+    int display_primaries_y0;
+    int display_primaries_x1;
+    int display_primaries_y1;
+    int display_primaries_x2;
+    int display_primaries_y2;
+    int white_point_x;
+    int white_point_y;
+    int min_display_mastering_luminance;
+    int max_display_mastering_luminance;
+    int max_content_light_level;
+    int max_pic_average_light_level;
+    int transfer_characteristics;
+    int color_primaries;
+    int matrix_coeffs;
+    bool video_full_range_flag;
+};
+
 std::string starfish_json_build_load(const struct starfish_json_load_params *params);
+std::string starfish_json_build_hdr_info(const struct starfish_json_hdr_info_params *params);
 std::string starfish_json_build_feed(int es_data, const void *data, size_t size,
                                      int64_t pts_ns);
 std::string starfish_json_build_seek(int64_t pts_ns);
