@@ -81,6 +81,7 @@ STARFISH_CTX_API bool starfish_ctx_pop_video_frame(struct starfish_ctx *ctx,
                                                    struct starfish_video_frame *frame);
 STARFISH_CTX_API bool starfish_ctx_resume(struct starfish_ctx *ctx);
 STARFISH_CTX_API bool starfish_ctx_pause(struct starfish_ctx *ctx);
+STARFISH_CTX_API bool starfish_ctx_set_seek_target(struct starfish_ctx *ctx, double pts);
 STARFISH_CTX_API bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts);
 STARFISH_CTX_API bool starfish_ctx_push_eos(struct starfish_ctx *ctx);
 STARFISH_CTX_API bool starfish_ctx_has_ended(struct starfish_ctx *ctx);

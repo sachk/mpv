@@ -203,6 +203,8 @@ struct starfish_ctx {
     bool need_segment = false;
     bool flush_requested = false;
     int64_t flush_pts_ns = 0;
+    bool pending_seek_target = false;
+    int64_t pending_seek_target_pts_ns = 0;
     bool have_segment_target = false;
     int64_t segment_target_pts_ns = 0;
     bool eos_sent = false;
@@ -770,6 +772,7 @@ static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type 
         ctx->segment_restart_count += 1;
         ctx->need_segment = false;
         ctx->have_segment_target = false;
+        ctx->pending_seek_target = false;
     }
 
     std::string payload = starfish_json_build_feed(stream, packet.data->data(),
@@ -880,6 +883,13 @@ static void apply_flush(struct starfish_ctx *ctx)
         ctx->ended = false;
         ctx->eos_sent = false;
         ctx->eos_pending = false;
+        if (ctx->pending_seek_target) {
+            ctx->segment_target_pts_ns = ctx->pending_seek_target_pts_ns;
+            ctx->have_segment_target = true;
+        } else {
+            ctx->segment_target_pts_ns = 0;
+            ctx->have_segment_target = false;
+        }
         ctx->need_segment = true;
         ctx->flush_requested = false;
         ctx->flush_count += 1;
@@ -1122,6 +1132,10 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
             ctx->eos_sent = false;
             ctx->eos_pending = false;
             ctx->need_segment = false;
+            ctx->pending_seek_target = false;
+            ctx->pending_seek_target_pts_ns = 0;
+            ctx->have_segment_target = false;
+            ctx->segment_target_pts_ns = 0;
             ctx->ready_frames.clear();
             ctx->video_inflight.clear();
             ctx->audio_inflight.clear();
@@ -1488,6 +1502,21 @@ bool starfish_ctx_pause(struct starfish_ctx *ctx)
     return true;
 }
 
+bool starfish_ctx_set_seek_target(struct starfish_ctx *ctx, double pts)
+{
+    if (pts == MP_NOPTS_VALUE)
+        return true;
+
+    std::lock_guard<std::mutex> lock(ctx->lock);
+    ctx->pending_seek_target = true;
+    ctx->pending_seek_target_pts_ns = (int64_t)(pts * 1e9);
+    if (ctx->need_segment) {
+        ctx->segment_target_pts_ns = ctx->pending_seek_target_pts_ns;
+        ctx->have_segment_target = true;
+    }
+    return true;
+}
+
 bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts)
 {
     {
@@ -1495,8 +1524,11 @@ bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts)
         ctx->flush_requested = true;
         if (pts != MP_NOPTS_VALUE) {
             ctx->flush_pts_ns = (int64_t)(pts * 1e9);
-            ctx->segment_target_pts_ns = ctx->flush_pts_ns;
-            ctx->have_segment_target = true;
+            ctx->pending_seek_target = true;
+            ctx->pending_seek_target_pts_ns = ctx->flush_pts_ns;
+        } else if (!ctx->pending_seek_target) {
+            ctx->segment_target_pts_ns = 0;
+            ctx->have_segment_target = false;
         }
     }
     ctx->cv.notify_all();

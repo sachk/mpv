@@ -252,6 +252,7 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg)
         return CONTROL_TRUE;
     case VDCTRL_SET_START_PTS:
         p->start_pts = *(double *)arg;
+        starfish_ctx_set_seek_target(p->ctx, p->start_pts);
         return CONTROL_TRUE;
     case VDCTRL_GET_HWDEC:
         *(char **)arg = "starfish";
