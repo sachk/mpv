@@ -27,6 +27,7 @@ struct priv {
     struct mp_log *log;
     struct mp_codec_params *codec;
     struct starfish_ctx *ctx;
+    double start_pts;
     AVBSFContext *bsf;
     AVPacket *avpkt;
     AVPacket *filtered_pkt;
@@ -247,7 +248,10 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg)
 
     switch (cmd) {
     case VDCTRL_REINIT:
-        starfish_ctx_flush(p->ctx, 0);
+        starfish_ctx_flush(p->ctx, p->start_pts);
+        return CONTROL_TRUE;
+    case VDCTRL_SET_START_PTS:
+        p->start_pts = *(double *)arg;
         return CONTROL_TRUE;
     case VDCTRL_GET_HWDEC:
         *(char **)arg = "starfish";
@@ -275,7 +279,7 @@ static void vd_starfish_reset(struct mp_filter *f)
     p->sent_eof = false;
     if (p->bsf)
         av_bsf_flush(p->bsf);
-    starfish_ctx_flush(p->ctx, 0);
+    starfish_ctx_flush(p->ctx, p->start_pts);
 }
 
 static void vd_starfish_destroy(struct mp_filter *f)
@@ -327,6 +331,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->log = vd->log;
     p->codec = codec;
     p->ctx = ctx;
+    p->start_pts = MP_NOPTS_VALUE;
     p->public.f = vd;
     p->public.control = control;
 

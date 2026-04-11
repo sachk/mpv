@@ -76,6 +76,7 @@ enum dec_ctrl {
     VDCTRL_GET_HWDEC,
     VDCTRL_REINIT,
     VDCTRL_GET_BFRAMES,
+    VDCTRL_SET_START_PTS,
     // framedrop mode: 0=none, 1=standard, 2=hrseek
     VDCTRL_SET_FRAMEDROP,
     // int*: extra hw surfaces retained

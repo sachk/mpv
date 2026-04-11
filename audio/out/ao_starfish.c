@@ -376,7 +376,7 @@ static void reset(struct ao *ao)
     if (p->encoder)
         avcodec_flush_buffers(p->encoder);
     if (p->ctx)
-        starfish_ctx_flush(p->ctx, 0);
+        starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
 }
 
 static void start(struct ao *ao)
