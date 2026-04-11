@@ -592,7 +592,8 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
     switch (request) {
     case VOCTRL_RESET:
-        return starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE) ? VO_TRUE : VO_ERROR;
+        // starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
+        return VO_TRUE;
     case VOCTRL_PAUSE:
         return starfish_ctx_pause(p->ctx) ? VO_TRUE : VO_ERROR;
     case VOCTRL_RESUME:

@@ -39,6 +39,7 @@ struct priv {
 #define STARFISH_AUDIO_BUFFER_SEC 3.0
 
 static void uninit(struct ao *ao);
+static int encode_silence_frame(struct ao *ao, int samples);
 
 static void wake_ao(void *opaque)
 {
@@ -94,6 +95,56 @@ static bool feed_encoded_packet(struct ao *ao, const uint8_t *data, size_t size,
 
     MP_WARN(ao, "Timed out waiting for Starfish audio buffer space\n");
     return false;
+}
+
+static void sync_written_samples_to_seek_target(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    int64_t seek_target_ns = 0;
+
+    p->written_samples = 0;
+    if (!p->ctx || !p->encoder)
+        return;
+    if (!starfish_ctx_get_seek_target_ns(p->ctx, &seek_target_ns) || seek_target_ns <= 0)
+        return;
+
+    p->written_samples = av_rescale_q(seek_target_ns, (AVRational){1, 1000000000},
+                                      p->encoder->time_base);
+    MP_INFO(ao, "ao_starfish synced audio pts base to seek target ns=%" PRId64
+            " samples=%" PRId64 "\n",
+            seek_target_ns, p->written_samples);
+}
+
+static bool ensure_audio_primed(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+
+    if (p->primed)
+        return true;
+
+    int primed_packets = 0;
+    int primed_frames = 0;
+    for (int n = 0; n < 4; n++) {
+        int ret = encode_silence_frame(ao, p->frame_samples);
+        if (ret < 0) {
+            MP_WARN(ao, "Failed to pre-prime Starfish audio with AAC silence\n");
+            return false;
+        }
+        primed_frames++;
+        primed_packets += ret;
+    }
+
+    p->primed = true;
+    if (primed_packets > 0) {
+        MP_INFO(ao,
+                "Pre-primed Starfish audio with %d silent samples across %d frames (%d packets)\n",
+                primed_frames * p->frame_samples, primed_frames, primed_packets);
+    } else {
+        MP_WARN(ao, "AAC prime produced no output packets after %d silent frames\n",
+                primed_frames);
+    }
+
+    return true;
 }
 
 static bool encode_pending_audio(struct ao *ao, bool flush_tail)
@@ -308,27 +359,10 @@ static int init(struct ao *ao)
     MP_INFO(ao, "ao_starfish init samplerate=%d channels=%d frame_samples=%d\n",
             ao->samplerate, ao->channels.num, p->frame_samples);
     starfish_ctx_set_wakeup_cb(p->ctx, STARFISH_STREAM_AUDIO, wake_ao, ao);
-    if (!p->primed) {
-        p->primed = true;
-        int primed_packets = 0;
-        int primed_frames = 0;
-        for (int n = 0; n < 4; n++) {
-            int ret = encode_silence_frame(ao, p->frame_samples);
-            if (ret < 0) {
-                MP_WARN(ao, "Failed to pre-prime Starfish audio with AAC silence\n");
-                break;
-            }
-            primed_frames++;
-            primed_packets += ret;
-        }
-        if (primed_packets > 0) {
-            MP_INFO(ao,
-                    "Pre-primed Starfish audio with %d silent samples across %d frames (%d packets)\n",
-                    primed_frames * p->frame_samples, primed_frames, primed_packets);
-        } else {
-            MP_WARN(ao, "AAC prime produced no output packets after %d silent frames\n",
-                    primed_frames);
-        }
+    sync_written_samples_to_seek_target(ao);
+    if (!ensure_audio_primed(ao)) {
+        uninit(ao);
+        return -1;
     }
     ao->device_buffer = p->latency_samples +
                         ao->samplerate * STARFISH_AUDIO_BUFFER_SEC;
@@ -368,15 +402,15 @@ static void reset(struct ao *ao)
     p->paused = false;
     p->playing = false;
     p->buffered = 0;
-    p->written_samples = 0;
     p->primed = false;
     p->logged_write = false;
     if (p->fifo)
         av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
     if (p->encoder)
         avcodec_flush_buffers(p->encoder);
+    sync_written_samples_to_seek_target(ao);
     if (p->ctx)
-        starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
+        ;// starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
 }
 
 static void start(struct ao *ao)
@@ -387,6 +421,8 @@ static void start(struct ao *ao)
     p->playing = true;
     p->last_time = mp_time_sec();
     MP_INFO(ao, "ao_starfish start\n");
+    if (!ensure_audio_primed(ao))
+        MP_WARN(ao, "Unable to re-prime Starfish audio on start\n");
     if (p->ctx)
         starfish_ctx_resume(p->ctx);
 }
@@ -413,6 +449,8 @@ static bool audio_write(struct ao *ao, void **data, int samples)
         MP_INFO(ao, "ao_starfish first write samples=%d\n", samples);
         p->logged_write = true;
     }
+    if (!ensure_audio_primed(ao))
+        return false;
     if (av_audio_fifo_realloc(p->fifo, av_audio_fifo_size(p->fifo) + samples) < 0)
         return false;
     if (av_audio_fifo_write(p->fifo, data, samples) < samples)

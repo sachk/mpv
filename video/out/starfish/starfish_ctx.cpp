@@ -205,8 +205,8 @@ struct starfish_ctx {
     int64_t flush_pts_ns = 0;
     bool pending_seek_target = false;
     int64_t pending_seek_target_pts_ns = 0;
-    bool have_segment_target = false;
-    int64_t segment_target_pts_ns = 0;
+    bool seek_target_valid = false;
+    int64_t seek_target_pts_ns = 0;
     bool eos_sent = false;
     bool eos_pending = false;
     bool ended = false;
@@ -439,10 +439,8 @@ static bool resolve_effective_dovi_locked(struct starfish_ctx *ctx)
     case dovi_policy::AUTO:
     case dovi_policy::P7_FALLBACK:
         if (ctx->dv_profile == 7 && dovi_track_is_dual_layer(ctx)) {
-            mp_warn(ctx->log,
-                    "Dolby Vision profile 7 dual-layer stream needs conversion; "
-                    "falling back to HDR10 in current fork\n");
-            return false;
+            mp_info(ctx->log, "Starfish: Profile 7 detected, allowing conversion to 8.1 in decoder\n");
+            // we will convert this to 8.1 in the decoder
         }
         return true;
     }
@@ -736,42 +734,47 @@ static bool set_time_to_decode(struct starfish_ctx *ctx, int64_t pts_ns)
     return true;
 }
 
+static bool send_segment_event(struct starfish_ctx *ctx)
+{
+    auto *player = static_cast<mediapipeline::CustomPlayer *>(ctx->media->player.get());
+    auto *pipeline =
+        player ? static_cast<mediapipeline::CustomPipeline *>(player->getPipeline().get())
+               : nullptr;
+    if (!pipeline)
+        return true;
+
+    try {
+        pipeline->sendSegmentEvent();
+        return true;
+    } catch (const std::exception &e) {
+        mp_err(ctx->log, "Starfish sendSegmentEvent threw exception: %s\n", e.what());
+        return false;
+    } catch (...) {
+        mp_err(ctx->log, "Starfish sendSegmentEvent threw unknown exception\n");
+        return false;
+    }
+}
+
 static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type stream,
                             const queued_packet &packet, bool *buffer_full)
 {
-    if (stream == STARFISH_STREAM_VIDEO && ctx->need_segment) {
-        const int64_t segment_pts =
-            ctx->have_segment_target ? ctx->segment_target_pts_ns : packet.pts_ns;
+    if (ctx->need_segment) {
         mp_info(ctx->log,
-                "Starfish segment restart #%" PRIu64 ": target=%" PRId64
-                " packet_pts=%" PRId64 " source=%s\n",
-                ctx->segment_restart_count + 1, segment_pts, packet.pts_ns,
-                ctx->have_segment_target ? "seek-target" : "packet");
-        if (!set_time_to_decode(ctx, segment_pts)) {
-            mp_warn(ctx->log, "Starfish setTimeToDecode failed for segment target %" PRId64
-                              "\n",
-                    segment_pts);
+                "Starfish segment restart %s #%" PRIu64 ": packet_pts=%" PRId64
+                " requested_target=%" PRId64 "\n",
+                stream == STARFISH_STREAM_VIDEO ? "VIDEO" : "AUDIO",
+                ctx->segment_restart_count + 1, packet.pts_ns,
+                ctx->pending_seek_target ? ctx->pending_seek_target_pts_ns : packet.pts_ns);
+        if (!set_time_to_decode(ctx, packet.pts_ns)) {
+            mp_warn(ctx->log, "Starfish setTimeToDecode failed for packet pts %" PRId64 "\n",
+                    packet.pts_ns);
         }
-        auto *player = static_cast<mediapipeline::CustomPlayer *>(ctx->media->player.get());
-        auto *pipeline =
-            player ? static_cast<mediapipeline::CustomPipeline *>(player->getPipeline().get())
-                   : nullptr;
-        if (pipeline) {
-            try {
-                pipeline->sendSegmentEvent();
-            } catch (const std::exception &e) {
-                mp_err(ctx->log, "Starfish sendSegmentEvent threw exception: %s\n", e.what());
-                *buffer_full = true;
-                return false;
-            } catch (...) {
-                mp_err(ctx->log, "Starfish sendSegmentEvent threw unknown exception\n");
-                *buffer_full = true;
-                return false;
-            }
+        if (!send_segment_event(ctx)) {
+            *buffer_full = true;
+            return false;
         }
         ctx->segment_restart_count += 1;
         ctx->need_segment = false;
-        ctx->have_segment_target = false;
         ctx->pending_seek_target = false;
     }
 
@@ -808,6 +811,9 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
                                             std::unique_lock<std::mutex> &lock,
                                             enum starfish_stream_type stream)
 {
+    if (ctx->need_segment && stream == STARFISH_STREAM_AUDIO && !ctx->video_codec.empty())
+        return feed_attempt_result::NO_PACKET;
+
     std::deque<queued_packet> *queue = stream == STARFISH_STREAM_VIDEO
                                        ? &ctx->video_queue
                                        : &ctx->audio_queue;
@@ -883,19 +889,13 @@ static void apply_flush(struct starfish_ctx *ctx)
         ctx->ended = false;
         ctx->eos_sent = false;
         ctx->eos_pending = false;
-        if (ctx->pending_seek_target) {
-            ctx->segment_target_pts_ns = ctx->pending_seek_target_pts_ns;
-            ctx->have_segment_target = true;
-        } else {
-            ctx->segment_target_pts_ns = 0;
-            ctx->have_segment_target = false;
-        }
         ctx->need_segment = true;
         ctx->flush_requested = false;
         ctx->flush_count += 1;
         mp_info(ctx->log,
-                "Starfish apply_flush #%" PRIu64 ": have_target=%d target=%" PRId64 "\n",
-                ctx->flush_count, ctx->have_segment_target, ctx->segment_target_pts_ns);
+                "Starfish apply_flush #%" PRIu64 ": requested_target=%" PRId64 "\n",
+                ctx->flush_count,
+                ctx->pending_seek_target ? ctx->pending_seek_target_pts_ns : 0);
     }
 }
 
@@ -991,7 +991,9 @@ static void worker_loop(struct starfish_ctx *ctx)
                 continue;
             }
 
-            if (ctx->play_requested && ctx->state == pipeline_state::PAUSED) {
+            if (ctx->play_requested &&
+                (ctx->state == pipeline_state::PAUSED ||
+                 ctx->state == pipeline_state::LOADED)) {
                 lock.unlock();
                 if (!media_call_bool(ctx, "Play", [&] { return ctx->media->Play(); }))
                     mp_warn(ctx->log, "Starfish Play failed\n");
@@ -1046,7 +1048,9 @@ static void worker_loop(struct starfish_ctx *ctx)
                    (is_loaded_state(ctx->state) &&
                    ((!ctx->video_queue.empty()) || (!ctx->audio_queue.empty()) ||
                      (ctx->eos_pending && !ctx->eos_sent))) ||
-                   (ctx->play_requested && ctx->state == pipeline_state::PAUSED) ||
+                   (ctx->play_requested &&
+                    (ctx->state == pipeline_state::PAUSED ||
+                     ctx->state == pipeline_state::LOADED)) ||
                    (!ctx->play_requested && ctx->state == pipeline_state::PLAYING);
         });
     }
@@ -1134,8 +1138,8 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
             ctx->need_segment = false;
             ctx->pending_seek_target = false;
             ctx->pending_seek_target_pts_ns = 0;
-            ctx->have_segment_target = false;
-            ctx->segment_target_pts_ns = 0;
+            ctx->seek_target_valid = false;
+            ctx->seek_target_pts_ns = 0;
             ctx->ready_frames.clear();
             ctx->video_inflight.clear();
             ctx->audio_inflight.clear();
@@ -1510,10 +1514,8 @@ bool starfish_ctx_set_seek_target(struct starfish_ctx *ctx, double pts)
     std::lock_guard<std::mutex> lock(ctx->lock);
     ctx->pending_seek_target = true;
     ctx->pending_seek_target_pts_ns = (int64_t)(pts * 1e9);
-    if (ctx->need_segment) {
-        ctx->segment_target_pts_ns = ctx->pending_seek_target_pts_ns;
-        ctx->have_segment_target = true;
-    }
+    ctx->seek_target_valid = true;
+    ctx->seek_target_pts_ns = ctx->pending_seek_target_pts_ns;
     return true;
 }
 
@@ -1526,12 +1528,24 @@ bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts)
             ctx->flush_pts_ns = (int64_t)(pts * 1e9);
             ctx->pending_seek_target = true;
             ctx->pending_seek_target_pts_ns = ctx->flush_pts_ns;
-        } else if (!ctx->pending_seek_target) {
-            ctx->segment_target_pts_ns = 0;
-            ctx->have_segment_target = false;
+            ctx->seek_target_valid = true;
+            ctx->seek_target_pts_ns = ctx->flush_pts_ns;
         }
     }
     ctx->cv.notify_all();
+    return true;
+}
+
+bool starfish_ctx_get_seek_target_ns(struct starfish_ctx *ctx, int64_t *pts_ns)
+{
+    if (!ctx || !pts_ns)
+        return false;
+
+    std::lock_guard<std::mutex> lock(ctx->lock);
+    if (!ctx->seek_target_valid)
+        return false;
+
+    *pts_ns = ctx->seek_target_pts_ns;
     return true;
 }
 
@@ -1568,6 +1582,12 @@ double starfish_ctx_get_video_fps(struct starfish_ctx *ctx)
 {
     std::lock_guard<std::mutex> lock(ctx->lock);
     return ctx->fps;
+}
+
+int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx)
+{
+    std::lock_guard<std::mutex> lock(ctx->lock);
+    return ctx->dv_profile;
 }
 
 } // extern "C"
