@@ -1,5 +1,6 @@
 #include "starfish_ctx.h"
 
+#include <exception>
 #include <inttypes.h>
 #include <atomic>
 #include <chrono>
@@ -180,9 +181,37 @@ struct starfish_ctx {
 
 static std::mutex g_current_lock;
 static struct starfish_ctx *g_current_ctx;
+static std::mutex g_media_init_lock;
+static std::unique_ptr<StarfishMediaAPIs> g_primed_media;
 static void player_callback(int32_t type, int64_t numValue, const char *strValue,
                             void *opaque);
 static void worker_loop(struct starfish_ctx *ctx);
+
+template <typename F>
+static bool media_call_bool(struct starfish_ctx *ctx, const char *what, F &&fn)
+{
+    try {
+        return fn();
+    } catch (const std::exception &e) {
+        mp_err(ctx->log, "Starfish %s threw exception: %s\n", what, e.what());
+    } catch (...) {
+        mp_err(ctx->log, "Starfish %s threw unknown exception\n", what);
+    }
+    return false;
+}
+
+template <typename F>
+static std::string media_call_string(struct starfish_ctx *ctx, const char *what, F &&fn)
+{
+    try {
+        return fn();
+    } catch (const std::exception &e) {
+        mp_err(ctx->log, "Starfish %s threw exception: %s\n", what, e.what());
+    } catch (...) {
+        mp_err(ctx->log, "Starfish %s threw unknown exception\n", what);
+    }
+    return "";
+}
 
 static const char *event_name(int32_t type)
 {
@@ -265,11 +294,31 @@ static void wake_all(struct starfish_ctx *ctx)
     wake_stream(ctx, STARFISH_STREAM_AUDIO);
 }
 
+static std::unique_ptr<StarfishMediaAPIs> create_media_instance(struct mp_log *log)
+{
+    try {
+        return std::make_unique<StarfishMediaAPIs>();
+    } catch (const std::exception &e) {
+        if (log)
+            mp_err(log, "StarfishMediaAPIs allocation threw exception: %s\n", e.what());
+    } catch (...) {
+        if (log)
+            mp_err(log, "StarfishMediaAPIs allocation threw unknown exception\n");
+    }
+    return nullptr;
+}
+
 static bool ensure_media(struct starfish_ctx *ctx)
 {
     if (ctx->media)
         return true;
-    ctx->media = std::make_unique<StarfishMediaAPIs>();
+
+    std::lock_guard<std::mutex> media_lock(g_media_init_lock);
+    if (g_primed_media) {
+        ctx->media = std::move(g_primed_media);
+        return true;
+    }
+    ctx->media = create_media_instance(ctx->log);
     return !!ctx->media;
 }
 
@@ -340,7 +389,8 @@ static void set_failed_locked(struct starfish_ctx *ctx, int code, const char *re
 static bool set_time_to_decode(struct starfish_ctx *ctx, int64_t pts_ns)
 {
     std::string payload = starfish_json_build_seek(pts_ns);
-    if (ctx->media->setTimeToDecode(payload.c_str()))
+    if (media_call_bool(ctx, "setTimeToDecode",
+                        [&] { return ctx->media->setTimeToDecode(payload.c_str()); }))
         return true;
 
     auto *player = static_cast<mediapipeline::CustomPlayer *>(ctx->media->player.get());
@@ -350,9 +400,25 @@ static bool set_time_to_decode(struct starfish_ctx *ctx, int64_t pts_ns)
         return false;
 
     MEDIA_CUSTOM_CONTENT_INFO_T content_info;
-    pipeline->loadSpi_getInfo(&content_info);
+    try {
+        pipeline->loadSpi_getInfo(&content_info);
+    } catch (const std::exception &e) {
+        mp_err(ctx->log, "Starfish loadSpi_getInfo threw exception: %s\n", e.what());
+        return false;
+    } catch (...) {
+        mp_err(ctx->log, "Starfish loadSpi_getInfo threw unknown exception\n");
+        return false;
+    }
     content_info.ptsToDecode = pts_ns;
-    pipeline->setContentInfo(MEDIA_CUSTOM_SRC_TYPE_ES, &content_info);
+    try {
+        pipeline->setContentInfo(MEDIA_CUSTOM_SRC_TYPE_ES, &content_info);
+    } catch (const std::exception &e) {
+        mp_err(ctx->log, "Starfish setContentInfo threw exception: %s\n", e.what());
+        return false;
+    } catch (...) {
+        mp_err(ctx->log, "Starfish setContentInfo threw unknown exception\n");
+        return false;
+    }
     return false;
 }
 
@@ -365,14 +431,26 @@ static bool try_feed_packet(struct starfish_ctx *ctx, enum starfish_stream_type 
         auto *pipeline =
             player ? static_cast<mediapipeline::CustomPipeline *>(player->getPipeline().get())
                    : nullptr;
-        if (pipeline)
-            pipeline->sendSegmentEvent();
+        if (pipeline) {
+            try {
+                pipeline->sendSegmentEvent();
+            } catch (const std::exception &e) {
+                mp_err(ctx->log, "Starfish sendSegmentEvent threw exception: %s\n", e.what());
+                *buffer_full = true;
+                return false;
+            } catch (...) {
+                mp_err(ctx->log, "Starfish sendSegmentEvent threw unknown exception\n");
+                *buffer_full = true;
+                return false;
+            }
+        }
         ctx->need_segment = false;
     }
 
     std::string payload = starfish_json_build_feed(stream, packet.data->data(),
                                                    packet.data->size(), packet.pts_ns);
-    std::string result = ctx->media->Feed(payload.c_str());
+    std::string result = media_call_string(ctx, "Feed",
+                                           [&] { return ctx->media->Feed(payload.c_str()); });
     mp_info(ctx->log, "Starfish %s feed: size=%zu pts=%" PRId64 " result=%s\n",
             stream == STARFISH_STREAM_VIDEO ? "video" : "audio",
             packet.data->size(), packet.pts_ns, result.c_str());
@@ -459,7 +537,7 @@ static void apply_flush(struct starfish_ctx *ctx)
         loaded = is_loaded_state(ctx->state);
     }
 
-    if (loaded && !ctx->media->flush())
+    if (loaded && !media_call_bool(ctx, "flush", [&] { return ctx->media->flush(); }))
         mp_warn(ctx->log, "Starfish flush() failed\n");
 
     {
@@ -535,9 +613,11 @@ static void worker_loop(struct starfish_ctx *ctx)
                 wake_all(ctx);
                 continue;
             }
-            if (!ctx->media->notifyForeground())
+            if (!media_call_bool(ctx, "notifyForeground",
+                                 [&] { return ctx->media->notifyForeground(); }))
                 mp_warn(ctx->log, "Starfish notifyForeground failed\n");
-            bool ok = ctx->media->Load(payload.c_str(), &player_callback, ctx);
+            bool ok = media_call_bool(ctx, "Load",
+                                      [&] { return ctx->media->Load(payload.c_str(), &player_callback, ctx); });
             mp_info(ctx->log, "Starfish Load returned: %s\n", ok ? "success" : "failure");
             lock.lock();
             if (!ok) {
@@ -556,7 +636,7 @@ static void worker_loop(struct starfish_ctx *ctx)
         if (is_loaded_state(ctx->state)) {
             if (!ctx->play_requested && ctx->state == pipeline_state::PLAYING) {
                 lock.unlock();
-                if (!ctx->media->Pause())
+                if (!media_call_bool(ctx, "Pause", [&] { return ctx->media->Pause(); }))
                     mp_warn(ctx->log, "Starfish Pause failed\n");
                 lock.lock();
                 continue;
@@ -564,7 +644,7 @@ static void worker_loop(struct starfish_ctx *ctx)
 
             if (ctx->play_requested && ctx->state == pipeline_state::PAUSED) {
                 lock.unlock();
-                if (!ctx->media->Play())
+                if (!media_call_bool(ctx, "Play", [&] { return ctx->media->Play(); }))
                     mp_warn(ctx->log, "Starfish Play failed\n");
                 lock.lock();
                 continue;
@@ -604,7 +684,7 @@ static void worker_loop(struct starfish_ctx *ctx)
             if (ctx->eos_pending && !ctx->eos_sent) {
                 ctx->eos_sent = true;
                 lock.unlock();
-                if (!ctx->media->pushEOS())
+                if (!media_call_bool(ctx, "pushEOS", [&] { return ctx->media->pushEOS(); }))
                     mp_warn(ctx->log, "Starfish pushEOS failed\n");
                 lock.lock();
                 ctx->eos_pending = false;
@@ -725,7 +805,7 @@ static void player_callback(int32_t type, int64_t numValue, const char *strValue
         }
     }
 
-    if (call_play && !ctx->media->Play())
+    if (call_play && !media_call_bool(ctx, "Play after load", [&] { return ctx->media->Play(); }))
         mp_err(ctx->log, "Starfish Play failed after load\n");
     ctx->cv.notify_all();
     if (wake_video)
@@ -752,6 +832,15 @@ struct starfish_ctx *starfish_ctx_create(struct mp_log *log)
     return ctx;
 }
 
+bool starfish_ctx_prime_media(void)
+{
+    std::lock_guard<std::mutex> media_lock(g_media_init_lock);
+    if (g_primed_media)
+        return true;
+    g_primed_media = create_media_instance(nullptr);
+    return !!g_primed_media;
+}
+
 struct starfish_ctx *starfish_ctx_retain(struct starfish_ctx *ctx)
 {
     if (ctx)
@@ -775,7 +864,7 @@ void starfish_ctx_unref(struct starfish_ctx *ctx)
         ctx->worker.join();
 
     if (ctx->media)
-        ctx->media->Unload();
+        media_call_bool(ctx, "Unload", [&] { return ctx->media->Unload(); });
     if (ctx->acb_id) {
         if (ctx->acb_initialized)
             AcbAPI_finalize(ctx->acb_id);
