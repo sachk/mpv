@@ -8,6 +8,8 @@
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
 #include <libavutil/hwcontext.h>
+#include "rpu_parser.h"
+
 
 #include "common/av_common.h"
 #include "common/codecs.h"
@@ -35,6 +37,7 @@ struct priv {
     bool have_filtered;
     bool input_eof;
     bool sent_eof;
+    bool wait_for_keyframe;
     struct mp_decoder public;
 };
 
@@ -178,11 +181,97 @@ static void maybe_output_eof(struct mp_filter *f)
     mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
 }
 
+static void process_dovi_packet(struct priv *p, const uint8_t **data, size_t *size)
+{
+    if (starfish_ctx_get_dovi_profile(p->ctx) != 7)
+        return;
+
+    // Search for UNSPEC62 NAL unit in the Annex B stream
+    const uint8_t *buf = *data;
+    size_t len = *size;
+    
+    for (size_t i = 0; i + 5 < len; i++) {
+        if (buf[i] == 0 && buf[i+1] == 0 && (buf[i+2] == 1 || (buf[i+2] == 0 && buf[i+3] == 1))) {
+            size_t header_len = (buf[i+2] == 1) ? 3 : 4;
+            uint8_t nal_type = (buf[i+header_len] >> 1) & 0x3F;
+            if (nal_type == 62) {
+                // Found UNSPEC62 RPU NAL unit
+                size_t nalu_start = i;
+                size_t nalu_content_start = i + header_len;
+                size_t nalu_end = len;
+                // Find next start code or end of buffer
+                for (size_t j = i + header_len + 1; j + 3 < len; j++) {
+                    if (buf[j] == 0 && buf[j+1] == 0 && (buf[j+2] == 1 || (buf[j+2] == 0 && buf[j+3] == 1))) {
+                        nalu_end = j;
+                        break;
+                    }
+                }
+                
+                size_t nalu_full_len = nalu_end - nalu_start;
+                size_t nalu_content_len = nalu_end - nalu_content_start;
+                
+                // Skip start code prefix when parsing with libdovi
+                RpuOpaque *rpu = dovi_parse_unspec62_nalu(&buf[nalu_content_start], nalu_content_len);
+                if (rpu) {
+                    if (dovi_convert_rpu_with_mode(rpu, 2) == 0) {
+                        const dovi_data_t *new_data = dovi_write_unspec62_nalu(rpu);
+                        if (new_data) {
+                            // Replace NAL unit in a new buffer. 
+                            // Ensure 4-byte start code prefix (00 00 00 01) is prepended to new_data.
+                            size_t new_total_len = len - nalu_full_len + 4 + new_data->len;
+                            uint8_t *new_buf = talloc_size(p, new_total_len);
+                            if (new_buf) {
+                                // 1. Copy everything before the RPU NAL unit
+                                memcpy(new_buf, buf, nalu_start);
+                                
+                                // 2. Insert 4-byte Annex B start code
+                                new_buf[nalu_start] = 0;
+                                new_buf[nalu_start + 1] = 0;
+                                new_buf[nalu_start + 2] = 0;
+                                new_buf[nalu_start + 3] = 1;
+                                
+                                // 3. Copy the converted NAL unit (already contains header)
+                                memcpy(new_buf + nalu_start + 4, new_data->data, new_data->len);
+                                
+                                // 4. Copy everything after the RPU NAL unit
+                                memcpy(new_buf + nalu_start + 4 + new_data->len, buf + nalu_end, len - nalu_end);
+                                
+                                *data = new_buf;
+                                *size = new_total_len;
+                                mp_info(p->log, "vd_starfish: converted Profile 7 RPU to 8.1 (%zu -> %zu bytes, content only)\n", 
+                                        nalu_content_len, new_data->len);
+                            }
+                            dovi_data_free(new_data);
+                        }
+                    } else {
+                        const char *err = dovi_rpu_get_error(rpu);
+                        mp_warn(p->log, "vd_starfish: dovi_convert_rpu_with_mode failed: %s\n", err ? err : "unknown");
+                    }
+                    dovi_rpu_free(rpu);
+                }
+                break; // Only process one RPU per packet (unlikely to have more)
+            }
+        }
+    }
+}
+
 static bool feed_pending(struct mp_filter *f)
 {
     struct priv *p = f->priv;
     if (!p->pending)
         return false;
+
+    if (p->wait_for_keyframe) {
+        if (!p->pending->keyframe) {
+            MP_INFO(p, "vd_starfish dropping non-keyframe after reset pts=%f dts=%f\n",
+                    p->pending->pts, p->pending->dts);
+            clear_pending(p);
+            return true;
+        }
+        p->wait_for_keyframe = false;
+        MP_INFO(p, "vd_starfish starting decode on keyframe pts=%f dts=%f\n",
+                p->pending->pts, p->pending->dts);
+    }
 
     const void *data = p->pending->buffer;
     size_t size = p->pending->len;
@@ -195,14 +284,13 @@ static bool feed_pending(struct mp_filter *f)
         size = p->filtered_pkt->size;
     }
 
-    MP_INFO(p, "vd_starfish feeding bytes=%02x %02x %02x %02x size=%zu filtered=%d\n",
-            size > 0 ? ((const unsigned char *)data)[0] : 0,
-            size > 1 ? ((const unsigned char *)data)[1] : 0,
-            size > 2 ? ((const unsigned char *)data)[2] : 0,
-            size > 3 ? ((const unsigned char *)data)[3] : 0,
-            size, p->bsf ? 1 : 0);
+    const uint8_t *feed_data = data;
+    size_t feed_size = size;
+    process_dovi_packet(p, &feed_data, &feed_size);
 
-    int r = starfish_ctx_feed_video(p->ctx, data, size, p->pending->pts);
+    int r = starfish_ctx_feed_video(p->ctx, feed_data, feed_size, p->pending->pts);
+    if (feed_data != data)
+        talloc_free((void *)feed_data);
     MP_INFO(p, "vd_starfish feed_pending size=%zu pts=%f status=%d\n",
             size, p->pending->pts, r);
     if (r == STARFISH_FEED_OK) {
@@ -212,6 +300,16 @@ static bool feed_pending(struct mp_filter *f)
     if (r == STARFISH_FEED_ERROR)
         mp_filter_internal_mark_failed(f);
     return false;
+}
+
+static void reset_decoder_state(struct priv *p)
+{
+    clear_pending(p);
+    p->input_eof = false;
+    p->sent_eof = false;
+    p->wait_for_keyframe = true;
+    if (p->bsf)
+        av_bsf_flush(p->bsf);
 }
 
 static void process_input(struct mp_filter *f)
@@ -238,8 +336,9 @@ static void process_input(struct mp_filter *f)
     }
 
     p->pending = frame.data;
-    MP_INFO(p, "vd_starfish queued packet size=%zu pts=%f dts=%f\n",
-            p->pending->len, p->pending->pts, p->pending->dts);
+    MP_INFO(p, "vd_starfish queued packet size=%zu pts=%f dts=%f keyframe=%d wait_keyframe=%d\n",
+            p->pending->len, p->pending->pts, p->pending->dts,
+            p->pending->keyframe, p->wait_for_keyframe);
 }
 
 static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg)
@@ -248,6 +347,7 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg)
 
     switch (cmd) {
     case VDCTRL_REINIT:
+        reset_decoder_state(p);
         starfish_ctx_flush(p->ctx, p->start_pts);
         return CONTROL_TRUE;
     case VDCTRL_SET_START_PTS:
@@ -275,11 +375,7 @@ static void vd_starfish_reset(struct mp_filter *f)
 {
     struct priv *p = f->priv;
 
-    clear_pending(p);
-    p->input_eof = false;
-    p->sent_eof = false;
-    if (p->bsf)
-        av_bsf_flush(p->bsf);
+    reset_decoder_state(p);
     starfish_ctx_flush(p->ctx, p->start_pts);
 }
 
@@ -333,6 +429,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->codec = codec;
     p->ctx = ctx;
     p->start_pts = MP_NOPTS_VALUE;
+    p->wait_for_keyframe = true;
     p->public.f = vd;
     p->public.control = control;
 
