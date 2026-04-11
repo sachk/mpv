@@ -27,8 +27,6 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/rational.h>
-#define PL_LIBAV_IMPLEMENTATION 0
-#include <libplacebo/utils/libav.h>
 
 #include "audio/chmap.h"
 #include "audio/format.h"
@@ -489,6 +487,131 @@ static int scale_content_light(float value)
     return value > 0.0f ? (int)llrintf(value) : 0;
 }
 
+static enum AVColorSpace color_system_to_av(enum pl_color_system sys)
+{
+    switch (sys) {
+    case PL_COLOR_SYSTEM_UNKNOWN:
+        return AVCOL_SPC_UNSPECIFIED;
+    case PL_COLOR_SYSTEM_BT_601:
+        return AVCOL_SPC_SMPTE170M;
+    case PL_COLOR_SYSTEM_BT_709:
+        return AVCOL_SPC_BT709;
+    case PL_COLOR_SYSTEM_SMPTE_240M:
+        return AVCOL_SPC_SMPTE240M;
+    case PL_COLOR_SYSTEM_BT_2020_NC:
+        return AVCOL_SPC_BT2020_NCL;
+    case PL_COLOR_SYSTEM_BT_2020_C:
+        return AVCOL_SPC_BT2020_CL;
+    case PL_COLOR_SYSTEM_BT_2100_PQ:
+    case PL_COLOR_SYSTEM_BT_2100_HLG:
+        return AVCOL_SPC_ICTCP;
+    case PL_COLOR_SYSTEM_DOLBYVISION:
+    case PL_COLOR_SYSTEM_XYZ:
+        return AVCOL_SPC_UNSPECIFIED;
+    case PL_COLOR_SYSTEM_YCGCO:
+        return AVCOL_SPC_YCGCO;
+    case PL_COLOR_SYSTEM_RGB:
+        return AVCOL_SPC_RGB;
+    case PL_COLOR_SYSTEM_COUNT:
+        return AVCOL_SPC_NB;
+    }
+
+    return AVCOL_SPC_UNSPECIFIED;
+}
+
+static enum AVColorRange color_levels_to_av(enum pl_color_levels levels)
+{
+    switch (levels) {
+    case PL_COLOR_LEVELS_UNKNOWN:
+        return AVCOL_RANGE_UNSPECIFIED;
+    case PL_COLOR_LEVELS_LIMITED:
+        return AVCOL_RANGE_MPEG;
+    case PL_COLOR_LEVELS_FULL:
+        return AVCOL_RANGE_JPEG;
+    case PL_COLOR_LEVELS_COUNT:
+        return AVCOL_RANGE_NB;
+    }
+
+    return AVCOL_RANGE_UNSPECIFIED;
+}
+
+static enum AVColorPrimaries color_primaries_to_av(enum pl_color_primaries prim)
+{
+    switch (prim) {
+    case PL_COLOR_PRIM_UNKNOWN:
+        return AVCOL_PRI_UNSPECIFIED;
+    case PL_COLOR_PRIM_BT_601_525:
+        return AVCOL_PRI_SMPTE170M;
+    case PL_COLOR_PRIM_BT_601_625:
+        return AVCOL_PRI_BT470BG;
+    case PL_COLOR_PRIM_BT_709:
+        return AVCOL_PRI_BT709;
+    case PL_COLOR_PRIM_BT_470M:
+        return AVCOL_PRI_BT470M;
+    case PL_COLOR_PRIM_EBU_3213:
+        return AVCOL_PRI_JEDEC_P22;
+    case PL_COLOR_PRIM_BT_2020:
+        return AVCOL_PRI_BT2020;
+    case PL_COLOR_PRIM_CIE_1931:
+        return AVCOL_PRI_SMPTE428;
+    case PL_COLOR_PRIM_DCI_P3:
+        return AVCOL_PRI_SMPTE431;
+    case PL_COLOR_PRIM_DISPLAY_P3:
+        return AVCOL_PRI_SMPTE432;
+    case PL_COLOR_PRIM_FILM_C:
+        return AVCOL_PRI_FILM;
+    case PL_COLOR_PRIM_APPLE:
+    case PL_COLOR_PRIM_ADOBE:
+    case PL_COLOR_PRIM_PRO_PHOTO:
+    case PL_COLOR_PRIM_V_GAMUT:
+    case PL_COLOR_PRIM_S_GAMUT:
+    case PL_COLOR_PRIM_ACES_AP0:
+    case PL_COLOR_PRIM_ACES_AP1:
+        return AVCOL_PRI_UNSPECIFIED;
+    case PL_COLOR_PRIM_COUNT:
+        return AVCOL_PRI_NB;
+    }
+
+    return AVCOL_PRI_UNSPECIFIED;
+}
+
+static enum AVColorTransferCharacteristic color_transfer_to_av(enum pl_color_transfer trc)
+{
+    switch (trc) {
+    case PL_COLOR_TRC_UNKNOWN:
+        return AVCOL_TRC_UNSPECIFIED;
+    case PL_COLOR_TRC_BT_1886:
+        return AVCOL_TRC_BT709;
+    case PL_COLOR_TRC_SRGB:
+        return AVCOL_TRC_IEC61966_2_1;
+    case PL_COLOR_TRC_LINEAR:
+        return AVCOL_TRC_LINEAR;
+    case PL_COLOR_TRC_GAMMA22:
+        return AVCOL_TRC_GAMMA22;
+    case PL_COLOR_TRC_GAMMA28:
+        return AVCOL_TRC_GAMMA28;
+    case PL_COLOR_TRC_ST428:
+        return AVCOL_TRC_SMPTE428;
+    case PL_COLOR_TRC_PQ:
+        return AVCOL_TRC_SMPTE2084;
+    case PL_COLOR_TRC_HLG:
+        return AVCOL_TRC_ARIB_STD_B67;
+    case PL_COLOR_TRC_GAMMA18:
+    case PL_COLOR_TRC_GAMMA20:
+    case PL_COLOR_TRC_GAMMA24:
+    case PL_COLOR_TRC_GAMMA26:
+    case PL_COLOR_TRC_PRO_PHOTO:
+    case PL_COLOR_TRC_V_LOG:
+    case PL_COLOR_TRC_S_LOG1:
+    case PL_COLOR_TRC_S_LOG2:
+        return AVCOL_TRC_UNSPECIFIED;
+    case PL_COLOR_TRC_COUNT:
+        return AVCOL_TRC_NB;
+    }
+
+    return AVCOL_TRC_UNSPECIFIED;
+}
+
 static bool apply_hdr_info(struct starfish_ctx *ctx)
 {
     struct starfish_json_hdr_info_params params = {};
@@ -513,11 +636,11 @@ static bool apply_hdr_info(struct starfish_ctx *ctx)
         params.max_display_mastering_luminance = scale_luminance(hdr->max_luma);
         params.max_content_light_level = scale_content_light(hdr->max_cll);
         params.max_pic_average_light_level = scale_content_light(hdr->max_fall);
-        params.transfer_characteristics = pl_transfer_to_av(ctx->video_color.transfer);
-        params.color_primaries = pl_primaries_to_av(ctx->video_color.primaries);
-        params.matrix_coeffs = pl_system_to_av(ctx->video_repr.sys);
+        params.transfer_characteristics = color_transfer_to_av(ctx->video_color.transfer);
+        params.color_primaries = color_primaries_to_av(ctx->video_color.primaries);
+        params.matrix_coeffs = color_system_to_av(ctx->video_repr.sys);
         params.video_full_range_flag =
-            pl_levels_to_av(ctx->video_repr.levels) == AVCOL_RANGE_JPEG;
+            color_levels_to_av(ctx->video_repr.levels) == AVCOL_RANGE_JPEG;
     }
 
     std::string payload = starfish_json_build_hdr_info(&params);
