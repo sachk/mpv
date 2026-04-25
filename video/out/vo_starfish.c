@@ -592,7 +592,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
     switch (request) {
     case VOCTRL_RESET:
-        // starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
+        /* The video decoder reset already triggers starfish_ctx_flush with the
+         * current seek target. Don't double-flush here — a second flush() while
+         * Starfish is mid-seek wedges the pipeline. */
         return VO_TRUE;
     case VOCTRL_PAUSE:
         return starfish_ctx_pause(p->ctx) ? VO_TRUE : VO_ERROR;
