@@ -470,7 +470,7 @@ static int resize(struct vo *vo)
 
     if (!p->exported_path && vo->params) {
         starfish_ctx_set_display_window(p->ctx, 0, 0, vo->params->w, vo->params->h,
-                                        0, 0, width, height);
+                                        dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst));
     }
 
     clear_free_buffers(vo);
@@ -491,6 +491,9 @@ static int preinit(struct vo *vo)
     struct priv *p = vo->priv;
     const char *window_id = getenv("STARFISH_WINDOW_ID");
     bool external_window = (window_id && window_id[0]) || vo->opts->WinID > 0;
+    const char *use_exported = getenv("STARFISH_USE_EXPORTED_WINDOW");
+    bool exported_enabled = use_exported && use_exported[0] &&
+                            strcmp(use_exported, "0") != 0;
 
     p->ctx = starfish_ctx_create(vo->log);
     if (!p->ctx)
@@ -513,7 +516,7 @@ static int preinit(struct vo *vo)
     } else if (vo->opts->WinID > 0) {
         p->window_ready = true;
         starfish_ctx_set_numeric_window_id(p->ctx, vo->opts->WinID);
-    } else if (vo->wl && vo->wl->webos_foreign) {
+    } else if (exported_enabled && vo->wl && vo->wl->webos_foreign) {
         p->exported = wl_webos_foreign_export_element(
             vo->wl->webos_foreign, vo->wl->video_surface,
             WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT);
@@ -525,7 +528,7 @@ static int preinit(struct vo *vo)
         wl_display_roundtrip(vo->wl->display);
         p->exported_path = true;
     } else {
-        MP_WARN(vo, "webOS exported window unavailable, using ACB fallback\n");
+        MP_INFO(vo, "Using Starfish ACB display window path\n");
     }
 
     hwdec_devices_add(vo->hwdec_devs, &p->hwctx);
