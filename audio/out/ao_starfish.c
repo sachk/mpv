@@ -47,6 +47,41 @@ struct priv {
 static void uninit(struct ao *ao);
 static int encode_silence_frame(struct ao *ao, int samples);
 static bool audio_prime_cb(void *opaque, int64_t pts_ns);
+static enum AVSampleFormat select_encoder_format(const AVCodec *codec);
+
+static bool reopen_encoder_locked(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    enum AVSampleFormat sample_fmt;
+
+    if (!codec)
+        return false;
+
+    sample_fmt = p->encoder ? p->encoder->sample_fmt : select_encoder_format(codec);
+    avcodec_free_context(&p->encoder);
+    p->encoder = avcodec_alloc_context3(codec);
+    if (!p->encoder)
+        return false;
+
+    p->encoder->sample_fmt = sample_fmt;
+    p->encoder->sample_rate = ao->samplerate;
+    p->encoder->time_base = (AVRational){1, ao->samplerate};
+    p->encoder->bit_rate = 192000;
+    p->encoder->profile = AV_PROFILE_AAC_LOW;
+    av_channel_layout_default(&p->encoder->ch_layout, ao->channels.num);
+
+    if (avcodec_open2(p->encoder, codec, NULL) < 0) {
+        MP_ERR(ao, "Failed to reopen AAC encoder\n");
+        avcodec_free_context(&p->encoder);
+        return false;
+    }
+
+    p->frame_samples = p->encoder->frame_size > 0 ? p->encoder->frame_size : 1024;
+    p->outburst = p->frame_samples;
+    p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
+    return true;
+}
 
 static void wake_ao(void *opaque)
 {
@@ -181,7 +216,8 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
         return false;
 
     av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
-    avcodec_flush_buffers(p->encoder);
+    if (!reopen_encoder_locked(ao))
+        return false;
     p->written_samples = av_rescale_q(pts_ns, (AVRational){1, 1000000000},
                                       p->encoder->time_base);
     p->primed = false;
@@ -486,8 +522,8 @@ static void reset(struct ao *ao)
     p->written_samples = 0;
     if (p->fifo)
         av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
-    if (p->encoder)
-        avcodec_flush_buffers(p->encoder);
+    if (p->encoder && !reopen_encoder_locked(ao))
+        MP_WARN(ao, "Unable to reopen Starfish AAC encoder on reset\n");
     p->needs_sync = true;
     pthread_mutex_unlock(&p->lock);
     if (p->ctx)
