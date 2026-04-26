@@ -97,6 +97,11 @@ struct wake_target {
   void *opaque = nullptr;
 };
 
+struct callback_guard {
+  std::atomic<starfish_ctx *> ctx{nullptr};
+  std::atomic<int> active{0};
+};
+
 const char *get_app_id() {
   const char *app_id = getenv("APPID");
   return app_id && app_id[0] ? app_id : "mpv";
@@ -180,6 +185,7 @@ void acb_callback(long acbId, long taskId, long eventType, long appState,
 
 struct starfish_ctx {
   std::atomic<int> refs{1};
+  callback_guard *callbacks = nullptr;
   struct mp_log *log = nullptr;
   std::mutex lock;
   std::condition_variable cv;
@@ -794,7 +800,7 @@ static bool try_start_load(struct starfish_ctx *ctx,
   media_call_bool(ctx, "notifyForeground",
                   [&] { return ctx->media->notifyForeground(); });
   bool ok = media_call_bool(ctx, "Load", [&] {
-    return ctx->media->Load(payload.c_str(), &player_callback, ctx);
+    return ctx->media->Load(payload.c_str(), &player_callback, ctx->callbacks);
   });
   mp_info(ctx->log, "Starfish Load returned: %s\n", ok ? "success" : "failure");
   if (ok)
@@ -1171,8 +1177,23 @@ static void worker_loop(struct starfish_ctx *ctx) {
 /* player callback (runs on Starfish's thread)                         */
 static void player_callback(int32_t type, int64_t numValue,
                             const char *strValue, void *opaque) {
-  struct starfish_ctx *ctx = (struct starfish_ctx *)opaque;
+  auto *guard = static_cast<callback_guard *>(opaque);
+  if (!guard)
+    return;
+
+  guard->active.fetch_add(1, std::memory_order_acq_rel);
+  struct starfish_ctx *ctx = guard->ctx.load(std::memory_order_acquire);
+  if (!ctx) {
+    guard->active.fetch_sub(1, std::memory_order_acq_rel);
+    return;
+  }
+
   std::unique_lock<std::mutex> lk(ctx->lock);
+  if (ctx->stop) {
+    lk.unlock();
+    guard->active.fetch_sub(1, std::memory_order_acq_rel);
+    return;
+  }
 
   int mapped_type = type;
 
@@ -1386,6 +1407,8 @@ static void player_callback(int32_t type, int64_t numValue,
     video_wake.cb(video_wake.opaque);
   if (wake_audio && audio_wake.cb)
     audio_wake.cb(audio_wake.opaque);
+
+  guard->active.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1396,6 +1419,8 @@ extern "C" {
 
 struct starfish_ctx *starfish_ctx_create(struct mp_log *log) {
   struct starfish_ctx *ctx = new starfish_ctx();
+  ctx->callbacks = new callback_guard();
+  ctx->callbacks->ctx.store(ctx, std::memory_order_release);
   ctx->log = mp_log_new(nullptr, log, "starfish");
   if (env_wants_audio_hint()) {
     ctx->audio_codec = "AAC";
@@ -1429,6 +1454,8 @@ void starfish_ctx_unref(struct starfish_ctx *ctx) {
   if (ctx->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
     return;
 
+  callback_guard *guard = ctx->callbacks;
+
   {
     std::lock_guard<std::mutex> lk(ctx->lock);
     ctx->stop = true;
@@ -1436,6 +1463,12 @@ void starfish_ctx_unref(struct starfish_ctx *ctx) {
   ctx->cv.notify_all();
   if (ctx->worker.joinable())
     ctx->worker.join();
+
+  if (guard) {
+    guard->ctx.store(nullptr, std::memory_order_release);
+    while (guard->active.load(std::memory_order_acquire) > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 
   if (ctx->media)
     media_call_bool(ctx, "Unload", [&] { return ctx->media->Unload(); });
