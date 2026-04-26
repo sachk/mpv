@@ -62,6 +62,8 @@ struct priv {
 static pthread_mutex_t overlay_cb_lock = PTHREAD_MUTEX_INITIALIZER;
 static starfish_overlay_present_cb overlay_present_cb;
 static void *overlay_present_opaque;
+static starfish_exported_crop_cb exported_crop_cb;
+static void *exported_crop_opaque;
 
 STARFISH_CTX_API void starfish_overlay_set_present_cb(starfish_overlay_present_cb cb,
                                                       void *opaque)
@@ -69,6 +71,15 @@ STARFISH_CTX_API void starfish_overlay_set_present_cb(starfish_overlay_present_c
     pthread_mutex_lock(&overlay_cb_lock);
     overlay_present_cb = cb;
     overlay_present_opaque = opaque;
+    pthread_mutex_unlock(&overlay_cb_lock);
+}
+
+STARFISH_CTX_API void starfish_exported_set_crop_cb(starfish_exported_crop_cb cb,
+                                                    void *opaque)
+{
+    pthread_mutex_lock(&overlay_cb_lock);
+    exported_crop_cb = cb;
+    exported_crop_opaque = opaque;
     pthread_mutex_unlock(&overlay_cb_lock);
 }
 
@@ -221,6 +232,8 @@ static void map_video_surface(struct vo *vo)
 static void update_external_osd_geometry(struct vo *vo)
 {
     struct priv *p = vo->priv;
+    starfish_exported_crop_cb crop_cb = NULL;
+    void *crop_opaque = NULL;
 
     if (vo->wl || !vo->params)
         return;
@@ -241,6 +254,16 @@ static void update_external_osd_geometry(struct vo *vo)
     struct mp_rect src, dst;
     vo_get_src_dst_rects(vo, &src, &dst, &p->osd);
     osd_resize(vo->osd, p->osd);
+
+    pthread_mutex_lock(&overlay_cb_lock);
+    crop_cb = exported_crop_cb;
+    crop_opaque = exported_crop_opaque;
+    pthread_mutex_unlock(&overlay_cb_lock);
+    if (crop_cb && vo->params) {
+        crop_cb(crop_opaque, vo->params->w, vo->params->h, src.x0, src.y0,
+                mp_rect_w(src), mp_rect_h(src), dst.x0, dst.y0,
+                mp_rect_w(dst), mp_rect_h(dst));
+    }
 
     mp_mutex_lock(&vo->params_mutex);
     p->target_params.w = mp_rect_w(dst);
@@ -424,6 +447,43 @@ static void set_exported_crop(struct vo *vo)
                dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst));
 }
 
+static void get_acb_display_window(struct vo *vo, struct mp_rect *src,
+                                   struct mp_rect *dst)
+{
+    *src = (struct mp_rect){0};
+    *dst = (struct mp_rect){0};
+
+    if (!vo->params || vo->params->w <= 0 || vo->params->h <= 0 ||
+        vo->dwidth <= 0 || vo->dheight <= 0)
+        return;
+
+    int d_w = vo->params->w;
+    int d_h = vo->params->h;
+    mp_image_params_get_dsize(vo->params, &d_w, &d_h);
+    if (d_w <= 0 || d_h <= 0) {
+        d_w = vo->params->w;
+        d_h = vo->params->h;
+    }
+
+    double aspect = (double)d_w / MPMAX(d_h, 1);
+    int dst_w = vo->dwidth;
+    int dst_h = lround(dst_w / aspect);
+    if (dst_h > vo->dheight) {
+        dst_h = vo->dheight;
+        dst_w = lround(dst_h * aspect);
+    }
+    dst_w = MPMAX(dst_w, 1);
+    dst_h = MPMAX(dst_h, 1);
+
+    *src = (struct mp_rect){0, 0, vo->params->w, vo->params->h};
+    *dst = (struct mp_rect){
+        (vo->dwidth - dst_w) / 2,
+        (vo->dheight - dst_h) / 2,
+        (vo->dwidth - dst_w) / 2 + dst_w,
+        (vo->dheight - dst_h) / 2 + dst_h,
+    };
+}
+
 static int resize(struct vo *vo)
 {
     struct priv *p = vo->priv;
@@ -468,17 +528,24 @@ static int resize(struct vo *vo)
     mp_mutex_unlock(&vo->params_mutex);
     set_exported_crop(vo);
 
+    struct mp_rect acb_src = src;
+    struct mp_rect acb_dst = dst;
     if (!p->exported_path && vo->params) {
-        starfish_ctx_set_display_window(p->ctx, 0, 0, vo->params->w, vo->params->h,
-                                        dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst));
+        get_acb_display_window(vo, &acb_src, &acb_dst);
+        starfish_ctx_set_display_window(p->ctx, acb_src.x0, acb_src.y0,
+                                        mp_rect_w(acb_src), mp_rect_h(acb_src),
+                                        acb_dst.x0, acb_dst.y0,
+                                        mp_rect_w(acb_dst), mp_rect_h(acb_dst));
     }
 
     clear_free_buffers(vo);
 
     if (!p->logged_resize) {
-        MP_INFO(vo, "Starfish resize: window=%dx%d src=%d,%d %dx%d dst=%d,%d %dx%d\n",
+        MP_INFO(vo,
+                "Starfish resize: window=%dx%d src=%d,%d %dx%d dst=%d,%d %dx%d acb=%d,%d %dx%d\n",
                 width, height, src.x0, src.y0, mp_rect_w(src), mp_rect_h(src),
-                dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst));
+                dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst),
+                acb_dst.x0, acb_dst.y0, mp_rect_w(acb_dst), mp_rect_h(acb_dst));
         p->logged_resize = true;
     }
 
@@ -631,6 +698,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     mp_mutex_lock(&vo->params_mutex);
     vo->target_params = &p->target_params;
     mp_mutex_unlock(&vo->params_mutex);
+    p->logged_resize = false;
     starfish_ctx_set_video_geometry(p->ctx, params->w, params->h, 0);
     if (!vo->wl) {
         update_external_osd_geometry(vo);
