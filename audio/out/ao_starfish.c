@@ -30,7 +30,7 @@ struct priv {
     bool paused;
     bool playing;
     double last_time;
-    double buffered;
+    double buffered_samples;
     int latency_samples;
     int outburst;
     int64_t written_samples;
@@ -39,13 +39,13 @@ struct priv {
     bool needs_sync;
 };
 
-#define STARFISH_AUDIO_TARGET_LATENCY_SEC 1.0
+#define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.25
 #define STARFISH_AUDIO_BUFFER_SEC 3.0
 #define STARFISH_AUDIO_START_PRIME_FRAMES 4
-#define STARFISH_AUDIO_SEEK_PREROLL_SEC 4.0
 
 static void uninit(struct ao *ao);
 static int encode_silence_frame(struct ao *ao, int samples);
+static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason);
 static bool audio_prime_cb(void *opaque, int64_t pts_ns);
 static enum AVSampleFormat select_encoder_format(const AVCodec *codec);
 
@@ -96,10 +96,10 @@ static void drain(struct ao *ao)
         return;
 
     double now = mp_time_sec();
-    if (p->buffered > 0) {
-        p->buffered -= (now - p->last_time) * ao->samplerate;
-        if (p->buffered < 0)
-            p->buffered = 0;
+    if (p->buffered_samples > 0) {
+        p->buffered_samples -= (now - p->last_time) * ao->samplerate;
+        if (p->buffered_samples < 0)
+            p->buffered_samples = 0;
     }
     p->last_time = now;
 }
@@ -220,17 +220,11 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
         return false;
     p->written_samples = av_rescale_q(pts_ns, (AVRational){1, 1000000000},
                                       p->encoder->time_base);
-    p->primed = false;
+    p->primed = true;
     p->needs_sync = false;
-    p->buffered = 0;
+    p->buffered_samples = 0;
     MP_INFO(ao, "ao_starfish prime at %s pts=%" PRId64 " samples=%" PRId64 "\n",
             reason ? reason : "request", pts_ns, p->written_samples);
-
-    int seek_frames = (int)((ao->samplerate * STARFISH_AUDIO_SEEK_PREROLL_SEC +
-                             p->frame_samples - 1) / p->frame_samples);
-    if (!prime_silence_frames(ao, seek_frames, "Seek-prerolled"))
-        return false;
-    p->primed = true;
     return true;
 }
 
@@ -316,7 +310,7 @@ static bool encode_pending_audio(struct ao *ao, bool flush_tail)
             }
 
             drain(ao);
-            p->buffered += p->frame_samples;
+            p->buffered_samples += p->frame_samples;
             av_packet_unref(p->packet);
         }
     }
@@ -378,7 +372,7 @@ static int encode_silence_frame(struct ao *ao, int samples)
         }
 
         drain(ao);
-        p->buffered += samples;
+        p->buffered_samples += samples;
         packets++;
         av_packet_unref(p->packet);
     }
@@ -516,9 +510,9 @@ static void reset(struct ao *ao)
     pthread_mutex_lock(&p->lock);
     p->paused = false;
     p->playing = false;
-    p->buffered = 0;
     p->primed = false;
     p->logged_write = false;
+    p->buffered_samples = 0;
     p->written_samples = 0;
     if (p->fifo)
         av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
@@ -540,10 +534,7 @@ static void start(struct ao *ao)
     p->last_time = mp_time_sec();
     MP_INFO(ao, "ao_starfish start\n");
     if (p->needs_sync) {
-        if (sync_written_samples_to_seek_target(ao, true))
-            p->needs_sync = false;
-        else
-            MP_INFO(ao, "ao_starfish start deferred audio prime until seek target is known\n");
+        MP_INFO(ao, "ao_starfish start waiting for Starfish segment audio prime\n");
     }
     if (!p->needs_sync && !ensure_audio_primed(ao))
         MP_WARN(ao, "Unable to re-prime Starfish audio on start\n");
@@ -576,19 +567,8 @@ static bool audio_write(struct ao *ao, void **data, int samples)
 
     pthread_mutex_lock(&p->lock);
     if (p->needs_sync) {
-        int64_t target_ns = 0;
-        if (starfish_ctx_get_seek_target_ns(p->ctx, &target_ns)) {
-            p->written_samples = av_rescale_q(target_ns, (AVRational){1, 1000000000},
-                                              p->encoder->time_base);
-            MP_INFO(ao, "ao_starfish synced audio pts base to seek target ns=%" PRId64
-                    " samples=%" PRId64 "\n",
-                    target_ns, p->written_samples);
-            p->needs_sync = false;
-        } else {
-            /* If we don't have a seek target yet, we should probably wait or
-             * at least not clear needs_sync so we try again on next write. */
-            MP_WARN(ao, "ao_starfish sync: waiting for seek target...\n");
-        }
+        MP_TRACE(ao, "ao_starfish sync: waiting for segment audio prime\n");
+        goto done;
     }
     if (!p->logged_write) {
         MP_INFO(ao, "ao_starfish first write samples=%d\n", samples);
@@ -602,8 +582,8 @@ static bool audio_write(struct ao *ao, void **data, int samples)
         goto done;
     if (!encode_pending_audio(ao, false))
         goto done;
-    if (p->buffered <= 0)
-        p->buffered = p->latency_samples;
+    if (p->buffered_samples < p->latency_samples)
+        p->buffered_samples = p->latency_samples;
     ok = true;
 
 done:
@@ -615,28 +595,20 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
 {
     struct priv *p = ao->priv;
     int queued_fifo = 0;
-    double queued_total;
+    double queued_total = 0;
 
     pthread_mutex_lock(&p->lock);
     queued_fifo = p->fifo ? av_audio_fifo_size(p->fifo) : 0;
-    if (p->needs_sync && sync_written_samples_to_seek_target(ao, false)) {
-        p->needs_sync = false;
-        if (!ensure_audio_primed(ao))
-            MP_WARN(ao, "Unable to re-prime Starfish audio from get_state\n");
-        queued_fifo = p->fifo ? av_audio_fifo_size(p->fifo) : 0;
-    }
-
     drain(ao);
-    queued_total = p->buffered + queued_fifo;
+    queued_total = p->buffered_samples + queued_fifo;
+
     state->queued_samples = queued_total;
     state->free_samples = MPMAX(ao->device_buffer - p->latency_samples -
                                 state->queued_samples, 0);
     state->free_samples = state->free_samples / p->outburst * p->outburst;
-    state->delay = queued_total;
-    if (state->delay < p->latency_samples)
-        state->delay = p->latency_samples;
-    state->delay /= ao->samplerate;
-    state->playing = p->playing && p->buffered > 0;
+    state->delay = queued_total / ao->samplerate;
+    state->playing = p->playing && !p->paused && !p->needs_sync &&
+                     queued_total > 0;
     pthread_mutex_unlock(&p->lock);
 }
 

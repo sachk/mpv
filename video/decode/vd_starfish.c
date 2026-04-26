@@ -354,7 +354,7 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
   switch (cmd) {
   case VDCTRL_REINIT:
     reset_decoder_state(p);
-    starfish_ctx_flush(p->ctx, p->start_pts);
+    starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
     return CONTROL_TRUE;
   case VDCTRL_SET_START_PTS:
     p->start_pts = *(double *)arg;
@@ -380,7 +380,7 @@ static void vd_starfish_reset(struct mp_filter *f) {
   struct priv *p = f->priv;
 
   reset_decoder_state(p);
-  starfish_ctx_flush(p->ctx, p->start_pts);
+  starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
 }
 
 static void vd_starfish_destroy(struct mp_filter *f) {

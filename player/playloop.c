@@ -1161,6 +1161,13 @@ static void handle_playback_restart(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
 
+    if (!opts->initial_audio_sync &&
+        mpctx->audio_status == STATUS_READY &&
+        mpctx->video_status == STATUS_SYNCING)
+    {
+        audio_start_ao(mpctx);
+    }
+
     if (mpctx->audio_status < STATUS_READY ||
         mpctx->video_status < STATUS_READY)
         return;
