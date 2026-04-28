@@ -2236,6 +2236,11 @@ Property list
     Read-only table of all the environment variables. A specific variable can be
     accessed as a sub-property, e.g. ``${env/HOME}`` returns ``$HOME`` if set.
 
+    .. note:: On certain platforms (e.g Windows) environment variables are case
+              insensitive and so ``${env/PATH}`` and ``${env/Path}`` will
+              resolve to the same thing. However, the returned table will
+              contain the variable name as is without any case-normalization.
+
 ``pid``
     Process-id of mpv.
 
@@ -2406,6 +2411,7 @@ Property list
     restart playback. The number of the first edition is 0.
 
     For Matroska files, this is the edition. For DVD/Blu-ray, this is the title.
+    For MPEG-TS, HLS, and EDL streams, this maps to the underlying program/variant.
 
     This strictly returns the user-set option or property value, and the
     ``current-edition`` property returns the runtime selected edition (this
@@ -2442,6 +2448,9 @@ Property list
     ``edition-list/N/title``
         Edition title as stored in the file. Not always available.
 
+    ``edition-list/N/metadata``
+        Per-edition metadata key/value pairs.
+
     When querying the property with the client API using ``MPV_FORMAT_NODE``,
     or with Lua ``mp.get_property_native``, this will return a mpv_node with
     the following contents:
@@ -2453,6 +2462,7 @@ Property list
                 "id"                MPV_FORMAT_INT64
                 "title"             MPV_FORMAT_STRING
                 "default"           MPV_FORMAT_FLAG
+                "metadata"          MPV_FORMAT_NODE_MAP
 
 ``metadata``
     Metadata key/value pairs.
@@ -2467,7 +2477,7 @@ Property list
 
     This has a number of sub-properties:
 
-    ``metadata/by-key/<key>``
+    ``metadata/by-key/<key>`` (RW)
         Value of metadata entry ``<key>``.
 
     ``metadata/list/count``
@@ -3148,8 +3158,15 @@ Property list
 
     ``mouse-pos/hover``
         Boolean - whether the mouse pointer hovers the video window. The
-        coordinates should be ignored when this value is false, because the
-        video backends update them only when the pointer hovers the window.
+        coordinates should be ignored when this value is false if no mouse
+        button is being pressed, because the video backends update them only
+        when the pointer hovers the window in this case.
+
+        If a mouse button is pressed while the pointer hovers the video window
+        and then the mouse pointer moves out of window region without releasing
+        the button, some video backends "capture" the pointer and still report
+        the coordinates. In this case, the value of this property may be true or
+        false depending on the video backend.
 
 ``touch-pos``
     Read-only - last known touch point positions, normalized to OSD dimensions.
@@ -3273,6 +3290,29 @@ Property list
 ``secondary-sub-end``
     Same as ``sub-end``, but for the secondary subtitles.
 
+``sub-lines``
+    The list of subtitle lines in memory. Not available if the subtitle is not
+    text-based (i.e. DVD/BD subtitles).
+
+    When querying the property with the client API using ``MPV_FORMAT_NODE``,
+    or with Lua ``mp.get_property_native``, this will return a mpv_node with
+    the following contents:
+
+    ::
+
+        MPV_FORMAT_NODE_ARRAY
+            MPV_FORMAT_NODE_MAP (for each subtitle line)
+                "text"  MPV_FORMAT_STRING
+                "start" MPV_FORMAT_DOUBLE
+                "end"   MPV_FORMAT_DOUBLE
+
+    ASS tags are stripped from ``text``.
+
+    ``end`` is absent if unknown.
+
+``secondary-sub-lines``
+    Same as ``sub-lines``, but for the secondary subtitles.
+
 ``playlist-pos`` (RW)
     Current position on playlist. The first entry is on position 0. Writing to
     this property may start playback at the new position.
@@ -3387,7 +3427,8 @@ Property list
                 "playlist-path" MPV_FORMAT_STRING (optional)
 
 ``track-list``
-    List of audio/video/sub tracks, current entry marked.
+    List of audio/video/sub tracks, current entry marked. When the file has
+    editions, only tracks belonging to the currently selected edition are listed.
 
     This has a number of sub-properties. Replace ``N`` with the 0-based track
     index.
@@ -3461,7 +3502,7 @@ Property list
         The bitrate of the HLS stream, if available.
 
     ``track-list/N/program-id``
-        The program ID of the HLS stream, if available.
+        The program ID of the stream, if available.
 
     ``track-list/N/codec``
         The codec name used by this track, for example ``h264``. Unavailable
@@ -3913,6 +3954,10 @@ Property list
         the left, right, top, and bottom margins respectively.
         Values are between 0.0 and 1.0, normalized to window width/height.
 
+    ``user-data/osc/draw-preview``
+        Used to communicate between osc and compatible thumbnailer (if
+        installed). See `OSC Preview API`_ section for more details.
+
     ``user-data/mpv/ytdl``
         Data shared by the builtin ytdl hook script.
 
@@ -3928,6 +3973,9 @@ Property list
 
     ``user-data/mpv/console/open``
         Whether the console is open.
+
+    ``user-data/mpv/context-menu/open``
+        Whether the context menu script is open.
 
 ``menu-data`` (RW)
     This property stores the raw menu definition. See `Context Menu`_ section for details.

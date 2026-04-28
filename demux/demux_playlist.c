@@ -259,7 +259,7 @@ static int parse_m3u(struct pl_parser *p)
             int len = stream_read_peek(p->real_stream, probe, sizeof(probe));
             bstr data = {probe, len};
             if (ext && data.len >= 2 && maybe_text(data)) {
-                const char *exts[] = {"m3u", "m3u8", NULL};
+                const char *exts[] = {"m3u", "m3u8", "strm", NULL};
                 for (int n = 0; exts[n]; n++) {
                     if (strcasecmp(ext, exts[n]) == 0)
                         goto ok;
@@ -432,15 +432,15 @@ static bool test_path(struct pl_parser *p, char *path, int autocreate)
         return true;
 
     bstr ext = bstr_get_ext(bstr0(path));
-    if (autocreate & AUTO_VIDEO && str_in_list(ext, p->mp_opts->video_exts))
+    if (autocreate & AUTO_VIDEO && bstr_in_list0(ext, p->mp_opts->video_exts))
         return true;
-    if (autocreate & AUTO_AUDIO && str_in_list(ext, p->mp_opts->audio_exts))
+    if (autocreate & AUTO_AUDIO && bstr_in_list0(ext, p->mp_opts->audio_exts))
         return true;
-    if (autocreate & AUTO_IMAGE && str_in_list(ext, p->mp_opts->image_exts))
+    if (autocreate & AUTO_IMAGE && bstr_in_list0(ext, p->mp_opts->image_exts))
         return true;
-    if (autocreate & AUTO_ARCHIVE && str_in_list(ext, p->mp_opts->archive_exts))
+    if (autocreate & AUTO_ARCHIVE && bstr_in_list0(ext, p->mp_opts->archive_exts))
         return true;
-    if (autocreate & AUTO_PLAYLIST && str_in_list(ext, p->mp_opts->playlist_exts))
+    if (autocreate & AUTO_PLAYLIST && bstr_in_list0(ext, p->mp_opts->playlist_exts))
         return true;
 
     return false;
@@ -519,15 +519,15 @@ static enum autocreate_mode get_directory_filter(struct pl_parser *p)
     enum autocreate_mode autocreate = AUTO_NONE;
     if (!p->opts->directory_filter || !p->opts->directory_filter[0])
         autocreate = AUTO_ANY;
-    if (str_in_list(bstr0("video"), p->opts->directory_filter))
+    if (bstr_in_list0(bstr0("video"), p->opts->directory_filter))
         autocreate |= AUTO_VIDEO;
-    if (str_in_list(bstr0("audio"), p->opts->directory_filter))
+    if (bstr_in_list0(bstr0("audio"), p->opts->directory_filter))
         autocreate |= AUTO_AUDIO;
-    if (str_in_list(bstr0("image"), p->opts->directory_filter))
+    if (bstr_in_list0(bstr0("image"), p->opts->directory_filter))
         autocreate |= AUTO_IMAGE;
-    if (str_in_list(bstr0("archive"), p->opts->directory_filter))
+    if (bstr_in_list0(bstr0("archive"), p->opts->directory_filter))
         autocreate |= AUTO_ARCHIVE;
-    if (str_in_list(bstr0("playlist"), p->opts->directory_filter))
+    if (bstr_in_list0(bstr0("playlist"), p->opts->directory_filter))
         autocreate |= AUTO_PLAYLIST;
     return autocreate;
 }
@@ -546,15 +546,15 @@ static int parse_dir(struct pl_parser *p)
             autocreate = get_directory_filter(p);
             break;
         case 2: // same
-            if (str_in_list(ext, p->mp_opts->video_exts)) {
+            if (bstr_in_list0(ext, p->mp_opts->video_exts)) {
                 autocreate = AUTO_VIDEO;
-            } else if (str_in_list(ext, p->mp_opts->audio_exts)) {
+            } else if (bstr_in_list0(ext, p->mp_opts->audio_exts)) {
                 autocreate = AUTO_AUDIO;
-            } else if (str_in_list(ext, p->mp_opts->image_exts)) {
+            } else if (bstr_in_list0(ext, p->mp_opts->image_exts)) {
                 autocreate = AUTO_IMAGE;
-            } else if (str_in_list(ext, p->mp_opts->archive_exts)) {
+            } else if (bstr_in_list0(ext, p->mp_opts->archive_exts)) {
                 autocreate = AUTO_ARCHIVE;
-            } else if (str_in_list(ext, p->mp_opts->playlist_exts)) {
+            } else if (bstr_in_list0(ext, p->mp_opts->playlist_exts)) {
                 autocreate = AUTO_PLAYLIST;
             }
             break;
@@ -616,6 +616,7 @@ static const struct pl_format dir_formats[] = {
 static const struct pl_format playlist_formats[] = {
     {"m3u", parse_m3u,
      MIME_TYPES("audio/mpegurl", "audio/x-mpegurl", "application/x-mpegurl")},
+    {"strm", parse_m3u},
     {"ini", parse_ref_init},
     {"pls", parse_pls,
      MIME_TYPES("audio/x-scpls")},

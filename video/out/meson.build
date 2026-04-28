@@ -21,7 +21,7 @@ endif
 wl_protocols_source = []
 wl_protocols_headers = []
 
-foreach v: ['1.39', '1.41', '1.44', '1.47']
+foreach v: ['1.39', '1.41', '1.44', '1.47', '1.48']
     features += {'wayland-protocols-' + v.replace('.', '-'):
         wl_protocol_dir != ''}
 endforeach
@@ -36,6 +36,10 @@ endif
 
 if features['wayland-protocols-1-44']
     protocols += [[wl_protocol_dir, 'staging/color-representation/color-representation-v1.xml']]
+endif
+
+if features['wayland-protocols-1-48']
+    protocols += [[wl_protocol_dir, 'staging/xdg-session-management/xdg-session-management-v1.xml']]
 endif
 
 foreach p: protocols

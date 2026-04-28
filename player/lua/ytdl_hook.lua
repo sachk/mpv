@@ -7,7 +7,7 @@ local o = {
     include = "^%w+%.youtube%.com/|^youtube%.com/|^youtu%.be/|^%w+%.twitch%.tv/|^twitch%.tv/",
     try_ytdl_first = false,
     use_manifests = false,
-    all_formats = false,
+    all_formats = true,
     force_all_formats = true,
     thumbnails = "none",
     ytdl_path = "",
@@ -26,6 +26,7 @@ options.read_options(o, nil, function()
 end)
 
 local chapter_list = {}
+local metadata = {}
 local playlist_cookies = {}
 local playlist_metadata = {}
 
@@ -37,6 +38,7 @@ end
 
 -- youtube-dl JSON name to mpv tag name
 local tag_list = {
+    ["title"]           = "title",
     ["artist"]          = "artist",
     ["album"]           = "album",
     ["album_artist"]    = "album_artist",
@@ -61,8 +63,6 @@ local tag_list = {
     ["is_live"]         = "ytdl_is_live",
     ["release_year"]    = "ytdl_release_year",
     ["description"]     = "ytdl_description",
-    -- "title" is handled by force-media-title
-    -- tags don't work with all_formats=yes
 }
 
 local safe_protos = Set {
@@ -486,13 +486,18 @@ local function formats_to_edl(json, formats, use_all_formats)
     local streams = {}
 
     local tbr_only = true
+    local has_video_only = false
     for _, track in ipairs(formats) do
         tbr_only = tbr_only and track["tbr"] and
                    (not track["abr"]) and (not track["vbr"])
+        local video_only = track.vcodec and track.vcodec ~= "none"
+                      and (not track.acodec or track.acodec == "none")
+        has_video_only = has_video_only or video_only
     end
 
     local has_requested_video = false
     local has_requested_audio = false
+    local next_program_id = 0
     -- Web players with quality selection always show the highest quality
     -- option at the top. Since tracks are usually listed with the first
     -- track at the top, that should also be the highest quality track.
@@ -537,6 +542,13 @@ local function formats_to_edl(json, formats, use_all_formats)
         local skip = #tracks == 0
         local params = ""
 
+        -- For DASH-style sources (video-only + audio-only streams), only video
+        -- formats get a program_id. Audio-only formats are shared across all
+        -- editions. For muxed sources, every format including audio_only becomes
+        -- a separate edition.
+        local has_video = track.vcodec and track.vcodec ~= "none"
+        local dominated = has_video or not has_video_only
+
         if use_all_formats then
             for _, sub in ipairs(tracks) do
                 -- A single track that is either audio or video. Delay load it.
@@ -580,7 +592,11 @@ local function formats_to_edl(json, formats, use_all_formats)
                 end
                 hdr[#hdr + 1] = "!track_meta,title=" ..
                     edl_escape(title) .. ",byterate=" .. byterate ..
+                    (dominated and ",program_id=" .. next_program_id or "") ..
                     (#flags > 0 and ",flags=" .. table.concat(flags, "+") or "")
+            end
+            if dominated then
+                next_program_id = next_program_id + 1
             end
 
             if duration > 0 then
@@ -661,6 +677,12 @@ local function add_single_video(json)
         elseif json.tbr then
             max_bitrate = json.tbr > max_bitrate and json.tbr or max_bitrate
         end
+
+        for json_name, mp_name in pairs(tag_list) do
+            if json[json_name] then
+                metadata[mp_name] = json[json_name]
+            end
+        end
     end
 
     if streamurl == ""  then
@@ -714,10 +736,6 @@ local function add_single_video(json)
     msg.debug("streamurl: " .. streamurl)
 
     mp.set_property("stream-open-filename", streamurl:gsub("^data:", "data://", 1))
-
-    if mp.get_property("force-media-title", "") == "" then
-        mp.set_property("file-local-options/force-media-title", json.title)
-    end
 
     -- set hls-bitrate for dash track selection
     if max_bitrate > 0 and
@@ -1155,8 +1173,7 @@ local function run_ytdl_hook(url)
 
     else -- probably a video
         -- add playlist metadata if any belongs to the current video
-        local metadata = playlist_metadata[mp.get_property("playlist-path")] or {}
-        for key, value in pairs(metadata) do
+        for key, value in pairs(playlist_metadata[mp.get_property("playlist-path")] or {}) do
             json[key] = value
         end
 
@@ -1196,6 +1213,11 @@ mp.add_hook("on_preloaded", 10, function ()
         mp.set_property_native("chapter-list", chapter_list)
         chapter_list = {}
     end
+
+    for key, value in pairs(metadata) do
+        mp.set_property("metadata/by-key/" .. key, value)
+    end
+    metadata = {}
 end)
 
 mp.add_hook("on_after_end_file", 50, function ()
