@@ -53,10 +53,21 @@ struct priv {
     size_t callback_size;
     int callback_stride;
     struct mp_image_params target_params;
-    bool logged_osd_pixels;
+    double last_osd_pts;
+    bool have_osd_pts;
+    int logged_osd_pixels;
+    int had_osd_pixels;
     bool logged_osd_skip;
     bool logged_draw_frame;
     bool logged_resize;
+};
+
+struct starfish_video_geometry {
+    int window_w;
+    int window_h;
+    struct mp_rect src;
+    struct mp_rect dst;
+    struct mp_osd_res osd;
 };
 
 static pthread_mutex_t overlay_cb_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -172,7 +183,6 @@ static void clear_free_buffers(struct vo *vo)
 
 static bool ensure_video_placeholder(struct vo *vo)
 {
-    struct priv *p = vo->priv;
     struct vo_wayland_state *wl = vo->wl;
 
     if (!wl || p->solid_buffer)
@@ -229,58 +239,172 @@ static void map_video_surface(struct vo *vo)
     wl_surface_damage_buffer(wl->surface, 0, 0, 1, 1);
 }
 
-static void update_external_osd_geometry(struct vo *vo)
+static bool get_external_window_size(struct vo *vo, int *width, int *height)
 {
-    struct priv *p = vo->priv;
-    starfish_exported_crop_cb crop_cb = NULL;
-    void *crop_opaque = NULL;
-
-    if (vo->wl || !vo->params)
-        return;
-
     const char *width_env = getenv("STARFISH_WINDOW_WIDTH");
     const char *height_env = getenv("STARFISH_WINDOW_HEIGHT");
-    int width = width_env ? atoi(width_env) : 0;
-    int height = height_env ? atoi(height_env) : 0;
+    *width = width_env ? atoi(width_env) : 0;
+    *height = height_env ? atoi(height_env) : 0;
 
-    if (width <= 0)
-        width = vo->params->w;
-    if (height <= 0)
-        height = vo->params->h;
+    if (*width <= 0 && vo->params)
+        *width = vo->params->w;
+    if (*height <= 0 && vo->params)
+        *height = vo->params->h;
 
-    vo->dwidth = width;
-    vo->dheight = height;
+    return *width > 0 && *height > 0;
+}
 
-    struct mp_rect src, dst;
-    vo_get_src_dst_rects(vo, &src, &dst, &p->osd);
-    osd_resize(vo->osd, p->osd);
+static bool compute_video_geometry(struct vo *vo, struct starfish_video_geometry *geo)
+{
+    struct priv *p = vo->priv;
+    struct vo_wayland_state *wl = vo->wl;
+
+    *geo = (struct starfish_video_geometry){0};
+    if (!vo->params || vo->params->w <= 0 || vo->params->h <= 0)
+        return false;
+
+    if (wl) {
+        geo->window_w = mp_rect_w(wl->geometry);
+        geo->window_h = mp_rect_h(wl->geometry);
+    } else if (!get_external_window_size(vo, &geo->window_w, &geo->window_h)) {
+        return false;
+    }
+
+    if (geo->window_w <= 0 || geo->window_h <= 0)
+        return false;
+
+    vo->dwidth = geo->window_w;
+    vo->dheight = geo->window_h;
+    vo_get_src_dst_rects(vo, &geo->src, &geo->dst, &geo->osd);
+    return mp_rect_w(geo->dst) > 0 && mp_rect_h(geo->dst) > 0;
+}
+
+static void set_target_params(struct vo *vo, const struct starfish_video_geometry *geo)
+{
+    struct priv *p = vo->priv;
+
+    mp_mutex_lock(&vo->params_mutex);
+    p->target_params.w = mp_rect_w(geo->dst);
+    p->target_params.h = mp_rect_h(geo->dst);
+    p->target_params.rotate = vo->params ? (vo->params->rotate % 90) * 90 : 0;
+    p->target_params.vflip = vo->params && vo->params->vflip;
+    vo->target_params = &p->target_params;
+    mp_mutex_unlock(&vo->params_mutex);
+}
+
+static void apply_exported_crop(struct vo *vo, const struct starfish_video_geometry *geo)
+{
+    struct priv *p = vo->priv;
+    struct vo_wayland_state *wl = vo->wl;
+
+    if (!p->exported || !p->window_ready || !wl || !wl->compositor)
+        return;
+
+    if (mp_rect_equals(&geo->src, &p->last_src) &&
+        mp_rect_equals(&geo->dst, &p->last_dst) &&
+        p->last_w == vo->params->w && p->last_h == vo->params->h)
+        return;
+
+    struct wl_region *orig = wl_compositor_create_region(wl->compositor);
+    struct wl_region *src_region = wl_compositor_create_region(wl->compositor);
+    struct wl_region *dst_region = wl_compositor_create_region(wl->compositor);
+    if (!orig || !src_region || !dst_region)
+        goto done;
+
+    wl_region_add(orig, 0, 0, vo->params->w, vo->params->h);
+    wl_region_add(src_region, geo->src.x0, geo->src.y0,
+                  mp_rect_w(geo->src), mp_rect_h(geo->src));
+    wl_region_add(dst_region, geo->dst.x0, geo->dst.y0,
+                  mp_rect_w(geo->dst), mp_rect_h(geo->dst));
+    wl_webos_exported_set_crop_region(p->exported, orig, src_region, dst_region);
+
+    p->last_src = geo->src;
+    p->last_dst = geo->dst;
+    p->last_w = vo->params->w;
+    p->last_h = vo->params->h;
+
+done:
+    if (orig)
+        wl_region_destroy(orig);
+    if (src_region)
+        wl_region_destroy(src_region);
+    if (dst_region)
+        wl_region_destroy(dst_region);
+}
+
+static void apply_external_crop_callback(struct vo *vo,
+                                         const struct starfish_video_geometry *geo)
+{
+    starfish_exported_crop_cb crop_cb = NULL;
+    void *crop_opaque = NULL;
 
     pthread_mutex_lock(&overlay_cb_lock);
     crop_cb = exported_crop_cb;
     crop_opaque = exported_crop_opaque;
     pthread_mutex_unlock(&overlay_cb_lock);
-    if (crop_cb && vo->params) {
-        crop_cb(crop_opaque, vo->params->w, vo->params->h, src.x0, src.y0,
-                mp_rect_w(src), mp_rect_h(src), dst.x0, dst.y0,
-                mp_rect_w(dst), mp_rect_h(dst));
+
+    if (crop_cb) {
+        crop_cb(crop_opaque, vo->params->w, vo->params->h,
+                geo->src.x0, geo->src.y0, mp_rect_w(geo->src), mp_rect_h(geo->src),
+                geo->dst.x0, geo->dst.y0, mp_rect_w(geo->dst), mp_rect_h(geo->dst));
+    }
+}
+
+static bool apply_video_geometry(struct vo *vo, const char *reason)
+{
+    struct priv *p = vo->priv;
+    struct vo_wayland_state *wl = vo->wl;
+    struct starfish_video_geometry geo;
+
+    if (!compute_video_geometry(vo, &geo))
+        return false;
+
+    if (wl) {
+        vo_wayland_set_opaque_region(wl, false);
+        vo_wayland_handle_scale(wl);
+        if (wl->video_viewport)
+            wp_viewport_set_destination(wl->video_viewport,
+                                        lround(mp_rect_w(geo.dst) / wl->scaling_factor),
+                                        lround(mp_rect_h(geo.dst) / wl->scaling_factor));
+        if (wl->video_subsurface)
+            wl_subsurface_set_position(wl->video_subsurface,
+                                       lround(geo.dst.x0 / wl->scaling_factor),
+                                       lround(geo.dst.y0 / wl->scaling_factor));
+        if (wl->osd_viewport)
+            wp_viewport_set_destination(wl->osd_viewport,
+                                        lround(vo->dwidth / wl->scaling_factor),
+                                        lround(vo->dheight / wl->scaling_factor));
+        if (wl->osd_subsurface)
+            wl_subsurface_set_position(wl->osd_subsurface,
+                                       lround((0 - geo.dst.x0) / wl->scaling_factor),
+                                       lround((0 - geo.dst.y0) / wl->scaling_factor));
+        apply_exported_crop(vo, &geo);
+    } else {
+        apply_external_crop_callback(vo, &geo);
+        if (!p->exported_path) {
+            starfish_ctx_set_display_window(p->ctx, geo.src.x0, geo.src.y0,
+                                            mp_rect_w(geo.src), mp_rect_h(geo.src),
+                                            geo.dst.x0, geo.dst.y0,
+                                            mp_rect_w(geo.dst), mp_rect_h(geo.dst));
+        }
     }
 
-    mp_mutex_lock(&vo->params_mutex);
-    p->target_params.w = mp_rect_w(dst);
-    p->target_params.h = mp_rect_h(dst);
-    p->target_params.rotate = vo->params ? (vo->params->rotate % 90) * 90 : 0;
-    p->target_params.vflip = vo->params && vo->params->vflip;
-    vo->target_params = &p->target_params;
-    mp_mutex_unlock(&vo->params_mutex);
+    p->osd = geo.osd;
+    osd_resize(vo->osd, p->osd);
+    set_target_params(vo, &geo);
 
     if (!p->logged_resize) {
         MP_INFO(vo,
-                "Starfish external resize: window=%dx%d src=%d,%d %dx%d dst=%d,%d %dx%d osd=%dx%d margins=%d,%d,%d,%d\n",
-                width, height, src.x0, src.y0, mp_rect_w(src), mp_rect_h(src),
-                dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst),
-                p->osd.w, p->osd.h, p->osd.mt, p->osd.mb, p->osd.ml, p->osd.mr);
+                "Starfish geometry apply reason=%s window=%dx%d video=%dx%d src=%d,%d %dx%d dst=%d,%d %dx%d osd=%dx%d margins=%d,%d,%d,%d mode=%s\n",
+                reason ? reason : "unknown", geo.window_w, geo.window_h,
+                vo->params->w, vo->params->h,
+                geo.src.x0, geo.src.y0, mp_rect_w(geo.src), mp_rect_h(geo.src),
+                geo.dst.x0, geo.dst.y0, mp_rect_w(geo.dst), mp_rect_h(geo.dst),
+                p->osd.w, p->osd.h, p->osd.mt, p->osd.mb, p->osd.ml, p->osd.mr,
+                wl ? (p->exported_path ? "exported" : "wayland") : "external");
         p->logged_resize = true;
     }
+    return true;
 }
 
 static void render_osd_surface(struct vo *vo, double pts)
@@ -328,7 +452,7 @@ static void render_osd_surface(struct vo *vo, double pts)
 
         memset(mpi.planes[0], 0, p->callback_size);
         osd_draw_on_image(vo->osd, p->osd, pts, 0, &mpi);
-        if (!p->logged_osd_pixels) {
+        {
             bool has_pixels = false;
             for (size_t i = 0; i + 3 < p->callback_size; i += 4) {
                 if (p->callback_pixels[i + 3]) {
@@ -336,9 +460,20 @@ static void render_osd_surface(struct vo *vo, double pts)
                     break;
                 }
             }
-            MP_INFO(vo, "Starfish OSD callback alpha=%s size=%dx%d pts=%.3f\n",
-                    has_pixels ? "nonzero" : "zero", mpi.w, mpi.h, pts);
-            p->logged_osd_pixels = true;
+            const bool first_nonzero = has_pixels && !p->had_osd_pixels;
+            if (has_pixels)
+                p->had_osd_pixels = 1;
+            const bool should_log =
+                !p->logged_osd_pixels ||               // first frame
+                first_nonzero ||                         // first nonzero frame
+                p->logged_osd_pixels < 3 ||              // first 3 frames
+                p->logged_osd_pixels % 30 == 0;          // every 30th frame
+            if (should_log) {
+                MP_INFO(vo, "Starfish OSD callback alpha=%s size=%dx%d pts=%.3f frame=%d\n",
+                        has_pixels ? "nonzero" : "zero", mpi.w, mpi.h, pts,
+                        p->logged_osd_pixels);
+            }
+            p->logged_osd_pixels++;
         }
         cb(cb_opaque, p->callback_pixels, mpi.w, mpi.h, mpi.stride[0]);
         return;
@@ -408,147 +543,11 @@ static const struct wl_webos_exported_listener exported_listener = {
     .window_id_assigned = exported_window_id_assigned,
 };
 
-static void set_exported_crop(struct vo *vo)
-{
-    struct priv *p = vo->priv;
-    struct vo_wayland_state *wl = vo->wl;
-
-    if (!p->exported || !p->window_ready || !vo->params ||
-        !wl || !wl->compositor || vo->dwidth <= 0 || vo->dheight <= 0)
-        return;
-
-    struct mp_rect src, dst;
-    struct mp_osd_res osd;
-    vo_get_src_dst_rects(vo, &src, &dst, &osd);
-    if (mp_rect_equals(&src, &p->last_src) &&
-        mp_rect_equals(&dst, &p->last_dst) &&
-        p->last_w == vo->params->w && p->last_h == vo->params->h)
-        return;
-
-    struct wl_region *orig = wl_compositor_create_region(wl->compositor);
-    struct wl_region *src_region = wl_compositor_create_region(wl->compositor);
-    struct wl_region *dst_region = wl_compositor_create_region(wl->compositor);
-
-    wl_region_add(orig, 0, 0, vo->params->w, vo->params->h);
-    wl_region_add(src_region, src.x0, src.y0, mp_rect_w(src), mp_rect_h(src));
-    wl_region_add(dst_region, dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst));
-    wl_webos_exported_set_crop_region(p->exported, orig, src_region, dst_region);
-    wl_region_destroy(orig);
-    wl_region_destroy(src_region);
-    wl_region_destroy(dst_region);
-
-    p->last_src = src;
-    p->last_dst = dst;
-    p->last_w = vo->params->w;
-    p->last_h = vo->params->h;
-
-    MP_VERBOSE(vo, "Updated Starfish exported crop: src=%d,%d %dx%d dst=%d,%d %dx%d\n",
-               src.x0, src.y0, mp_rect_w(src), mp_rect_h(src),
-               dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst));
-}
-
-static void get_acb_display_window(struct vo *vo, struct mp_rect *src,
-                                   struct mp_rect *dst)
-{
-    *src = (struct mp_rect){0};
-    *dst = (struct mp_rect){0};
-
-    if (!vo->params || vo->params->w <= 0 || vo->params->h <= 0 ||
-        vo->dwidth <= 0 || vo->dheight <= 0)
-        return;
-
-    int d_w = vo->params->w;
-    int d_h = vo->params->h;
-    mp_image_params_get_dsize(vo->params, &d_w, &d_h);
-    if (d_w <= 0 || d_h <= 0) {
-        d_w = vo->params->w;
-        d_h = vo->params->h;
-    }
-
-    double aspect = (double)d_w / MPMAX(d_h, 1);
-    int dst_w = vo->dwidth;
-    int dst_h = lround(dst_w / aspect);
-    if (dst_h > vo->dheight) {
-        dst_h = vo->dheight;
-        dst_w = lround(dst_h * aspect);
-    }
-    dst_w = MPMAX(dst_w, 1);
-    dst_h = MPMAX(dst_h, 1);
-
-    *src = (struct mp_rect){0, 0, vo->params->w, vo->params->h};
-    *dst = (struct mp_rect){
-        (vo->dwidth - dst_w) / 2,
-        (vo->dheight - dst_h) / 2,
-        (vo->dwidth - dst_w) / 2 + dst_w,
-        (vo->dheight - dst_h) / 2 + dst_h,
-    };
-}
-
 static int resize(struct vo *vo)
 {
-    struct priv *p = vo->priv;
-    struct vo_wayland_state *wl = vo->wl;
-
-    if (!wl)
+    if (!apply_video_geometry(vo, "resize"))
         return VO_TRUE;
-
-    const int32_t width = mp_rect_w(wl->geometry);
-    const int32_t height = mp_rect_h(wl->geometry);
-    if (width <= 0 || height <= 0)
-        return VO_TRUE;
-
-    vo->dwidth = width;
-    vo->dheight = height;
-    vo_wayland_set_opaque_region(wl, false);
-    vo_wayland_handle_scale(wl);
-    struct mp_rect src, dst;
-    vo_get_src_dst_rects(vo, &src, &dst, &p->osd);
-    if (wl->video_viewport)
-        wp_viewport_set_destination(wl->video_viewport,
-                                    lround(mp_rect_w(dst) / wl->scaling_factor),
-                                    lround(mp_rect_h(dst) / wl->scaling_factor));
-    if (wl->video_subsurface)
-        wl_subsurface_set_position(wl->video_subsurface,
-                                   lround(dst.x0 / wl->scaling_factor),
-                                   lround(dst.y0 / wl->scaling_factor));
-    if (wl->osd_viewport)
-        wp_viewport_set_destination(wl->osd_viewport,
-                                    lround(vo->dwidth / wl->scaling_factor),
-                                    lround(vo->dheight / wl->scaling_factor));
-    if (wl->osd_subsurface)
-        wl_subsurface_set_position(wl->osd_subsurface,
-                                   lround((0 - dst.x0) / wl->scaling_factor),
-                                   lround((0 - dst.y0) / wl->scaling_factor));
-    mp_mutex_lock(&vo->params_mutex);
-    p->target_params.w = mp_rect_w(dst);
-    p->target_params.h = mp_rect_h(dst);
-    p->target_params.rotate = vo->params ? (vo->params->rotate % 90) * 90 : 0;
-    p->target_params.vflip = vo->params && vo->params->vflip;
-    vo->target_params = &p->target_params;
-    mp_mutex_unlock(&vo->params_mutex);
-    set_exported_crop(vo);
-
-    struct mp_rect acb_src = src;
-    struct mp_rect acb_dst = dst;
-    if (!p->exported_path && vo->params) {
-        get_acb_display_window(vo, &acb_src, &acb_dst);
-        starfish_ctx_set_display_window(p->ctx, acb_src.x0, acb_src.y0,
-                                        mp_rect_w(acb_src), mp_rect_h(acb_src),
-                                        acb_dst.x0, acb_dst.y0,
-                                        mp_rect_w(acb_dst), mp_rect_h(acb_dst));
-    }
-
     clear_free_buffers(vo);
-
-    if (!p->logged_resize) {
-        MP_INFO(vo,
-                "Starfish resize: window=%dx%d src=%d,%d %dx%d dst=%d,%d %dx%d acb=%d,%d %dx%d\n",
-                width, height, src.x0, src.y0, mp_rect_w(src), mp_rect_h(src),
-                dst.x0, dst.y0, mp_rect_w(dst), mp_rect_h(dst),
-                acb_dst.x0, acb_dst.y0, mp_rect_w(acb_dst), mp_rect_h(acb_dst));
-        p->logged_resize = true;
-    }
-
     vo->want_redraw = true;
     return VO_TRUE;
 }
@@ -644,10 +643,16 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     mp_image_unrefp(&p->next_image);
     if (frame->current && !frame->redraw && !frame->repeat)
         p->next_image = mp_image_new_ref(frame->current);
-    update_external_osd_geometry(vo);
-    set_exported_crop(vo);
+    apply_video_geometry(vo, "draw");
     map_video_surface(vo);
-    render_osd_surface(vo, frame->current ? frame->current->pts : 0);
+    double osd_pts = frame->current ? frame->current->pts : starfish_ctx_get_current_pts(p->ctx);
+    if (osd_pts == MP_NOPTS_VALUE || !isfinite(osd_pts))
+        osd_pts = p->have_osd_pts ? p->last_osd_pts : 0;
+    else {
+        p->last_osd_pts = osd_pts;
+        p->have_osd_pts = true;
+    }
+    render_osd_surface(vo, osd_pts);
     return VO_TRUE;
 }
 
@@ -680,7 +685,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
         ret = resize(vo);
     if (events & VO_EVENT_EXPOSE) {
         vo->want_redraw = true;
-        set_exported_crop(vo);
+        apply_video_geometry(vo, "expose");
     }
     vo_event(vo, events);
     return ret;
@@ -700,11 +705,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     mp_mutex_unlock(&vo->params_mutex);
     p->logged_resize = false;
     starfish_ctx_set_video_geometry(p->ctx, params->w, params->h, 0);
-    if (!vo->wl) {
-        update_external_osd_geometry(vo);
-        return 0;
-    }
-    return resize(vo) < 0 ? -1 : 0;
+    return apply_video_geometry(vo, "reconfig") ? 0 : -1;
 }
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)

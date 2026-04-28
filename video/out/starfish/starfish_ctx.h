@@ -52,6 +52,7 @@ STARFISH_CTX_API struct starfish_ctx *
 starfish_ctx_retain(struct starfish_ctx *ctx);
 STARFISH_CTX_API void starfish_ctx_unref(struct starfish_ctx *ctx);
 STARFISH_CTX_API bool starfish_ctx_prime_media(void);
+STARFISH_CTX_API bool starfish_ctx_unload(struct starfish_ctx *ctx);
 
 STARFISH_CTX_API struct starfish_ctx *
 starfish_ctx_from_hwdec(struct mp_hwdec_ctx *hwctx);
@@ -117,6 +118,7 @@ STARFISH_CTX_API bool starfish_ctx_has_ended(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_video_width(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_video_height(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_video_fps(struct starfish_ctx *ctx);
+STARFISH_CTX_API double starfish_ctx_get_current_pts(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx);
 
 #ifdef __cplusplus
