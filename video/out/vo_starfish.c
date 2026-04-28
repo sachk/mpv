@@ -183,6 +183,7 @@ static void clear_free_buffers(struct vo *vo)
 
 static bool ensure_video_placeholder(struct vo *vo)
 {
+    struct priv *p = vo->priv;
     struct vo_wayland_state *wl = vo->wl;
 
     if (!wl || p->solid_buffer)
@@ -256,7 +257,6 @@ static bool get_external_window_size(struct vo *vo, int *width, int *height)
 
 static bool compute_video_geometry(struct vo *vo, struct starfish_video_geometry *geo)
 {
-    struct priv *p = vo->priv;
     struct vo_wayland_state *wl = vo->wl;
 
     *geo = (struct starfish_video_geometry){0};
