@@ -48,7 +48,7 @@ static struct starfish_ctx *get_ctx(struct mp_filter *parent) {
   struct mp_hwdec_ctx *hwctx = hwdec_devices_get_by_imgfmt_and_type(
       info->hwdec_devs, IMGFMT_STARFISH, AV_HWDEVICE_TYPE_NONE);
   if (hwctx)
-    return starfish_ctx_from_hwdec(hwctx);
+    return starfish_ctx_retain(starfish_ctx_from_hwdec(hwctx));
 
   return starfish_ctx_get_current();
 }
@@ -391,6 +391,7 @@ static void vd_starfish_destroy(struct mp_filter *f) {
   av_packet_free(&p->avpkt);
   av_bsf_free(&p->bsf);
   starfish_ctx_set_wakeup_cb(p->ctx, STARFISH_STREAM_VIDEO, NULL, NULL);
+  starfish_ctx_unload(p->ctx);
   starfish_ctx_unref(p->ctx);
 }
 
