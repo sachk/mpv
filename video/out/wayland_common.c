@@ -77,8 +77,11 @@
 #include "color-representation-v1.h"
 #endif
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_WAYLAND_PROTOCOLS_1_48 && defined(__has_include)
+#if __has_include("xdg-session-management-v1.h")
 #include "xdg-session-management-v1.h"
+#define HAVE_XDG_SESSION_MANAGEMENT 1
+#endif
 #endif
 
 #ifndef CLOCK_MONOTONIC_RAW
@@ -2764,7 +2767,7 @@ static const struct zwp_linux_dmabuf_feedback_v1_listener dmabuf_feedback_listen
     .tranche_flags = tranche_flags,
 };
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_XDG_SESSION_MANAGEMENT
 static void xdg_session_created(void *data, struct xdg_session_v1 *xdg_session_v1, const char *session_id)
 {
     struct vo_wayland_state *wl = data;
@@ -2974,7 +2977,7 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
     }
 #endif
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_XDG_SESSION_MANAGEMENT
     if (wl->session_file &&
         !strcmp(interface, xdg_session_manager_v1_interface.name) &&
         found++)
@@ -3266,7 +3269,7 @@ static int create_xdg_surface(struct vo_wayland_state *wl)
         return 1;
     }
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_XDG_SESSION_MANAGEMENT
     if (wl->xdg_session) {
         wl->xdg_toplevel_session =
             xdg_session_v1_restore_toplevel(wl->xdg_session, wl->xdg_toplevel, "mpv");
@@ -4968,7 +4971,7 @@ void vo_wayland_uninit(struct vo *vo)
     if (wl->wp_tablet_manager)
         zwp_tablet_manager_v2_destroy(wl->wp_tablet_manager);
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_XDG_SESSION_MANAGEMENT
     if (wl->xdg_toplevel_session)
         xdg_toplevel_session_v1_destroy(wl->xdg_toplevel_session);
 
