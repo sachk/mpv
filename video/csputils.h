@@ -21,9 +21,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <libplacebo/config.h>
 #include <libplacebo/colorspace.h>
 
 #include "options/m_option.h"
+
+// libplacebo 7.362 split YCgCo into even/odd reconstruction variants. Older
+// distro builds only expose the base enum; keep local development builds
+// compiling against those libraries by folding the variants back to YCgCo.
+#if PL_API_VER < 362
+#define PL_COLOR_SYSTEM_YCGCO_RE PL_COLOR_SYSTEM_YCGCO
+#define PL_COLOR_SYSTEM_YCGCO_RO PL_COLOR_SYSTEM_YCGCO
+#endif
 
 /* NOTE: the csp and levels AUTO values are converted to specific ones
  * above vf/vo level. At least vf_scale relies on all valid settings being
