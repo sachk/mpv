@@ -1,3 +1,5 @@
+fs = import('fs')
+
 wl_protocol_dir = wayland['protocol_dir']
 protocols = [[wl_protocol_dir, 'stable/linux-dmabuf/linux-dmabuf-v1.xml'],
              [wl_protocol_dir, 'stable/presentation-time/presentation-time.xml'],
@@ -38,7 +40,7 @@ if features['wayland-protocols-1-44']
     protocols += [[wl_protocol_dir, 'staging/color-representation/color-representation-v1.xml']]
 endif
 
-if features['wayland-protocols-1-48']
+if features['wayland-protocols-1-48'] and fs.exists(wl_protocol_dir / 'staging/xdg-session-management/xdg-session-management-v1.xml')
     protocols += [[wl_protocol_dir, 'staging/xdg-session-management/xdg-session-management-v1.xml']]
 endif
 
