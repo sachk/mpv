@@ -20,7 +20,6 @@
 #include <sys/stat.h>
 #include <time.h>
 
-#include <libplacebo/config.h>
 #include <libplacebo/colorspace.h>
 #include <libplacebo/options.h>
 #include <libplacebo/renderer.h>
@@ -2540,17 +2539,11 @@ static void update_render_options(struct vo *vo)
         [BACKGROUND_NONE]  = PL_CLEAR_SKIP,
         [BACKGROUND_COLOR] = PL_CLEAR_COLOR,
         [BACKGROUND_TILES] = PL_CLEAR_TILES,
-#if PL_API_VER >= 362
         [BACKGROUND_BLUR]  = PL_CLEAR_BLUR,
-#else
-        [BACKGROUND_BLUR]  = PL_CLEAR_COLOR,
-#endif
     };
     pars->params.background = map_background_types[opts->background];
     pars->params.border = map_background_types[p->next_opts->border_background];
-#if PL_API_VER >= 362
     pars->params.blur_radius = p->next_opts->background_blur_radius;
-#endif
     pars->params.tile_size = opts->background_tile_size * 2;
     for (int i = 0; i < 2; ++i) {
         pars->params.tile_colors[i][0] = opts->background_tile_color[i].r / 255.0f;
