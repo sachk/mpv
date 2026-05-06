@@ -247,6 +247,7 @@ struct starfish_ctx {
   bool ended = false;
   bool started = false;
   int64_t current_pts_ns = 0;
+  int64_t frame_anchor_pts_ns = INT64_MIN;
   int64_t min_ready_pts_ns = INT64_MIN;
   int64_t fed_video_pts_ns = INT64_MIN;
   int64_t fed_audio_pts_ns = INT64_MIN;
@@ -955,10 +956,15 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
     ctx->need_segment = false;
     ctx->pending_seek_target = false;
     prepare_segment_timeline_locked(ctx, packet.pts_ns, "segment-packet");
+    ctx->frame_anchor_pts_ns = packet.pts_ns;
+    if (seek_target_ns >= 0 && seek_target_ns > packet.pts_ns)
+      ctx->min_ready_pts_ns = seek_target_ns;
     if (ctx->need_audio) {
       ctx->audio_prime_requested = true;
       prime_audio_for_segment = true;
-      audio_prime_pts_ns = packet.pts_ns;
+      audio_prime_pts_ns = ctx->min_ready_pts_ns != INT64_MIN
+                                ? ctx->min_ready_pts_ns
+                                : packet.pts_ns;
     }
   }
 
@@ -1013,7 +1019,6 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
   queue->pop_front();
   if (do_segment && stream == STARFISH_STREAM_VIDEO) {
     ctx->current_pts_ns = packet.pts_ns;
-    ctx->min_ready_pts_ns = packet.pts_ns;
     mp_info(ctx->log,
             "Starfish segment decode started at %.3f present_floor=%.3f seek_target=%.3f\n",
             (double)packet.pts_ns / 1e9, (double)ctx->min_ready_pts_ns / 1e9,
@@ -1039,6 +1044,7 @@ static void prepare_segment_timeline_locked(struct starfish_ctx *ctx,
   ctx->pts_offset_valid = false;
   ctx->pts_offset_ns = 0;
   ctx->current_pts_ns = start_pts_ns == INT64_MIN ? 0 : start_pts_ns;
+  ctx->frame_anchor_pts_ns = INT64_MIN;
   ctx->min_ready_pts_ns = start_pts_ns;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
@@ -1256,7 +1262,9 @@ static void player_callback(int32_t type, int64_t numValue,
     int64_t mapped_pts = numValue;
     if (!ctx->pts_offset_valid) {
       int64_t anchor_pts = numValue;
-      if (ctx->min_ready_pts_ns != INT64_MIN)
+      if (ctx->frame_anchor_pts_ns != INT64_MIN)
+        anchor_pts = ctx->frame_anchor_pts_ns;
+      else if (ctx->min_ready_pts_ns != INT64_MIN)
         anchor_pts = ctx->min_ready_pts_ns;
       else if (ctx->seek_target_valid)
         anchor_pts = ctx->seek_target_ns;
@@ -1386,6 +1394,7 @@ static void player_callback(int32_t type, int64_t numValue,
     ctx->pending_seek_target = false;
     ctx->seek_target_valid = false;
     ctx->started = false;
+    ctx->frame_anchor_pts_ns = INT64_MIN;
     ctx->min_ready_pts_ns = INT64_MIN;
     ctx->fed_video_pts_ns = INT64_MIN;
     ctx->fed_audio_pts_ns = INT64_MIN;
@@ -1714,6 +1723,7 @@ static void starfish_ctx_session_reset(struct starfish_ctx *ctx) {
   ctx->need_segment = false;
   ctx->pending_seek_target = false;
   ctx->seek_target_valid = false;
+  ctx->frame_anchor_pts_ns = INT64_MIN;
   ctx->min_ready_pts_ns = INT64_MIN;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
