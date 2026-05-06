@@ -506,6 +506,8 @@ static void uninit(struct ao *ao)
 static void reset(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    int64_t reset_target_ns = 0;
+    bool needs_segment_prime = false;
 
     pthread_mutex_lock(&p->lock);
     p->paused = false;
@@ -518,7 +520,20 @@ static void reset(struct ao *ao)
         av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
     if (p->encoder && !reopen_encoder_locked(ao))
         MP_WARN(ao, "Unable to reopen Starfish AAC encoder on reset\n");
-    p->needs_sync = true;
+    if (p->ctx && starfish_ctx_get_audio_reset_target_ns(p->ctx, &reset_target_ns,
+                                                         &needs_segment_prime)) {
+        if (needs_segment_prime) {
+            p->needs_sync = true;
+            MP_INFO(ao, "ao_starfish reset waiting for segment prime target=%.3f\n",
+                    (double)reset_target_ns / 1000000000.0);
+        } else if (!prime_at_ns_locked(ao, reset_target_ns, "audio reset")) {
+            p->needs_sync = true;
+            MP_WARN(ao, "Unable to prime Starfish audio reset at %.3f\n",
+                    (double)reset_target_ns / 1000000000.0);
+        }
+    } else {
+        p->needs_sync = true;
+    }
     pthread_mutex_unlock(&p->lock);
     if (p->ctx)
         ao_wakeup(ao);
