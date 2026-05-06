@@ -1978,7 +1978,7 @@ bool starfish_ctx_get_audio_reset_target_ns(struct starfish_ctx *ctx,
     return false;
   *needs_segment_prime =
       ctx->flush_requested || ctx->need_segment || ctx->pending_seek_target;
-  if (ctx->seek_target_valid)
+  if (*needs_segment_prime && ctx->seek_target_valid)
     *pts_ns = ctx->seek_target_ns;
   else
     *pts_ns = ctx->current_pts_ns;
