@@ -1809,8 +1809,29 @@ bool starfish_ctx_configure_audio_passthrough(struct starfish_ctx *ctx,
 bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx, int channels,
                                       int samplerate, int profile, bool raw) {
   std::lock_guard<std::mutex> lk(ctx->lock);
-  if (is_loaded_state(ctx->state))
-    return false;
+  if (is_loaded_state(ctx->state)) {
+    const bool same_config = ctx->need_audio && ctx->audio_codec == "AAC" &&
+                             ctx->audio_channels == channels &&
+                             ctx->audio_samplerate == samplerate &&
+                             ctx->audio_profile == profile &&
+                             ctx->audio_raw == raw;
+    if (!same_config) {
+      mp_warn(ctx->log,
+              "Rejecting Starfish AAC reconfigure while loaded: "
+              "current=%s/%d/%d/%d/%d requested=AAC/%d/%d/%d/%d\n",
+              ctx->audio_codec.c_str(), ctx->audio_channels,
+              ctx->audio_samplerate, ctx->audio_profile, ctx->audio_raw,
+              channels, samplerate, profile, raw);
+      return false;
+    }
+    ctx->audio_queue.clear();
+    ctx->audio_queue_bytes = 0;
+    ctx->fed_audio_pts_ns = INT64_MIN;
+    ctx->audio_bufferfull_logs = 0;
+    ctx->cv.notify_all();
+    mp_info(ctx->log, "Reusing loaded Starfish AAC audio configuration\n");
+    return true;
+  }
   ctx->audio_codec = "AAC";
   ctx->audio_channels = channels;
   ctx->audio_samplerate = samplerate;
@@ -1953,6 +1974,8 @@ bool starfish_ctx_get_audio_reset_target_ns(struct starfish_ctx *ctx,
   if (!ctx || !pts_ns || !needs_segment_prime)
     return false;
   std::lock_guard<std::mutex> lk(ctx->lock);
+  if (!is_loaded_state(ctx->state) && !ctx->seek_target_valid)
+    return false;
   *needs_segment_prime =
       ctx->flush_requested || ctx->need_segment || ctx->pending_seek_target;
   if (ctx->seek_target_valid)
