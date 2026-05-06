@@ -1947,6 +1947,21 @@ bool starfish_ctx_get_seek_target_ns(struct starfish_ctx *ctx,
   return true;
 }
 
+bool starfish_ctx_get_audio_reset_target_ns(struct starfish_ctx *ctx,
+                                            int64_t *pts_ns,
+                                            bool *needs_segment_prime) {
+  if (!ctx || !pts_ns || !needs_segment_prime)
+    return false;
+  std::lock_guard<std::mutex> lk(ctx->lock);
+  *needs_segment_prime =
+      ctx->flush_requested || ctx->need_segment || ctx->pending_seek_target;
+  if (ctx->seek_target_valid)
+    *pts_ns = ctx->seek_target_ns;
+  else
+    *pts_ns = ctx->current_pts_ns;
+  return true;
+}
+
 bool starfish_ctx_push_eos(struct starfish_ctx *ctx) {
   {
     std::lock_guard<std::mutex> lk(ctx->lock);

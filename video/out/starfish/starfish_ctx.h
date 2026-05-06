@@ -112,6 +112,10 @@ STARFISH_CTX_API bool starfish_ctx_set_seek_target(struct starfish_ctx *ctx,
 STARFISH_CTX_API bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts);
 STARFISH_CTX_API bool starfish_ctx_get_seek_target_ns(struct starfish_ctx *ctx,
                                                       int64_t *pts_ns);
+STARFISH_CTX_API bool
+starfish_ctx_get_audio_reset_target_ns(struct starfish_ctx *ctx,
+                                       int64_t *pts_ns,
+                                       bool *needs_segment_prime);
 STARFISH_CTX_API bool starfish_ctx_push_eos(struct starfish_ctx *ctx);
 STARFISH_CTX_API bool starfish_ctx_has_ended(struct starfish_ctx *ctx);
 
