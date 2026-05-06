@@ -67,7 +67,6 @@ constexpr unsigned int MAX_SRC_BUFFER_LEVEL_VIDEO = 8 * 1024 * 1024;
 constexpr size_t VIDEO_QUEUE_LIMIT = MAX_SRC_BUFFER_LEVEL_VIDEO;
 constexpr size_t AUDIO_QUEUE_LIMIT = MAX_SRC_BUFFER_LEVEL_AUDIO;
 constexpr int64_t MAX_FEED_AHEAD_NS = 1600LL * 1000 * 1000;
-constexpr int64_t VIDEO_LEAD_BEFORE_AUDIO_NS = 500LL * 1000 * 1000;
 constexpr int64_t STALE_READY_TOLERANCE_NS = 1000LL * 1000;
 constexpr int64_t READY_CEILING_SLACK_NS = 5LL * 1000 * 1000 * 1000;
 
@@ -944,16 +943,6 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
 
   queued_packet packet = queue->front();
   const bool is_audio_only = ctx->video_codec.empty();
-  if (stream == STARFISH_STREAM_VIDEO && ctx->need_audio &&
-      !ctx->need_segment && ctx->fed_audio_pts_ns == INT64_MIN &&
-      ctx->fed_video_pts_ns != INT64_MIN &&
-      packet.pts_ns - ctx->current_pts_ns > VIDEO_LEAD_BEFORE_AUDIO_NS) {
-    mp_trace(ctx->log,
-             "Starfish video BLOCKED waiting for first audio packet "
-             "(packet=%.3f current=%.3f)\n",
-             (double)packet.pts_ns / 1e9, (double)ctx->current_pts_ns / 1e9);
-    return feed_attempt_result::BLOCKED;
-  }
   const bool do_segment =
       ctx->need_segment && (stream == STARFISH_STREAM_VIDEO || is_audio_only);
   const int64_t seek_target_ns =
@@ -1168,18 +1157,13 @@ static void worker_loop(struct starfish_ctx *ctx) {
         const bool have_video = !ctx->video_queue.empty();
         const bool have_audio = !ctx->audio_queue.empty();
         const bool prefer_audio =
-            !ctx->need_segment && have_audio && ctx->need_audio &&
-            ctx->fed_audio_pts_ns == INT64_MIN;
-        const bool prefer_audio_by_pts =
             !ctx->need_segment && have_audio &&
             (!have_video || ctx->audio_queue.front().pts_ns <=
                                ctx->video_queue.front().pts_ns);
         const enum starfish_stream_type first =
-            (prefer_audio || prefer_audio_by_pts) ? STARFISH_STREAM_AUDIO
-                                                  : STARFISH_STREAM_VIDEO;
+            prefer_audio ? STARFISH_STREAM_AUDIO : STARFISH_STREAM_VIDEO;
         const enum starfish_stream_type second =
-            (prefer_audio || prefer_audio_by_pts) ? STARFISH_STREAM_VIDEO
-                                                  : STARFISH_STREAM_AUDIO;
+            prefer_audio ? STARFISH_STREAM_VIDEO : STARFISH_STREAM_AUDIO;
 
         bool blocked = false;
         feed_attempt_result result = try_drain_stream(ctx, lk, first);
@@ -1990,7 +1974,7 @@ bool starfish_ctx_get_audio_reset_target_ns(struct starfish_ctx *ctx,
   if (!ctx || !pts_ns || !needs_segment_prime)
     return false;
   std::lock_guard<std::mutex> lk(ctx->lock);
-  if (!is_loaded_state(ctx->state) && !ctx->seek_target_valid)
+  if (!is_loaded_state(ctx->state))
     return false;
   *needs_segment_prime =
       ctx->flush_requested || ctx->need_segment || ctx->pending_seek_target;
