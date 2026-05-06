@@ -462,11 +462,29 @@ static int init(struct ao *ao)
             ao->samplerate, ao->channels.num, p->frame_samples);
     starfish_ctx_set_wakeup_cb(p->ctx, STARFISH_STREAM_AUDIO, wake_ao, ao);
     starfish_ctx_set_audio_prime_cb(p->ctx, audio_prime_cb, ao);
-    sync_written_samples_to_seek_target(ao, true);
-    if (!ensure_audio_primed(ao)) {
+    pthread_mutex_lock(&p->lock);
+    int64_t start_target_ns = 0;
+    bool needs_segment_prime = false;
+    if (starfish_ctx_get_audio_reset_target_ns(p->ctx, &start_target_ns,
+                                               &needs_segment_prime)) {
+        if (needs_segment_prime) {
+            p->needs_sync = true;
+            MP_INFO(ao, "ao_starfish init waiting for segment prime target=%.3f\n",
+                    (double)start_target_ns / 1000000000.0);
+        } else if (!prime_at_ns_locked(ao, start_target_ns, "audio init")) {
+            pthread_mutex_unlock(&p->lock);
+            uninit(ao);
+            return -1;
+        }
+    } else {
+        sync_written_samples_to_seek_target(ao, true);
+    }
+    if (!p->needs_sync && !ensure_audio_primed(ao)) {
+        pthread_mutex_unlock(&p->lock);
         uninit(ao);
         return -1;
     }
+    pthread_mutex_unlock(&p->lock);
     ao->device_buffer = p->latency_samples +
                         ao->samplerate * STARFISH_AUDIO_BUFFER_SEC;
     p->last_time = mp_time_sec();
