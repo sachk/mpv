@@ -20,6 +20,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include "mpv_talloc.h"
 
@@ -69,6 +70,23 @@ static bool recreate_video_filters(struct MPContext *mpctx)
     mp_assert(vo_c);
 
     return mp_output_chain_update_filters(vo_c->filter, opts->vf_settings);
+}
+
+double calc_average_frame_duration(struct MPContext *mpctx);
+static bool using_spdif_passthrough(struct MPContext *mpctx);
+
+static double get_external_video_latency(void)
+{
+    const char *env = getenv("STARFISH_VIDEO_LATENCY_MS");
+    if (!env || !env[0])
+        return 0;
+
+    char *end = NULL;
+    double ms = strtod(env, &end);
+    if (end == env || ms < 0)
+        return 0;
+
+    return MPCLAMP(ms / 1000.0, 0.0, 10.0);
 }
 
 int reinit_video_filters(struct MPContext *mpctx)
@@ -634,6 +652,81 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
     }
 }
 
+static bool get_external_video_avdiff(struct MPContext *mpctx, double *diff)
+{
+    struct MPOpts *opts = mpctx->opts;
+    struct voctrl_external_video_clock clock = {0};
+
+    if (!mpctx->video_out || !mpctx->ao)
+        return false;
+    if (vo_control(mpctx->video_out, VOCTRL_GET_EXTERNAL_VIDEO_CLOCK,
+                   &clock) <= 0)
+        return false;
+
+    double a_pos = playing_audio_pts(mpctx);
+    if (a_pos == MP_NOPTS_VALUE || clock.pts == MP_NOPTS_VALUE ||
+        clock.host_time_ns <= 0)
+        return false;
+
+    double age = MP_TIME_NS_TO_S(mp_time_ns() - clock.host_time_ns);
+    if (age < 0 || age > 0.5)
+        return false;
+
+    double video_pts = clock.pts + age * opts->playback_speed -
+                       get_external_video_latency();
+    *diff = a_pos - video_pts + opts->audio_delay;
+    return true;
+}
+
+static void adjust_external_video_clock_sync(struct MPContext *mpctx)
+{
+    struct MPOpts *opts = mpctx->opts;
+
+    if (mpctx->audio_status != STATUS_PLAYING)
+        return;
+
+    double av_diff = 0;
+    if (!get_external_video_avdiff(mpctx, &av_diff))
+        return;
+
+    mpctx->last_av_difference = av_diff;
+
+    if (using_spdif_passthrough(mpctx))
+        return;
+
+    double frame_time = calc_average_frame_duration(mpctx);
+    if (frame_time <= 0 || frame_time > 0.5)
+        frame_time = 1.0 / 24.0;
+
+    const double AVD_FILTER_TIME = 0.5;
+    const double AVD_RECOVERY_TIME = 1.5;
+    const double SLEW_RAMP_FRAMES = 6.0;
+
+    double max_correct = opts->sync_max_audio_change / 100;
+    double other = opts->playback_speed;
+    double comp = 1.0 + mpctx->audio_drift_compensation;
+
+    double alpha = frame_time / (AVD_FILTER_TIME + frame_time);
+    mpctx->avd_filtered += alpha * (av_diff - mpctx->avd_filtered);
+    double avd_lp = mpctx->avd_filtered;
+
+    double p_delta = MPCLAMP(-avd_lp / (AVD_RECOVERY_TIME * other),
+                             -max_correct, max_correct);
+    double slew = MPMIN(fabs(p_delta), max_correct / SLEW_RAMP_FRAMES);
+    double target_comp = MPCLAMP(1.0 + p_delta,
+                                 1 - max_correct, 1 + max_correct);
+    double new_comp = comp + MPCLAMP(target_comp - comp, -slew, +slew);
+
+    mpctx->audio_drift_compensation = new_comp - 1.0;
+    mpctx->speed_factor_v = 1.0;
+    mpctx->speed_factor_a = new_comp;
+    update_playback_speed(mpctx);
+
+    MP_STATS(mpctx, "value %f starfish-avdiff", av_diff);
+    MP_STATS(mpctx, "value %f starfish-adrift", avd_lp);
+    MP_STATS(mpctx, "value %f starfish-aspeed", mpctx->speed_factor_a - 1);
+}
+
 // Update the A/V sync difference when a new video frame is being shown.
 static void update_av_diff(struct MPContext *mpctx, double offset)
 {
@@ -653,6 +746,8 @@ static void update_av_diff(struct MPContext *mpctx, double offset)
         mpctx->last_av_difference = a_pos - mpctx->video_pts
                                   + opts->audio_delay + offset;
     }
+
+    adjust_external_video_clock_sync(mpctx);
 
     if (fabs(mpctx->last_av_difference) > 0.5 && !mpctx->drop_message_shown) {
         MP_WARN(mpctx, "%s", av_desync_help_text);

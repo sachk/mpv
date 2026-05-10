@@ -677,6 +677,13 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return starfish_ctx_resume(p->ctx) ? VO_TRUE : VO_ERROR;
     case VOCTRL_SET_PANSCAN:
         return resize(vo);
+    case VOCTRL_GET_EXTERNAL_VIDEO_CLOCK: {
+        struct voctrl_external_video_clock *clock = data;
+        return starfish_ctx_get_video_clock(p->ctx, &clock->pts,
+                                            &clock->host_time_ns)
+                   ? VO_TRUE
+                   : VO_NOTIMPL;
+    }
     }
 
     int events = 0;
@@ -758,7 +765,7 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
 const struct vo_driver video_out_starfish = {
     .description = "LG webOS Starfish",
     .name = "starfish",
-    .caps = VO_CAP_NORETAIN,
+    .caps = VO_CAP_NORETAIN | VO_CAP_UNTIMED,
     .preinit = preinit,
     .query_format = query_format,
     .reconfig = reconfig,

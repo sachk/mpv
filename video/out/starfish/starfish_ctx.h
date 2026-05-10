@@ -123,6 +123,9 @@ STARFISH_CTX_API int starfish_ctx_get_video_width(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_video_height(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_video_fps(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_current_pts(struct starfish_ctx *ctx);
+STARFISH_CTX_API bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx,
+                                                   double *pts,
+                                                   int64_t *host_time_ns);
 STARFISH_CTX_API int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx);
 
 #ifdef __cplusplus

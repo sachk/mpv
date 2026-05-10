@@ -34,6 +34,7 @@ extern "C" {
 #include "common/msg.h"
 #include "demux/stheader.h"
 #include "mpv_talloc.h"
+#include "osdep/timer.h"
 #include "video/hwdec.h"
 #undef _Atomic
 }
@@ -252,6 +253,9 @@ struct starfish_ctx {
   int64_t fed_audio_pts_ns = INT64_MIN;
   bool pts_offset_valid = false;
   int64_t pts_offset_ns = 0;
+  bool clock_valid = false;
+  int64_t clock_pts_ns = 0;
+  int64_t clock_host_time_ns = 0;
   int video_bufferfull_logs = 0;
   int audio_bufferfull_logs = 0;
   bool audio_prime_requested = false;
@@ -951,14 +955,18 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
   bool prime_audio_for_segment = false;
   int64_t audio_prime_pts_ns = 0;
 
+  int64_t present_target_ns = packet.pts_ns;
+  if (do_segment && seek_target_ns >= 0)
+    present_target_ns = seek_target_ns;
+
   if (do_segment) {
     ctx->need_segment = false;
     ctx->pending_seek_target = false;
-    prepare_segment_timeline_locked(ctx, packet.pts_ns, "segment-packet");
+    prepare_segment_timeline_locked(ctx, present_target_ns, "segment-packet");
     if (ctx->need_audio) {
       ctx->audio_prime_requested = true;
       prime_audio_for_segment = true;
-      audio_prime_pts_ns = packet.pts_ns;
+      audio_prime_pts_ns = present_target_ns;
     }
   }
 
@@ -1012,8 +1020,8 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
   *queue_bytes -= packet.data->size();
   queue->pop_front();
   if (do_segment && stream == STARFISH_STREAM_VIDEO) {
-    ctx->current_pts_ns = packet.pts_ns;
-    ctx->min_ready_pts_ns = packet.pts_ns;
+    ctx->current_pts_ns = present_target_ns;
+    ctx->min_ready_pts_ns = present_target_ns;
     mp_info(ctx->log,
             "Starfish segment decode started at %.3f present_floor=%.3f seek_target=%.3f\n",
             (double)packet.pts_ns / 1e9, (double)ctx->min_ready_pts_ns / 1e9,
@@ -1042,6 +1050,9 @@ static void prepare_segment_timeline_locked(struct starfish_ctx *ctx,
   ctx->min_ready_pts_ns = start_pts_ns;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
+  ctx->clock_valid = false;
+  ctx->clock_pts_ns = 0;
+  ctx->clock_host_time_ns = 0;
   ctx->ready_frames.clear();
   mp_info(ctx->log, "Starfish segment timeline reset reason=%s target=%.3f\n",
           reason ? reason : "unknown",
@@ -1143,7 +1154,8 @@ static void worker_loop(struct starfish_ctx *ctx) {
         lk.unlock();
         bool play_ok =
             media_call_bool(ctx, "Play", [&] { return ctx->media->Play(); });
-        std::string rate_payload = starfish_json_build_play_rate(1000, true);
+        std::string rate_payload =
+            starfish_json_build_play_rate(1000, ctx->need_audio);
         (void)media_call_bool(ctx, "SetPlayRate", [&] {
           return ctx->media->SetPlayRate(rate_payload.c_str());
         });
@@ -1306,6 +1318,9 @@ static void player_callback(int32_t type, int64_t numValue,
     };
     ctx->ready_frames.push_back(frame);
     ctx->current_pts_ns = mapped_pts;
+    ctx->clock_valid = true;
+    ctx->clock_pts_ns = mapped_pts;
+    ctx->clock_host_time_ns = mp_time_ns();
     ctx->min_ready_pts_ns = INT64_MIN;
     ctx->started = true;
     wake_video = true;
@@ -2020,6 +2035,18 @@ double starfish_ctx_get_video_fps(struct starfish_ctx *ctx) {
 double starfish_ctx_get_current_pts(struct starfish_ctx *ctx) {
   std::lock_guard<std::mutex> lk(ctx->lock);
   return ctx->current_pts_ns / 1000000000.0;
+}
+
+bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx, double *pts,
+                                  int64_t *host_time_ns) {
+  if (!ctx || !pts || !host_time_ns)
+    return false;
+  std::lock_guard<std::mutex> lk(ctx->lock);
+  if (!ctx->clock_valid)
+    return false;
+  *pts = ctx->clock_pts_ns / 1000000000.0;
+  *host_time_ns = ctx->clock_host_time_ns;
+  return true;
 }
 
 int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx) {

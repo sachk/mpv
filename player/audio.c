@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <math.h>
 #include <assert.h>
+#include <stdlib.h>
 
 #include "mpv_talloc.h"
 
@@ -36,6 +37,7 @@
 #include "filters/f_async_queue.h"
 #include "filters/f_decoder_wrapper.h"
 #include "filters/filter_internal.h"
+#include "video/out/vo.h"
 
 #include "core.h"
 #include "command.h"
@@ -47,6 +49,42 @@ enum {
 };
 
 static void ao_process(struct mp_filter *f);
+
+static double get_external_video_latency(void)
+{
+    const char *env = getenv("STARFISH_VIDEO_LATENCY_MS");
+    if (!env || !env[0])
+        return 0;
+
+    char *end = NULL;
+    double ms = strtod(env, &end);
+    if (end == env || ms < 0)
+        return 0;
+
+    return MPCLAMP(ms / 1000.0, 0.0, 10.0);
+}
+
+static bool get_external_video_sync_pts(struct MPContext *mpctx, double *pts)
+{
+    struct MPOpts *opts = mpctx->opts;
+    struct voctrl_external_video_clock clock = {0};
+
+    if (!mpctx->video_out)
+        return false;
+    if (vo_control(mpctx->video_out, VOCTRL_GET_EXTERNAL_VIDEO_CLOCK,
+                   &clock) <= 0)
+        return false;
+    if (clock.pts == MP_NOPTS_VALUE || clock.host_time_ns <= 0)
+        return false;
+
+    double age = MP_TIME_NS_TO_S(mp_time_ns() - clock.host_time_ns);
+    if (age < 0 || age > 0.5)
+        return false;
+
+    *pts = clock.pts + age * opts->playback_speed -
+           get_external_video_latency() - opts->audio_delay;
+    return true;
+}
 
 static void update_speed_filters(struct MPContext *mpctx)
 {
@@ -814,6 +852,8 @@ static bool get_sync_pts(struct MPContext *mpctx, double *pts)
     if (sync_to_video) {
         if (mpctx->video_status < STATUS_READY)
             return false; // wait until we know a video PTS
+        if (get_external_video_sync_pts(mpctx, pts))
+            return true;
         if (mpctx->video_pts != MP_NOPTS_VALUE)
             *pts = mpctx->video_pts - opts->audio_delay;
     } else if (mpctx->hrseek_active) {
