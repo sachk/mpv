@@ -3,6 +3,7 @@
  */
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <pthread.h>
 
@@ -16,11 +17,15 @@
 #include "audio/out/internal.h"
 #include "common/common.h"
 #include "common/msg.h"
+#include "options/m_config_core.h"
+#include "options/options.h"
 #include "osdep/timer.h"
 #include "video/out/starfish/starfish_ctx.h"
 
 struct priv {
     struct starfish_ctx *ctx;
+    struct m_config_cache *opts_cache;
+    struct MPOpts *opts;
     pthread_mutex_t lock;
     bool lock_initialized;
     AVCodecContext *encoder;
@@ -37,17 +42,48 @@ struct priv {
     bool primed;
     bool logged_write;
     bool needs_sync;
+    bool logged_audio_delay;
+    double last_audio_delay;
 };
 
-#define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.25
+#define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.08
 #define STARFISH_AUDIO_BUFFER_SEC 3.0
-#define STARFISH_AUDIO_START_PRIME_FRAMES 4
+#define STARFISH_AUDIO_START_PRIME_FRAMES 1
 
 static void uninit(struct ao *ao);
 static int encode_silence_frame(struct ao *ao, int samples);
 static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason);
 static bool audio_prime_cb(void *opaque, int64_t pts_ns);
 static enum AVSampleFormat select_encoder_format(const AVCodec *codec);
+
+static double current_audio_delay(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+
+    if (!p->opts_cache || !p->opts)
+        return 0.0;
+
+    m_config_cache_update(p->opts_cache);
+    return p->opts->audio_delay;
+}
+
+static int64_t apply_audio_delay_to_pts(struct ao *ao, int64_t pts_ns)
+{
+    struct priv *p = ao->priv;
+    const double delay = current_audio_delay(ao);
+    const int64_t delayed_pts_ns =
+        pts_ns + (int64_t)llround(delay * 1000000000.0);
+
+    if (!p->logged_audio_delay || fabs(delay - p->last_audio_delay) >= 0.0005) {
+        MP_INFO(ao, "ao_starfish audio-delay applied delay=%.3f base_pts=%.3f feed_pts=%.3f\n",
+                delay, (double)pts_ns / 1000000000.0,
+                (double)MPMAX(delayed_pts_ns, 0) / 1000000000.0);
+        p->logged_audio_delay = true;
+        p->last_audio_delay = delay;
+    }
+
+    return MPMAX(delayed_pts_ns, 0);
+}
 
 static bool reopen_encoder_locked(struct ao *ao)
 {
@@ -304,7 +340,8 @@ static bool encode_pending_audio(struct ao *ao, bool flush_tail)
             if (pts_ns < 0)
                 pts_ns = 0;
 
-            if (!feed_encoded_packet(ao, p->packet->data, p->packet->size, pts_ns)) {
+            if (!feed_encoded_packet(ao, p->packet->data, p->packet->size,
+                                     apply_audio_delay_to_pts(ao, pts_ns))) {
                 av_packet_unref(p->packet);
                 return false;
             }
@@ -366,7 +403,8 @@ static int encode_silence_frame(struct ao *ao, int samples)
         if (pts_ns < 0)
             pts_ns = 0;
 
-        if (!feed_encoded_packet(ao, p->packet->data, p->packet->size, pts_ns)) {
+        if (!feed_encoded_packet(ao, p->packet->data, p->packet->size,
+                                 apply_audio_delay_to_pts(ao, pts_ns))) {
             av_packet_unref(p->packet);
             return -1;
         }
@@ -393,6 +431,8 @@ static int init(struct ao *ao)
         return -1;
     }
     MP_INFO(ao, "ao_starfish init ctx=%p\n", p->ctx);
+    p->opts_cache = m_config_cache_alloc(ao, ao->global, &mp_opt_root);
+    p->opts = p->opts_cache ? p->opts_cache->opts : NULL;
     if (pthread_mutex_init(&p->lock, NULL) != 0) {
         starfish_ctx_unref(p->ctx);
         p->ctx = NULL;
