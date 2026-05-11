@@ -253,9 +253,7 @@ struct starfish_ctx {
   int64_t fed_audio_pts_ns = INT64_MIN;
   bool pts_offset_valid = false;
   int64_t pts_offset_ns = 0;
-  bool clock_valid = false;
-  int64_t clock_pts_ns = 0;
-  int64_t clock_host_time_ns = 0;
+  bool playtime_clock_logged = false;
   int video_bufferfull_logs = 0;
   int audio_bufferfull_logs = 0;
   bool audio_prime_requested = false;
@@ -332,6 +330,44 @@ static std::string media_call_string(struct starfish_ctx *ctx, const char *what,
   }
   ctx->cv.notify_all();
   return result;
+}
+
+template <typename F>
+static void media_call_void(struct starfish_ctx *ctx, const char *what,
+                            F &&fn) {
+  {
+    std::lock_guard<std::mutex> lk(ctx->lock);
+    ctx->media_calls++;
+  }
+  try {
+    fn();
+  } catch (const std::exception &e) {
+    mp_err(ctx->log, "Starfish %s threw exception: %s\n", what, e.what());
+  } catch (...) {
+    mp_err(ctx->log, "Starfish %s threw unknown exception\n", what);
+  }
+  {
+    std::lock_guard<std::mutex> lk(ctx->lock);
+    ctx->media_calls--;
+  }
+  ctx->cv.notify_all();
+}
+
+static int64_t ns_to_ms(int64_t pts_ns) {
+  if (pts_ns < 0)
+    return 0;
+  return (pts_ns + 500000) / 1000000;
+}
+
+static void set_current_playtime(struct starfish_ctx *ctx, int64_t pts_ns,
+                                 const char *reason) {
+  int64_t playtime_ms = ns_to_ms(pts_ns);
+  media_call_void(ctx, "setCurrentPlaytime", [&] {
+    if (ctx->media)
+      ctx->media->setCurrentPlaytime(playtime_ms);
+  });
+  mp_info(ctx->log, "Starfish setCurrentPlaytime reason=%s ms=%" PRId64 "\n",
+          reason ? reason : "unknown", playtime_ms);
 }
 
 static const char *event_name(int32_t type) {
@@ -835,6 +871,8 @@ static bool try_start_load(struct starfish_ctx *ctx,
   });
   mp_info(ctx->log, "Starfish Load returned: %s\n", ok ? "success" : "failure");
   if (ok)
+    set_current_playtime(ctx, params.pts_to_decode_ns, "initial-load");
+  if (ok)
     apply_hdr_info(ctx);
 
   lk.lock();
@@ -866,6 +904,10 @@ static bool try_feed_packet(struct starfish_ctx *ctx,
       mp_warn(ctx->log,
               "Starfish setTimeToDecode failed for target %" PRId64 "\n",
               target_ns);
+    if (seek_target_ns >= 0)
+      set_current_playtime(ctx, seek_target_ns, "segment-seek");
+    else
+      set_current_playtime(ctx, target_ns, "segment-packet");
     if (!send_segment_event(ctx))
       mp_warn(ctx->log, "Starfish sendSegmentEvent failed\n");
 
@@ -1050,9 +1092,7 @@ static void prepare_segment_timeline_locked(struct starfish_ctx *ctx,
   ctx->min_ready_pts_ns = start_pts_ns;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
-  ctx->clock_valid = false;
-  ctx->clock_pts_ns = 0;
-  ctx->clock_host_time_ns = 0;
+  ctx->playtime_clock_logged = false;
   ctx->ready_frames.clear();
   mp_info(ctx->log, "Starfish segment timeline reset reason=%s target=%.3f\n",
           reason ? reason : "unknown",
@@ -1318,9 +1358,6 @@ static void player_callback(int32_t type, int64_t numValue,
     };
     ctx->ready_frames.push_back(frame);
     ctx->current_pts_ns = mapped_pts;
-    ctx->clock_valid = true;
-    ctx->clock_pts_ns = mapped_pts;
-    ctx->clock_host_time_ns = mp_time_ns();
     ctx->min_ready_pts_ns = INT64_MIN;
     ctx->started = true;
     wake_video = true;
@@ -2041,11 +2078,60 @@ bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx, double *pts,
                                   int64_t *host_time_ns) {
   if (!ctx || !pts || !host_time_ns)
     return false;
-  std::lock_guard<std::mutex> lk(ctx->lock);
-  if (!ctx->clock_valid)
+
+  {
+    std::lock_guard<std::mutex> lk(ctx->lock);
+    if (!ctx->media || ctx->resetting || !is_loaded_state(ctx->state))
+      return false;
+    ctx->media_calls++;
+  }
+
+  int64_t before_ns = mp_time_ns();
+  int64_t playtime_ms = -1;
+  try {
+    playtime_ms = ctx->media ? ctx->media->getCurrentPlaytime() : -1;
+  } catch (const std::exception &e) {
+    mp_err(ctx->log, "Starfish getCurrentPlaytime threw exception: %s\n",
+           e.what());
+  } catch (...) {
+    mp_err(ctx->log, "Starfish getCurrentPlaytime threw unknown exception\n");
+  }
+  int64_t after_ns = mp_time_ns();
+  {
+    std::lock_guard<std::mutex> lk(ctx->lock);
+    ctx->media_calls--;
+  }
+  ctx->cv.notify_all();
+
+  if (playtime_ms < 0)
     return false;
-  *pts = ctx->clock_pts_ns / 1000000000.0;
-  *host_time_ns = ctx->clock_host_time_ns;
+
+  int64_t query_ns = after_ns - before_ns;
+  if (query_ns < 0 || query_ns > 50LL * 1000 * 1000) {
+    mp_trace(ctx->log,
+             "Starfish getCurrentPlaytime rejected slow sample ms=%" PRId64
+             " query_ms=%.3f\n",
+             playtime_ms, (double)query_ns / 1e6);
+    return false;
+  }
+
+  *pts = playtime_ms / 1000.0;
+  *host_time_ns = before_ns + query_ns / 2;
+
+  bool log_clock = false;
+  {
+    std::lock_guard<std::mutex> lk(ctx->lock);
+    if (!ctx->playtime_clock_logged) {
+      ctx->playtime_clock_logged = true;
+      log_clock = true;
+    }
+  }
+  if (log_clock) {
+    mp_info(ctx->log,
+            "Starfish getCurrentPlaytime clock ms=%" PRId64
+            " pts=%.3f query_ms=%.3f\n",
+            playtime_ms, *pts, (double)query_ns / 1e6);
+  }
   return true;
 }
 

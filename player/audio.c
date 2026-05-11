@@ -21,7 +21,6 @@
 #include <limits.h>
 #include <math.h>
 #include <assert.h>
-#include <stdlib.h>
 
 #include "mpv_talloc.h"
 
@@ -50,20 +49,6 @@ enum {
 
 static void ao_process(struct mp_filter *f);
 
-static double get_external_video_latency(void)
-{
-    const char *env = getenv("STARFISH_VIDEO_LATENCY_MS");
-    if (!env || !env[0])
-        return 0;
-
-    char *end = NULL;
-    double ms = strtod(env, &end);
-    if (end == env || ms < 0)
-        return 0;
-
-    return MPCLAMP(ms / 1000.0, 0.0, 10.0);
-}
-
 static bool get_external_video_sync_pts(struct MPContext *mpctx, double *pts)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -81,8 +66,7 @@ static bool get_external_video_sync_pts(struct MPContext *mpctx, double *pts)
     if (age < 0 || age > 0.5)
         return false;
 
-    *pts = clock.pts + age * opts->playback_speed -
-           get_external_video_latency() - opts->audio_delay;
+    *pts = clock.pts + age * opts->playback_speed - opts->audio_delay;
     return true;
 }
 

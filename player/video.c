@@ -20,7 +20,6 @@
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
-#include <stdlib.h>
 
 #include "mpv_talloc.h"
 
@@ -74,20 +73,6 @@ static bool recreate_video_filters(struct MPContext *mpctx)
 
 double calc_average_frame_duration(struct MPContext *mpctx);
 static bool using_spdif_passthrough(struct MPContext *mpctx);
-
-static double get_external_video_latency(void)
-{
-    const char *env = getenv("STARFISH_VIDEO_LATENCY_MS");
-    if (!env || !env[0])
-        return 0;
-
-    char *end = NULL;
-    double ms = strtod(env, &end);
-    if (end == env || ms < 0)
-        return 0;
-
-    return MPCLAMP(ms / 1000.0, 0.0, 10.0);
-}
 
 int reinit_video_filters(struct MPContext *mpctx)
 {
@@ -672,8 +657,7 @@ static bool get_external_video_avdiff(struct MPContext *mpctx, double *diff)
     if (age < 0 || age > 0.5)
         return false;
 
-    double video_pts = clock.pts + age * opts->playback_speed -
-                       get_external_video_latency();
+    double video_pts = clock.pts + age * opts->playback_speed;
     *diff = a_pos - video_pts + opts->audio_delay;
     return true;
 }
