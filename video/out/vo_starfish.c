@@ -656,6 +656,24 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     return VO_TRUE;
 }
 
+static void redraw_osd(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    double osd_pts = starfish_ctx_get_current_pts(p->ctx);
+
+    if (osd_pts == MP_NOPTS_VALUE || !isfinite(osd_pts))
+        osd_pts = p->have_osd_pts ? p->last_osd_pts : 0;
+    else {
+        p->last_osd_pts = osd_pts;
+        p->have_osd_pts = true;
+    }
+
+    apply_video_geometry(vo, "redraw");
+    map_video_surface(vo);
+    render_osd_surface(vo, osd_pts);
+    flip_page(vo);
+}
+
 static int query_format(struct vo *vo, int format)
 {
     return format == IMGFMT_STARFISH;
@@ -671,9 +689,14 @@ static int control(struct vo *vo, uint32_t request, void *data)
          * current seek target. Don't double-flush here — a second flush() while
          * Starfish is mid-seek wedges the pipeline. */
         return VO_TRUE;
+    case VOCTRL_REDRAW:
+        redraw_osd(vo);
+        return VO_TRUE;
     case VOCTRL_PAUSE:
+        vo->want_redraw = true;
         return starfish_ctx_pause(p->ctx) ? VO_TRUE : VO_ERROR;
     case VOCTRL_RESUME:
+        vo->want_redraw = true;
         return starfish_ctx_resume(p->ctx) ? VO_TRUE : VO_ERROR;
     case VOCTRL_SET_PANSCAN:
         return resize(vo);
