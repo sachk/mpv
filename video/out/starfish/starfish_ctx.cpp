@@ -93,8 +93,21 @@ struct queued_packet {
   bool keyframe = false;
 };
 
-struct wake_target {
+struct wakeup_client_cb {
+  std::mutex lock;
+  std::condition_variable idle;
+  bool registered = false;
+  int active = 0;
   starfish_wakeup_cb cb = nullptr;
+  void *opaque = nullptr;
+};
+
+struct audio_prime_client_cb {
+  std::mutex lock;
+  std::condition_variable idle;
+  bool registered = false;
+  int active = 0;
+  starfish_audio_prime_cb cb = nullptr;
   void *opaque = nullptr;
 };
 
@@ -272,13 +285,10 @@ struct starfish_ctx {
 
   /* ready frames for vo */
   std::deque<struct starfish_video_frame> ready_frames;
-  /* wakeup callbacks */
-  starfish_wakeup_cb video_wakeup = nullptr;
-  void *video_wakeup_opaque = nullptr;
-  starfish_wakeup_cb audio_wakeup = nullptr;
-  void *audio_wakeup_opaque = nullptr;
-  starfish_audio_prime_cb audio_prime = nullptr;
-  void *audio_prime_opaque = nullptr;
+  /* mpv client callbacks */
+  wakeup_client_cb video_wakeup;
+  wakeup_client_cb audio_wakeup;
+  audio_prime_client_cb audio_prime;
 };
 
 /* ------------------------------------------------------------------ */
@@ -497,29 +507,76 @@ static bool is_loaded_state(pipeline_state state) {
          state == pipeline_state::PAUSED;
 }
 
-static void wake_stream(struct starfish_ctx *ctx,
-                        enum starfish_stream_type stream) {
+static void call_wakeup_client(wakeup_client_cb *client) {
   starfish_wakeup_cb cb = nullptr;
   void *opaque = nullptr;
   {
-    std::lock_guard<std::mutex> lk(ctx->lock);
-    if (stream == STARFISH_STREAM_VIDEO) {
-      cb = ctx->video_wakeup;
-      opaque = ctx->video_wakeup_opaque;
-    } else {
-      cb = ctx->audio_wakeup;
-      opaque = ctx->audio_wakeup_opaque;
-    }
+    std::lock_guard<std::mutex> lk(client->lock);
+    if (!client->registered || !client->cb)
+      return;
+    client->active++;
+    cb = client->cb;
+    opaque = client->opaque;
   }
-  if (cb)
-    cb(opaque);
+
+  cb(opaque);
+
+  {
+    std::lock_guard<std::mutex> lk(client->lock);
+    client->active--;
+    if (client->active == 0)
+      client->idle.notify_all();
+  }
 }
 
-static wake_target get_wake_target_locked(struct starfish_ctx *ctx,
-                                          enum starfish_stream_type stream) {
-  if (stream == STARFISH_STREAM_VIDEO)
-    return {ctx->video_wakeup, ctx->video_wakeup_opaque};
-  return {ctx->audio_wakeup, ctx->audio_wakeup_opaque};
+static bool call_audio_prime_client(audio_prime_client_cb *client,
+                                    int64_t pts_ns) {
+  starfish_audio_prime_cb cb = nullptr;
+  void *opaque = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(client->lock);
+    if (!client->registered || !client->cb)
+      return false;
+    client->active++;
+    cb = client->cb;
+    opaque = client->opaque;
+  }
+
+  bool result = cb(opaque, pts_ns);
+
+  {
+    std::lock_guard<std::mutex> lk(client->lock);
+    client->active--;
+    if (client->active == 0)
+      client->idle.notify_all();
+  }
+  return result;
+}
+
+static void set_wakeup_client(wakeup_client_cb *client,
+                              starfish_wakeup_cb cb, void *opaque) {
+  std::unique_lock<std::mutex> lk(client->lock);
+  client->registered = cb != nullptr;
+  client->cb = cb;
+  client->opaque = opaque;
+  if (!client->registered)
+    client->idle.wait(lk, [&] { return client->active == 0; });
+}
+
+static void set_audio_prime_client(audio_prime_client_cb *client,
+                                   starfish_audio_prime_cb cb, void *opaque) {
+  std::unique_lock<std::mutex> lk(client->lock);
+  client->registered = cb != nullptr;
+  client->cb = cb;
+  client->opaque = opaque;
+  if (!client->registered)
+    client->idle.wait(lk, [&] { return client->active == 0; });
+}
+
+static void wake_stream(struct starfish_ctx *ctx,
+                        enum starfish_stream_type stream) {
+  call_wakeup_client(stream == STARFISH_STREAM_VIDEO ? &ctx->video_wakeup
+                                                     : &ctx->audio_wakeup);
 }
 
 static void wake_all(struct starfish_ctx *ctx) {
@@ -528,16 +585,7 @@ static void wake_all(struct starfish_ctx *ctx) {
 }
 
 static bool request_audio_prime(struct starfish_ctx *ctx, int64_t pts_ns) {
-  starfish_audio_prime_cb cb = nullptr;
-  void *opaque = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(ctx->lock);
-    cb = ctx->audio_prime;
-    opaque = ctx->audio_prime_opaque;
-  }
-  if (!cb)
-    return false;
-  return cb(opaque, pts_ns);
+  return call_audio_prime_client(&ctx->audio_prime, pts_ns);
 }
 
 static std::unique_ptr<StarfishMediaAPIs>
@@ -1064,7 +1112,6 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
       ctx->need_segment && (stream == STARFISH_STREAM_VIDEO || is_audio_only);
   const int64_t seek_target_ns =
       ctx->pending_seek_target ? ctx->pending_seek_target_ns : -1;
-  const wake_target wake = get_wake_target_locked(ctx, stream);
   bool prime_audio_for_segment = false;
   int64_t audio_prime_pts_ns = 0;
 
@@ -1147,8 +1194,7 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
     ctx->fed_audio_pts_ns = packet.pts_ns;
 
   lk.unlock();
-  if (wake.cb)
-    wake.cb(wake.opaque);
+  wake_stream(ctx, stream);
   lk.lock();
   return feed_attempt_result::SUBMITTED;
 }
@@ -1595,8 +1641,6 @@ static void player_callback(int32_t type, int64_t numValue,
   }
 
   ctx->cv.notify_all();
-  wake_target video_wake = get_wake_target_locked(ctx, STARFISH_STREAM_VIDEO);
-  wake_target audio_wake = get_wake_target_locked(ctx, STARFISH_STREAM_AUDIO);
 
   lk.unlock();
 
@@ -1611,10 +1655,10 @@ static void player_callback(int32_t type, int64_t numValue,
       mp_err(ctx->log, "Starfish Play failed after load\n");
   }
 
-  if (wake_video && video_wake.cb)
-    video_wake.cb(video_wake.opaque);
-  if (wake_audio && audio_wake.cb)
-    audio_wake.cb(audio_wake.opaque);
+  if (wake_video)
+    wake_stream(ctx, STARFISH_STREAM_VIDEO);
+  if (wake_audio)
+    wake_stream(ctx, STARFISH_STREAM_AUDIO);
 
   guard->active.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -1711,22 +1755,19 @@ struct starfish_ctx *starfish_ctx_get_current(void) {
 void starfish_ctx_set_wakeup_cb(struct starfish_ctx *ctx,
                                 enum starfish_stream_type stream,
                                 starfish_wakeup_cb cb, void *opaque) {
-  std::lock_guard<std::mutex> lk(ctx->lock);
-  if (stream == STARFISH_STREAM_VIDEO) {
-    ctx->video_wakeup = cb;
-    ctx->video_wakeup_opaque = opaque;
-  } else {
-    ctx->audio_wakeup = cb;
-    ctx->audio_wakeup_opaque = opaque;
-  }
+  if (!ctx)
+    return;
+  set_wakeup_client(stream == STARFISH_STREAM_VIDEO ? &ctx->video_wakeup
+                                                    : &ctx->audio_wakeup,
+                    cb, opaque);
 }
 
 void starfish_ctx_set_audio_prime_cb(struct starfish_ctx *ctx,
                                      starfish_audio_prime_cb cb,
                                      void *opaque) {
-  std::lock_guard<std::mutex> lk(ctx->lock);
-  ctx->audio_prime = cb;
-  ctx->audio_prime_opaque = opaque;
+  if (!ctx)
+    return;
+  set_audio_prime_client(&ctx->audio_prime, cb, opaque);
 }
 
 bool starfish_ctx_set_window_id(struct starfish_ctx *ctx,
