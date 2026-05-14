@@ -9,6 +9,7 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/audio_fifo.h>
+#include <libavutil/mem.h>
 
 #include "audio/chmap.h"
 #include "audio/fmt-conversion.h"
@@ -21,6 +22,14 @@
 #include "options/options.h"
 #include "osdep/timer.h"
 #include "video/out/starfish/starfish_ctx.h"
+
+struct encoded_packet {
+    struct encoded_packet *next;
+    uint8_t *data;
+    size_t size;
+    int64_t pts_ns;
+    int samples;
+};
 
 struct priv {
     struct starfish_ctx *ctx;
@@ -44,6 +53,10 @@ struct priv {
     bool needs_sync;
     bool logged_audio_delay;
     double last_audio_delay;
+    struct encoded_packet *pending_head;
+    struct encoded_packet *pending_tail;
+    int pending_samples;
+    bool feed_blocked;
 };
 
 #define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.08
@@ -153,25 +166,111 @@ static enum AVSampleFormat select_encoder_format(const AVCodec *codec)
     return codec->sample_fmts[0];
 }
 
-static bool feed_encoded_packet(struct ao *ao, const uint8_t *data, size_t size, int64_t pts_ns)
+static void free_encoded_packet(struct encoded_packet *pkt)
+{
+    if (!pkt)
+        return;
+    av_free(pkt->data);
+    av_free(pkt);
+}
+
+static void free_pending_packets_locked(struct priv *p)
+{
+    while (p->pending_head) {
+        struct encoded_packet *pkt = p->pending_head;
+        p->pending_head = pkt->next;
+        free_encoded_packet(pkt);
+    }
+    p->pending_tail = NULL;
+    p->pending_samples = 0;
+    p->feed_blocked = false;
+}
+
+static bool queue_encoded_packet_locked(struct ao *ao, const uint8_t *data,
+                                        size_t size, int64_t pts_ns,
+                                        int samples)
 {
     struct priv *p = ao->priv;
+    struct encoded_packet *pkt = av_mallocz(sizeof(*pkt));
 
-    for (int tries = 0; tries < 10; tries++) {
-        int r = starfish_ctx_feed_audio(p->ctx, data, size, pts_ns);
-        if (r != STARFISH_FEED_AGAIN)
-            MP_TRACE(ao, "ao_starfish feed_encoded_packet ctx=%p size=%zu pts=%" PRId64
-                     " try=%d result=%d\n",
-                     p->ctx, size, pts_ns, tries + 1, r);
-        if (r == STARFISH_FEED_OK)
-            return true;
-        if (r == STARFISH_FEED_ERROR)
-            return false;
-        mp_sleep_ns(MP_TIME_MS_TO_NS(10));
+    if (!pkt)
+        return false;
+    pkt->data = av_memdup(data, size);
+    if (!pkt->data) {
+        av_free(pkt);
+        return false;
+    }
+    pkt->size = size;
+    pkt->pts_ns = pts_ns;
+    pkt->samples = samples;
+
+    if (p->pending_tail) {
+        p->pending_tail->next = pkt;
+    } else {
+        p->pending_head = pkt;
+    }
+    p->pending_tail = pkt;
+    p->pending_samples += samples;
+    p->feed_blocked = false;
+    return true;
+}
+
+static bool feed_pending_packets(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    bool ok = true;
+
+    for (;;) {
+        pthread_mutex_lock(&p->lock);
+        struct encoded_packet *pkt = p->pending_head;
+        if (!pkt || !p->ctx) {
+            p->feed_blocked = false;
+            pthread_mutex_unlock(&p->lock);
+            break;
+        }
+        p->pending_head = pkt->next;
+        if (p->pending_tail == pkt)
+            p->pending_tail = NULL;
+        pkt->next = NULL;
+        p->pending_samples = MPMAX(p->pending_samples - pkt->samples, 0);
+        struct starfish_ctx *ctx = starfish_ctx_retain(p->ctx);
+        pthread_mutex_unlock(&p->lock);
+
+        int r = starfish_ctx_feed_audio(ctx, pkt->data, pkt->size, pkt->pts_ns);
+        starfish_ctx_unref(ctx);
+        if (r == STARFISH_FEED_AGAIN) {
+            pthread_mutex_lock(&p->lock);
+            pkt->next = p->pending_head;
+            p->pending_head = pkt;
+            if (!p->pending_tail)
+                p->pending_tail = pkt;
+            p->pending_samples += pkt->samples;
+            p->feed_blocked = true;
+            pthread_mutex_unlock(&p->lock);
+            break;
+        }
+        if (r == STARFISH_FEED_ERROR) {
+            MP_WARN(ao, "Starfish rejected encoded audio packet pts=%" PRId64
+                    " size=%zu\n", pkt->pts_ns, pkt->size);
+            ok = false;
+        }
+
+        MP_TRACE(ao, "ao_starfish feed packet size=%zu pts=%" PRId64
+                 " result=%d\n", pkt->size, pkt->pts_ns, r);
+
+        pthread_mutex_lock(&p->lock);
+        if (r == STARFISH_FEED_OK) {
+            drain(ao);
+            p->buffered_samples += pkt->samples;
+        }
+        pthread_mutex_unlock(&p->lock);
+        free_encoded_packet(pkt);
+
+        if (!ok)
+            break;
     }
 
-    MP_WARN(ao, "Timed out waiting for Starfish audio buffer space\n");
-    return false;
+    return ok;
 }
 
 static bool sync_written_samples_to_seek_target(struct ao *ao, bool log_missing)
@@ -251,6 +350,7 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
     if (!p->encoder || pts_ns < 0)
         return false;
 
+    free_pending_packets_locked(p);
     av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
     if (!reopen_encoder_locked(ao))
         return false;
@@ -276,6 +376,8 @@ static bool audio_prime_cb(void *opaque, int64_t pts_ns)
     pthread_mutex_lock(&p->lock);
     ok = prime_at_ns_locked(ao, pts_ns, "starfish segment");
     pthread_mutex_unlock(&p->lock);
+    if (ok)
+        ok = feed_pending_packets(ao);
     return ok;
 }
 
@@ -340,14 +442,14 @@ static bool encode_pending_audio(struct ao *ao, bool flush_tail)
             if (pts_ns < 0)
                 pts_ns = 0;
 
-            if (!feed_encoded_packet(ao, p->packet->data, p->packet->size,
-                                     apply_audio_delay_to_pts(ao, pts_ns))) {
+            if (!queue_encoded_packet_locked(ao, p->packet->data,
+                                             p->packet->size,
+                                             apply_audio_delay_to_pts(ao, pts_ns),
+                                             p->frame_samples)) {
                 av_packet_unref(p->packet);
                 return false;
             }
 
-            drain(ao);
-            p->buffered_samples += p->frame_samples;
             av_packet_unref(p->packet);
         }
     }
@@ -403,14 +505,13 @@ static int encode_silence_frame(struct ao *ao, int samples)
         if (pts_ns < 0)
             pts_ns = 0;
 
-        if (!feed_encoded_packet(ao, p->packet->data, p->packet->size,
-                                 apply_audio_delay_to_pts(ao, pts_ns))) {
+        if (!queue_encoded_packet_locked(ao, p->packet->data, p->packet->size,
+                                         apply_audio_delay_to_pts(ao, pts_ns),
+                                         samples)) {
             av_packet_unref(p->packet);
             return -1;
         }
 
-        drain(ao);
-        p->buffered_samples += samples;
         packets++;
         av_packet_unref(p->packet);
     }
@@ -525,6 +626,10 @@ static int init(struct ao *ao)
         return -1;
     }
     pthread_mutex_unlock(&p->lock);
+    if (!feed_pending_packets(ao)) {
+        uninit(ao);
+        return -1;
+    }
     ao->device_buffer = p->latency_samples +
                         ao->samplerate * STARFISH_AUDIO_BUFFER_SEC;
     p->last_time = mp_time_sec();
@@ -556,6 +661,11 @@ static void uninit(struct ao *ao)
         p->ctx = NULL;
     }
     if (p->lock_initialized) {
+        pthread_mutex_lock(&p->lock);
+        free_pending_packets_locked(p);
+        pthread_mutex_unlock(&p->lock);
+    }
+    if (p->lock_initialized) {
         pthread_mutex_destroy(&p->lock);
         p->lock_initialized = false;
     }
@@ -574,6 +684,7 @@ static void reset(struct ao *ao)
     p->logged_write = false;
     p->buffered_samples = 0;
     p->written_samples = 0;
+    free_pending_packets_locked(p);
     if (p->fifo)
         av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
     if (p->encoder && !reopen_encoder_locked(ao))
@@ -600,6 +711,7 @@ static void reset(struct ao *ao)
 static void start(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    bool prime_ok = true;
 
     pthread_mutex_lock(&p->lock);
     p->paused = false;
@@ -610,8 +722,10 @@ static void start(struct ao *ao)
         MP_INFO(ao, "ao_starfish start waiting for Starfish segment audio prime\n");
     }
     if (!p->needs_sync && !ensure_audio_primed(ao))
-        MP_WARN(ao, "Unable to re-prime Starfish audio on start\n");
+        prime_ok = false;
     pthread_mutex_unlock(&p->lock);
+    if (!prime_ok || !feed_pending_packets(ao))
+        MP_WARN(ao, "Unable to re-prime Starfish audio on start\n");
     if (p->ctx)
         starfish_ctx_resume(p->ctx);
 }
@@ -627,7 +741,10 @@ static bool set_pause(struct ao *ao, bool paused)
     if (p->ctx) {
         if (paused)
             return starfish_ctx_pause(p->ctx);
+        feed_pending_packets(ao);
+        pthread_mutex_lock(&p->lock);
         p->last_time = mp_time_sec();
+        pthread_mutex_unlock(&p->lock);
         return starfish_ctx_resume(p->ctx);
     }
     return true;
@@ -637,6 +754,9 @@ static bool audio_write(struct ao *ao, void **data, int samples)
 {
     struct priv *p = ao->priv;
     bool ok = false;
+
+    if (!feed_pending_packets(ao))
+        return false;
 
     pthread_mutex_lock(&p->lock);
     if (p->needs_sync) {
@@ -661,6 +781,8 @@ static bool audio_write(struct ao *ao, void **data, int samples)
 
 done:
     pthread_mutex_unlock(&p->lock);
+    if (ok && !feed_pending_packets(ao))
+        ok = false;
     return ok;
 }
 
@@ -670,15 +792,19 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
     int queued_fifo = 0;
     double queued_total = 0;
 
+    feed_pending_packets(ao);
+
     pthread_mutex_lock(&p->lock);
     queued_fifo = p->fifo ? av_audio_fifo_size(p->fifo) : 0;
     drain(ao);
-    queued_total = p->buffered_samples + queued_fifo;
+    queued_total = p->buffered_samples + p->pending_samples + queued_fifo;
 
     state->queued_samples = queued_total;
     state->free_samples = MPMAX(ao->device_buffer - p->latency_samples -
                                 state->queued_samples, 0);
     state->free_samples = state->free_samples / p->outburst * p->outburst;
+    if (p->feed_blocked)
+        state->free_samples = 0;
     state->delay = queued_total / ao->samplerate;
     state->playing = p->playing && !p->paused && !p->needs_sync &&
                      queued_total > 0;
