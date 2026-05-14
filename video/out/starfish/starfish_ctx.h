@@ -110,6 +110,9 @@ STARFISH_CTX_API bool starfish_ctx_pause(struct starfish_ctx *ctx);
 STARFISH_CTX_API bool starfish_ctx_set_seek_target(struct starfish_ctx *ctx,
                                                    double pts);
 STARFISH_CTX_API bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts);
+STARFISH_CTX_API bool
+starfish_ctx_set_external_audio_clock(struct starfish_ctx *ctx, double pts,
+                                      int64_t host_time_ns);
 STARFISH_CTX_API bool starfish_ctx_get_seek_target_ns(struct starfish_ctx *ctx,
                                                       int64_t *pts_ns);
 STARFISH_CTX_API bool

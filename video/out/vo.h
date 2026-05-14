@@ -133,6 +133,11 @@ enum mp_voctrl {
     // Clipboard
     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
     VOCTRL_SET_CLIPBOARD,
+
+    // Starfish/webOS: audio is rendered externally by the normal AO. This
+    // publishes the measured audio clock to the VO so hardware video can slave
+    // to the real PCM position instead of Starfish's internal audio clock.
+    VOCTRL_SET_EXTERNAL_AUDIO_CLOCK,     // struct voctrl_external_audio_clock*
 };
 
 // Helper to expose what kind of content is currently playing to the VO.
@@ -140,6 +145,11 @@ enum mp_content_type {
     MP_CONTENT_NONE, // used for force-window
     MP_CONTENT_IMAGE,
     MP_CONTENT_VIDEO,
+};
+
+struct voctrl_external_audio_clock {
+    double pts;
+    int64_t host_time_ns;
 };
 
 #define VO_TRUE         true

@@ -388,6 +388,7 @@ typedef struct MPContext {
     double playback_pts;
     // For logging only.
     double logged_async_diff;
+    int64_t last_external_audio_clock_ns;
 
     int last_chapter;
 
@@ -522,6 +523,7 @@ float audio_get_gain(struct MPContext *mpctx);
 void audio_update_volume(struct MPContext *mpctx);
 void reload_audio_output(struct MPContext *mpctx);
 void audio_start_ao(struct MPContext *mpctx);
+void audio_update_external_clock(struct MPContext *mpctx, bool force);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);
