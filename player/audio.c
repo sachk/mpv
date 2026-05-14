@@ -36,6 +36,7 @@
 #include "filters/f_async_queue.h"
 #include "filters/f_decoder_wrapper.h"
 #include "filters/filter_internal.h"
+#include "video/out/vo.h"
 
 #include "core.h"
 #include "command.h"
@@ -47,6 +48,30 @@ enum {
 };
 
 static void ao_process(struct mp_filter *f);
+
+void audio_update_external_clock(struct MPContext *mpctx, bool force)
+{
+    if (!mpctx->video_out || !mpctx->ao ||
+        mpctx->audio_status != STATUS_PLAYING)
+        return;
+
+    int64_t now = mp_time_ns();
+    if (!force && mpctx->last_external_audio_clock_ns &&
+        now - mpctx->last_external_audio_clock_ns < MP_TIME_MS_TO_NS(20))
+        return;
+
+    double pts = playing_audio_pts(mpctx);
+    if (pts == MP_NOPTS_VALUE || !isfinite(pts))
+        return;
+    pts += mpctx->opts->audio_delay;
+
+    struct voctrl_external_audio_clock clock = {
+        .pts = pts,
+        .host_time_ns = now,
+    };
+    vo_control(mpctx->video_out, VOCTRL_SET_EXTERNAL_AUDIO_CLOCK, &clock);
+    mpctx->last_external_audio_clock_ns = now;
+}
 
 static void update_speed_filters(struct MPContext *mpctx)
 {
@@ -237,6 +262,7 @@ void reset_audio_state(struct MPContext *mpctx)
     }
     mpctx->audio_status = mpctx->ao_chain ? STATUS_SYNCING : STATUS_EOF;
     mpctx->delay = 0;
+    mpctx->last_external_audio_clock_ns = 0;
     mpctx->logged_async_diff = -1;
 }
 
@@ -857,6 +883,8 @@ void audio_start_ao(struct MPContext *mpctx)
     ao_c->delaying_audio_start = false;
     ao_start(ao_c->ao);
     mpctx->audio_status = STATUS_PLAYING;
+    mpctx->last_external_audio_clock_ns = 0;
+    audio_update_external_clock(mpctx, true);
     if (ao_c->out_eof) {
         mpctx->audio_status = STATUS_DRAINING;
         MP_VERBOSE(mpctx, "audio draining\n");
@@ -874,6 +902,7 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
         reload_audio_output(mpctx);
 
     update_throttle(mpctx);
+    audio_update_external_clock(mpctx, false);
 
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (!ao_c)

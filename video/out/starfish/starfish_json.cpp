@@ -68,6 +68,8 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
       << "\"appId\":\"" << json_escape(params->app_id) << "\","
       << "\"needAudio\":" << (params->need_audio ? "true" : "false") << ','
       << "\"seekMode\":\"keep-rate\","
+      << "\"queryPosition\":true,"
+      << "\"useCurrentTimeWithSystemClock\":true,"
       << "\"useDroppedFrameEvent\":true,";
 
   if (params->window_id && params->window_id[0])
@@ -78,6 +80,7 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
       << "\"trickType\":\"client-side\""
       << "},"
       << "\"externalStreamingInfo\":{"
+      << "\"audioSync\":true,"
       << "\"streamQualityInfo\":true,"
       << "\"streamQualityInfoNonFlushable\":true,"
       << "\"streamQualityInfoCorruptedFrame\":true,"

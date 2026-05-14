@@ -174,6 +174,8 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
         if (mpctx->ao) {
             bool eof = mpctx->audio_status == STATUS_EOF;
             ao_set_paused(mpctx->ao, internal_paused, eof);
+            if (!internal_paused)
+                audio_update_external_clock(mpctx, true);
         }
 
         if (mpctx->video_out)

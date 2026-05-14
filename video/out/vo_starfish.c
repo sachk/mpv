@@ -677,6 +677,15 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return starfish_ctx_resume(p->ctx) ? VO_TRUE : VO_ERROR;
     case VOCTRL_SET_PANSCAN:
         return resize(vo);
+    case VOCTRL_SET_EXTERNAL_AUDIO_CLOCK: {
+        struct voctrl_external_audio_clock *clock = data;
+        if (!clock)
+            return VO_FALSE;
+        return starfish_ctx_set_external_audio_clock(p->ctx, clock->pts,
+                                                     clock->host_time_ns)
+                   ? VO_TRUE
+                   : VO_ERROR;
+    }
     }
 
     int events = 0;
