@@ -36,6 +36,8 @@ struct priv {
   bool have_filtered;
   bool input_eof;
   bool sent_eof;
+  bool sent_initial_geometry;
+  bool allow_initial_geometry;
   bool wait_for_keyframe;
   struct mp_decoder public;
 };
@@ -163,6 +165,35 @@ static void output_ready_frame(struct mp_filter *f) {
   mpi->pkt_duration = frame.duration;
   mpi->nominal_fps = starfish_ctx_get_video_fps(p->ctx);
 
+  mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, mpi));
+}
+
+static void output_initial_geometry_frame(struct mp_filter *f) {
+  struct priv *p = f->priv;
+  if (!p->allow_initial_geometry || p->sent_initial_geometry ||
+      !mp_pin_in_needs_data(f->ppins[1]))
+    return;
+
+  const int width = starfish_ctx_get_video_width(p->ctx);
+  const int height = starfish_ctx_get_video_height(p->ctx);
+  if (width <= 0 || height <= 0)
+    return;
+
+  struct mp_image *mpi = mp_image_new_dummy_ref(NULL);
+  if (!mpi) {
+    mp_filter_internal_mark_failed(f);
+    return;
+  }
+
+  mp_image_setfmt(mpi, IMGFMT_STARFISH);
+  mp_image_set_size(mpi, width, height);
+  mpi->pts = p->start_pts == MP_NOPTS_VALUE ? 0.0 : p->start_pts;
+  mpi->dts = mpi->pts;
+  mpi->nominal_fps = starfish_ctx_get_video_fps(p->ctx);
+
+  p->sent_initial_geometry = true;
+  MP_INFO(p, "vd_starfish emitted reset geometry frame %dx%d pts=%f\n",
+          width, height, mpi->pts);
   mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, mpi));
 }
 
@@ -309,10 +340,12 @@ static bool feed_pending(struct mp_filter *f) {
   return false;
 }
 
-static void reset_decoder_state(struct priv *p) {
+static void reset_decoder_state(struct priv *p, bool allow_initial_geometry) {
   clear_pending(p);
   p->input_eof = false;
   p->sent_eof = false;
+  p->sent_initial_geometry = false;
+  p->allow_initial_geometry = allow_initial_geometry;
   p->wait_for_keyframe = true;
   if (p->bsf)
     av_bsf_flush(p->bsf);
@@ -353,7 +386,7 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
 
   switch (cmd) {
   case VDCTRL_REINIT:
-    reset_decoder_state(p);
+    reset_decoder_state(p, true);
     starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
     return CONTROL_TRUE;
   case VDCTRL_SET_START_PTS:
@@ -370,6 +403,7 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
 
 static void vd_starfish_process(struct mp_filter *f) {
   process_input(f);
+  output_initial_geometry_frame(f);
   if (feed_pending(f))
     mp_filter_internal_mark_progress(f);
   output_ready_frame(f);
@@ -379,7 +413,7 @@ static void vd_starfish_process(struct mp_filter *f) {
 static void vd_starfish_reset(struct mp_filter *f) {
   struct priv *p = f->priv;
 
-  reset_decoder_state(p);
+  reset_decoder_state(p, true);
   starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
 }
 
