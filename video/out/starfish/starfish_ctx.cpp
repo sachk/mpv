@@ -1304,7 +1304,7 @@ static void worker_loop(struct starfish_ctx *ctx) {
 
       /* User pause/play transitions */
       if (!ctx->play_requested && ctx->state == pipeline_state::PLAYING &&
-          !ctx->pending_seek_target) {
+          !ctx->pending_seek_target && !ctx->need_segment && ctx->started) {
         mp_info(ctx->log, "Starfish Pause (user)\n");
         ctx->state = pipeline_state::PAUSED;
         lk.unlock();
