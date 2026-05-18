@@ -39,6 +39,7 @@ struct priv {
   bool sent_initial_geometry;
   bool allow_initial_geometry;
   bool wait_for_keyframe;
+  bool pending_ctx_flush;
   struct mp_decoder public;
 };
 
@@ -309,6 +310,15 @@ static bool feed_pending(struct mp_filter *f) {
             p->pending->pts, p->pending->dts);
   }
 
+  if (p->pending_ctx_flush) {
+    double flush_pts = p->start_pts == MP_NOPTS_VALUE ? p->pending->pts
+                                                      : p->start_pts;
+    MP_INFO(p, "vd_starfish flushing Starfish at pts=%f\n", flush_pts);
+    p->pending_ctx_flush = false;
+    starfish_ctx_flush(p->ctx, flush_pts);
+    return false;
+  }
+
   const void *data = p->pending->buffer;
   size_t size = p->pending->len;
   if (p->bsf) {
@@ -347,6 +357,8 @@ static void reset_decoder_state(struct priv *p, bool allow_initial_geometry) {
   p->sent_initial_geometry = false;
   p->allow_initial_geometry = allow_initial_geometry;
   p->wait_for_keyframe = true;
+  p->pending_ctx_flush = true;
+  p->start_pts = MP_NOPTS_VALUE;
   if (p->bsf)
     av_bsf_flush(p->bsf);
 }
@@ -386,12 +398,18 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
 
   switch (cmd) {
   case VDCTRL_REINIT:
-    reset_decoder_state(p, true);
-    starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
+    reset_decoder_state(p, false);
     return CONTROL_TRUE;
   case VDCTRL_SET_START_PTS:
     p->start_pts = *(double *)arg;
-    starfish_ctx_set_seek_target(p->ctx, p->start_pts);
+    if (p->pending_ctx_flush) {
+      MP_INFO(p, "vd_starfish flushing Starfish for start pts=%f\n",
+              p->start_pts);
+      p->pending_ctx_flush = false;
+      starfish_ctx_flush(p->ctx, p->start_pts);
+    } else {
+      starfish_ctx_set_seek_target(p->ctx, p->start_pts);
+    }
     return CONTROL_TRUE;
   case VDCTRL_GET_HWDEC:
     *(char **)arg = "starfish";
@@ -413,8 +431,7 @@ static void vd_starfish_process(struct mp_filter *f) {
 static void vd_starfish_reset(struct mp_filter *f) {
   struct priv *p = f->priv;
 
-  reset_decoder_state(p, true);
-  starfish_ctx_flush(p->ctx, MP_NOPTS_VALUE);
+  reset_decoder_state(p, false);
 }
 
 static void vd_starfish_destroy(struct mp_filter *f) {
