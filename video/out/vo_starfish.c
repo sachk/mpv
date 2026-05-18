@@ -790,7 +790,12 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
 const struct vo_driver video_out_starfish = {
     .description = "LG webOS Starfish",
     .name = "starfish",
-    .caps = VO_CAP_NORETAIN,
+    // Starfish owns frame presentation after mpv hands frames to the webOS
+    // pipeline. mpv has no reliable presentation feedback here, so its generic
+    // lateness heuristic can mark every frame as a VO drop even while Starfish
+    // is presenting normally. Disable mpv-side VO drop accounting and let the
+    // Starfish pipeline decide what to discard internally.
+    .caps = VO_CAP_NORETAIN | VO_CAP_FRAMEDROP,
     .preinit = preinit,
     .query_format = query_format,
     .reconfig = reconfig,
