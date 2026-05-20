@@ -35,6 +35,7 @@ extern "C" {
 #include "common/msg.h"
 #include "demux/stheader.h"
 #include "mpv_talloc.h"
+#include "osdep/timer.h"
 #include "video/hwdec.h"
 #undef _Atomic
 }
@@ -278,6 +279,8 @@ struct starfish_ctx {
   std::chrono::steady_clock::time_point pending_segment_ready_watchdog =
       std::chrono::steady_clock::time_point::min();
   int64_t current_pts_ns = 0;
+  int64_t video_clock_base_pts_ns = INT64_MIN;
+  int64_t video_clock_base_host_ns = 0;
   int64_t min_ready_pts_ns = INT64_MIN;
   int64_t fed_video_pts_ns = INT64_MIN;
   int64_t fed_audio_pts_ns = INT64_MIN;
@@ -1112,6 +1115,28 @@ static bool pause_request_due_locked(struct starfish_ctx *ctx) {
   return std::chrono::steady_clock::now() >= ctx->pause_after_seek_at;
 }
 
+static std::chrono::nanoseconds frame_interval_locked(struct starfish_ctx *ctx) {
+  const double fps = ctx->fps > 0.0 ? ctx->fps : 30.0;
+  return std::chrono::nanoseconds((int64_t)llround(1000000000.0 / fps));
+}
+
+static int64_t projected_video_pts_locked(struct starfish_ctx *ctx) {
+  if (ctx->video_clock_base_pts_ns == INT64_MIN ||
+      ctx->video_clock_base_host_ns <= 0)
+    return INT64_MIN;
+
+  const int64_t elapsed_ns = mp_time_ns() - ctx->video_clock_base_host_ns;
+  if (elapsed_ns < 0)
+    return ctx->video_clock_base_pts_ns;
+  return ctx->video_clock_base_pts_ns + elapsed_ns;
+}
+
+static bool needs_synthetic_frame_wakeup_locked(struct starfish_ctx *ctx) {
+  return ctx->state == pipeline_state::PLAYING && ctx->started &&
+         !ctx->resetting && !ctx->flush_requested && !ctx->need_segment &&
+         ctx->ready_frames.empty();
+}
+
 static void queue_ready_frame_locked(struct starfish_ctx *ctx, int64_t pts_ns,
                                      const char *reason) {
   struct starfish_video_frame frame = {
@@ -1170,7 +1195,8 @@ static feed_attempt_result try_drain_stream(struct starfish_ctx *ctx,
     const int64_t fed_pts = stream == STARFISH_STREAM_VIDEO
                                 ? ctx->fed_video_pts_ns
                                 : ctx->fed_audio_pts_ns;
-    const int64_t clock_pts = ctx->external_audio_clock_valid
+    const int64_t clock_pts = stream == STARFISH_STREAM_AUDIO &&
+                                      ctx->external_audio_clock_valid
                                   ? ctx->external_audio_pts_ns
                                   : ctx->current_pts_ns;
     if (fed_pts != INT64_MIN &&
@@ -1309,6 +1335,8 @@ static void prepare_segment_timeline_locked(struct starfish_ctx *ctx,
   ctx->pts_offset_valid = false;
   ctx->pts_offset_ns = 0;
   ctx->current_pts_ns = start_pts_ns == INT64_MIN ? 0 : start_pts_ns;
+  ctx->video_clock_base_pts_ns = INT64_MIN;
+  ctx->video_clock_base_host_ns = 0;
   ctx->min_ready_pts_ns = start_pts_ns;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
@@ -1472,7 +1500,10 @@ static void worker_loop(struct starfish_ctx *ctx) {
         blocked |= result == feed_attempt_result::BLOCKED;
 
         if (blocked) {
+          const bool wake_synthetic = needs_synthetic_frame_wakeup_locked(ctx);
           lk.unlock();
+          if (wake_synthetic)
+            wake_stream(ctx, STARFISH_STREAM_VIDEO);
           std::this_thread::sleep_for(std::chrono::milliseconds(25));
           lk.lock();
           continue;
@@ -1511,6 +1542,11 @@ static void worker_loop(struct starfish_ctx *ctx) {
     }
 
     auto wait_time = std::chrono::steady_clock::duration(std::chrono::seconds(1));
+    if (needs_synthetic_frame_wakeup_locked(ctx)) {
+      const auto frame_interval = frame_interval_locked(ctx);
+      if (frame_interval < wait_time)
+        wait_time = frame_interval;
+    }
     if (!ctx->play_requested && ctx->state == pipeline_state::PLAYING &&
         ctx->pause_after_seek_at !=
             std::chrono::steady_clock::time_point::min()) {
@@ -1533,7 +1569,7 @@ static void worker_loop(struct starfish_ctx *ctx) {
       }
     }
 
-    ctx->cv.wait_for(lk, wait_time, [&] {
+    const bool woke_for_work = ctx->cv.wait_for(lk, wait_time, [&] {
       return ctx->stop || ctx->flush_requested || can_load(ctx) ||
              (is_loaded_state(ctx->state) &&
               (ctx->pending_external_audio_clock ||
@@ -1543,9 +1579,14 @@ static void worker_loop(struct starfish_ctx *ctx) {
                 (ctx->state == pipeline_state::PAUSED ||
                  ctx->state == pipeline_state::LOADED)) ||
                (!ctx->play_requested &&
-                ctx->state == pipeline_state::PLAYING &&
-                pause_request_due_locked(ctx))));
+                 ctx->state == pipeline_state::PLAYING &&
+                 pause_request_due_locked(ctx))));
     });
+    if (!woke_for_work && needs_synthetic_frame_wakeup_locked(ctx)) {
+      lk.unlock();
+      wake_stream(ctx, STARFISH_STREAM_VIDEO);
+      lk.lock();
+    }
   }
 }
 
@@ -1732,6 +1773,8 @@ static void player_callback(int32_t type, int64_t numValue,
     ctx->min_ready_pts_ns = INT64_MIN;
     ctx->fed_video_pts_ns = INT64_MIN;
     ctx->fed_audio_pts_ns = INT64_MIN;
+    ctx->video_clock_base_pts_ns = INT64_MIN;
+    ctx->video_clock_base_host_ns = 0;
     ctx->pts_offset_valid = false;
     ctx->pts_offset_ns = 0;
     ctx->media_sync_options_added = false;
@@ -2081,6 +2124,8 @@ static void starfish_ctx_session_reset(struct starfish_ctx *ctx) {
   ctx->min_ready_pts_ns = INT64_MIN;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
+  ctx->video_clock_base_pts_ns = INT64_MIN;
+  ctx->video_clock_base_host_ns = 0;
   ctx->pts_offset_valid = false;
   ctx->pts_offset_ns = 0;
   ctx->media_sync_options_added = false;
@@ -2274,15 +2319,30 @@ bool starfish_ctx_pop_video_frame(struct starfish_ctx *ctx,
   if (!ctx->ready_frames.empty()) {
     *frame = ctx->ready_frames.front();
     ctx->ready_frames.pop_front();
+    ctx->current_pts_ns = (int64_t)llround(frame->pts * 1000000000.0);
+    ctx->video_clock_base_pts_ns = ctx->current_pts_ns;
+    ctx->video_clock_base_host_ns = mp_time_ns();
     return true;
   }
   // Starfish doesn't emit FRAMEREADY events in this config, so synthesize
-  // frames at framerate so mpv's playback clock keeps advancing.
+  // frames from the video segment's wall-clock timeline. Do not derive these
+  // from ALSA: the pixels are owned by Starfish video, and using audio here can
+  // hide real video/seek drift behind a bogus mpv/UI timestamp.
   if (ctx->state != pipeline_state::PLAYING || !ctx->started)
     return false;
   const double fps = ctx->fps > 0.0 ? ctx->fps : 30.0;
   const int64_t frame_ns = (int64_t)llround(1e9 / fps);
-  ctx->current_pts_ns += frame_ns;
+  const int64_t projected_pts_ns = projected_video_pts_locked(ctx);
+  int64_t next_pts_ns = ctx->current_pts_ns + frame_ns;
+  if (projected_pts_ns != INT64_MIN) {
+    if (projected_pts_ns < ctx->current_pts_ns + frame_ns / 2)
+      return false;
+    next_pts_ns = projected_pts_ns;
+  }
+  if (ctx->eos_pushed && ctx->fed_video_pts_ns != INT64_MIN &&
+      next_pts_ns > ctx->fed_video_pts_ns + frame_ns)
+    return false;
+  ctx->current_pts_ns = next_pts_ns;
   frame->pts = (double)ctx->current_pts_ns / 1e9;
   frame->dts = frame->pts;
   frame->duration = 1.0 / fps;
@@ -2296,6 +2356,10 @@ bool starfish_ctx_pop_video_frame(struct starfish_ctx *ctx,
 bool starfish_ctx_resume(struct starfish_ctx *ctx) {
   {
     std::lock_guard<std::mutex> lk(ctx->lock);
+    if (ctx->started && ctx->current_pts_ns != INT64_MIN) {
+      ctx->video_clock_base_pts_ns = ctx->current_pts_ns;
+      ctx->video_clock_base_host_ns = mp_time_ns();
+    }
     ctx->pause_after_seek_restart = false;
     ctx->pause_after_seek_at = std::chrono::steady_clock::time_point::min();
     if (ctx->seek_target_valid &&
@@ -2321,6 +2385,11 @@ bool starfish_ctx_resume(struct starfish_ctx *ctx) {
 bool starfish_ctx_pause(struct starfish_ctx *ctx) {
   {
     std::lock_guard<std::mutex> lk(ctx->lock);
+    int64_t projected_pts_ns = projected_video_pts_locked(ctx);
+    if (projected_pts_ns != INT64_MIN)
+      ctx->current_pts_ns = projected_pts_ns;
+    ctx->video_clock_base_pts_ns = INT64_MIN;
+    ctx->video_clock_base_host_ns = 0;
     ctx->play_requested = false;
     ctx->resume_waiting_external_clock = false;
     ctx->pause_after_seek_at = std::chrono::steady_clock::time_point::min();
@@ -2487,6 +2556,12 @@ double starfish_ctx_get_video_fps(struct starfish_ctx *ctx) {
 
 double starfish_ctx_get_current_pts(struct starfish_ctx *ctx) {
   std::lock_guard<std::mutex> lk(ctx->lock);
+  int64_t projected_pts_ns = projected_video_pts_locked(ctx);
+  if (ctx->eos_pushed && ctx->fed_video_pts_ns != INT64_MIN &&
+      projected_pts_ns > ctx->fed_video_pts_ns)
+    projected_pts_ns = ctx->fed_video_pts_ns;
+  if (projected_pts_ns != INT64_MIN && projected_pts_ns > ctx->current_pts_ns)
+    return projected_pts_ns / 1000000000.0;
   return ctx->current_pts_ns / 1000000000.0;
 }
 
