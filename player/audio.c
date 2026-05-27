@@ -1005,36 +1005,41 @@ static bool get_sync_pts(struct MPContext *mpctx, double *pts,
                           bool require_live_starfish_clock)
 {
     struct MPOpts *opts = mpctx->opts;
+    bool starfish_video = is_starfish_video_out(mpctx);
+    bool split_clock = starfish_split_clock(mpctx);
 
     *pts = MP_NOPTS_VALUE;
 
-    if (starfish_split_clock(mpctx) && mpctx->video_status != STATUS_EOF) {
+    if (starfish_video && mpctx->video_status != STATUS_EOF) {
+        double audio_start_bias = split_clock
+            ? mpctx->starfish_audio_start_bias
+            : 0;
         double external_pts = MP_NOPTS_VALUE;
         if (query_external_video_clock(mpctx, &external_pts)) {
-            *pts = external_pts - opts->audio_delay +
-                   mpctx->starfish_audio_start_bias;
+            *pts = external_pts - opts->audio_delay + audio_start_bias;
             return true;
         }
 
-        if (!require_live_starfish_clock) {
+        if (!require_live_starfish_clock || !split_clock) {
             if (mpctx->hrseek_active && mpctx->hrseek_pts != MP_NOPTS_VALUE) {
                 *pts = mpctx->hrseek_pts - opts->audio_delay +
-                       mpctx->starfish_audio_start_bias;
+                       audio_start_bias;
                 return true;
             }
             if (mpctx->video_pts != MP_NOPTS_VALUE) {
                 *pts = mpctx->video_pts - opts->audio_delay +
-                       mpctx->starfish_audio_start_bias;
+                       audio_start_bias;
                 return true;
             }
             if (mpctx->playback_pts != MP_NOPTS_VALUE) {
                 *pts = mpctx->playback_pts - opts->audio_delay +
-                       mpctx->starfish_audio_start_bias;
+                       audio_start_bias;
                 return true;
             }
         }
 
-        mp_set_timeout(mpctx, MP_TIME_NS_TO_S(STARFISH_AUDIO_SYNC_PERIOD_NS));
+        if (split_clock)
+            mp_set_timeout(mpctx, MP_TIME_NS_TO_S(STARFISH_AUDIO_SYNC_PERIOD_NS));
         return false;
     }
 

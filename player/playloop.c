@@ -745,8 +745,13 @@ static void handle_osd_redraw(struct MPContext *mpctx)
         return;
     }
     bool starfish_force_redraw = false;
-    if (starfish_vo && !mpctx->paused && mpctx->video_status == STATUS_PLAYING &&
-        mpctx->playback_pts != MP_NOPTS_VALUE)
+    // Heartbeat must not depend on playback_pts: Starfish only publishes a live
+    // clock after preroll, so playback_pts is NOPTS for the first ~2s of
+    // playback. Gating on it there left the loop without a wakeup source,
+    // starving the AO refill (fill_audio_out_buffers runs on this thread) and
+    // stalling audio. Run the tick as soon as video is playing; only the
+    // subtitle redraw needs a valid pts.
+    if (starfish_vo && !mpctx->paused && mpctx->video_status == STATUS_PLAYING)
     {
         int64_t now = mp_time_ns();
         int64_t interval = starfish_synthetic_frame_interval_ns(mpctx);
@@ -754,12 +759,13 @@ static void handle_osd_redraw(struct MPContext *mpctx)
             ? now - mpctx->starfish_osd_last_redraw_ns
             : interval;
         if (elapsed >= interval) {
-            bool subs_ready = update_subtitles(mpctx, mpctx->playback_pts);
+            bool subs_ready = mpctx->playback_pts != MP_NOPTS_VALUE &&
+                              update_subtitles(mpctx, mpctx->playback_pts);
             mpctx->starfish_osd_last_redraw_ns = now;
             // Starfish drives video presentation itself, so mpv never gets a
             // per-frame OSD render trigger from video frames. Image subs (PGS)
             // and animated ASS subs need a periodic redraw to actually appear
-            // at their event PTS — want_redraw_notification only fires once
+            // at their event PTS. want_redraw_notification only fires once
             // when the dec_sub is set, not when a new event becomes current.
             // After a sub track is (re)attached, reinit_sub sets a warmup
             // deadline so the decoder can drain the historical PCS backlog
