@@ -433,12 +433,12 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
     }
     p->written_samples = av_rescale_q(pts_ns, (AVRational){1, 1000000000},
                                       audio_time_base(ao));
-    p->primed = true;
+    p->primed = false;
     p->needs_sync = false;
     p->buffered_samples = 0;
     MP_INFO(ao, "ao_starfish prime at %s pts=%" PRId64 " samples=%" PRId64 "\n",
             reason ? reason : "request", pts_ns, p->written_samples);
-    return true;
+    return ensure_audio_primed(ao);
 }
 
 static bool audio_prime_cb(void *opaque, int64_t pts_ns)
