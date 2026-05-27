@@ -20,6 +20,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
+#include <string.h>
 
 #include "mpv_talloc.h"
 
@@ -649,6 +650,27 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
 }
 
 // Update the A/V sync difference when a new video frame is being shown.
+// Query the VO for an externally-owned video playback clock (e.g. Starfish's
+// getCurrentPlaytime), age-adjusted to the current host time. Returns false
+// when no VO is attached, the VO doesn't supply a clock, or the cached
+// sample is stale (>250 ms old). The caller falls back to mpctx->video_pts.
+static bool query_external_video_clock(struct MPContext *mpctx, double *pts_out)
+{
+    if (!mpctx->video_out)
+        return false;
+    struct voctrl_external_video_clock clock = {0};
+    if (vo_control(mpctx->video_out, VOCTRL_GET_EXTERNAL_VIDEO_CLOCK, &clock)
+        != VO_TRUE)
+        return false;
+    if (clock.pts == MP_NOPTS_VALUE || clock.host_time_ns <= 0)
+        return false;
+    double age = MP_TIME_NS_TO_S(mp_time_ns() - clock.host_time_ns);
+    if (age < 0 || age > 0.250)
+        return false;
+    *pts_out = clock.pts + age * mpctx->opts->playback_speed;
+    return true;
+}
+
 static void update_av_diff(struct MPContext *mpctx, double offset)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -663,8 +685,13 @@ static void update_av_diff(struct MPContext *mpctx, double offset)
         return;
 
     double a_pos = playing_audio_pts(mpctx);
-    if (a_pos != MP_NOPTS_VALUE && mpctx->video_pts != MP_NOPTS_VALUE) {
-        mpctx->last_av_difference = a_pos - mpctx->video_pts
+    double v_pos = mpctx->video_pts;
+    double external_pos;
+    if (query_external_video_clock(mpctx, &external_pos))
+        v_pos = external_pos;
+
+    if (a_pos != MP_NOPTS_VALUE && v_pos != MP_NOPTS_VALUE) {
+        mpctx->last_av_difference = a_pos - v_pos
                                   + opts->audio_delay + offset;
     }
 
@@ -734,6 +761,12 @@ static bool using_spdif_passthrough(struct MPContext *mpctx)
         return !af_fmt_is_pcm(format);
     }
     return false;
+}
+
+static bool is_starfish_video_out(struct MPContext *mpctx)
+{
+    return mpctx->video_out && mpctx->video_out->driver &&
+           strcmp(mpctx->video_out->driver->name, "starfish") == 0;
 }
 
 // Audio drift compensation for display-sync. Tunes the audio-speed scale
@@ -818,6 +851,9 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
     mpctx->display_sync_active = false;
 
     if (!VS_IS_DISP(mode) || !vo_is_visible(vo))
+        return;
+
+    if (is_starfish_video_out(mpctx))
         return;
 
     bool resample = mode == VS_DISP_RESAMPLE || mode == VS_DISP_RESAMPLE_VDROP ||

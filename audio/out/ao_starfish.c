@@ -5,6 +5,8 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 
 #include <libavcodec/avcodec.h>
@@ -57,17 +59,43 @@ struct priv {
     struct encoded_packet *pending_tail;
     int pending_samples;
     bool feed_blocked;
+    /* PCM mode: feed raw interleaved PCM instead of AAC. When set, the
+     * encoder/fifo above are unused (NULL). bytes_per_frame is the size of one
+     * interleaved sample-frame (channels * bytes-per-sample). */
+    bool pcm_mode;
+    int bytes_per_frame;
 };
 
 #define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.08
 #define STARFISH_AUDIO_BUFFER_SEC 3.0
 #define STARFISH_AUDIO_START_PRIME_FRAMES 1
 
+// PCM mode: decoded audio is fed to Starfish as a raw-PCM elementary stream
+// instead of being re-encoded to AAC. Kept as a distinct path so the legacy
+// AAC encode code below can be removed wholesale once PCM is the only mode.
+#define STARFISH_PCM_FORMAT AF_FORMAT_S16
+#define STARFISH_PCM_BITS_PER_SAMPLE 16
+#define STARFISH_PCM_FORMAT_TOKEN "S16LE"
+
 static void uninit(struct ao *ao);
 static int encode_silence_frame(struct ao *ao, int samples);
 static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason);
+static bool prime_pcm_silence(struct ao *ao, int frames, const char *reason);
 static bool audio_prime_cb(void *opaque, int64_t pts_ns);
 static enum AVSampleFormat select_encoder_format(const AVCodec *codec);
+
+// Audio PTS time base is the same for both modes (sample-accurate at the
+// output rate); avoids reaching into p->encoder, which is NULL in PCM mode.
+static inline AVRational audio_time_base(struct ao *ao)
+{
+    return (AVRational){1, ao->samplerate};
+}
+
+static bool env_wants_pcm_audio(void)
+{
+    const char *codec = getenv("STARFISH_AUDIO_CODEC");
+    return codec && (strcmp(codec, "pcm") == 0 || strcmp(codec, "PCM") == 0);
+}
 
 static double current_audio_delay(struct ao *ao)
 {
@@ -278,7 +306,7 @@ static bool sync_written_samples_to_seek_target(struct ao *ao, bool log_missing)
     struct priv *p = ao->priv;
     int64_t seek_target_ns = 0;
 
-    if (!p->ctx || !p->encoder)
+    if (!p->ctx || (!p->pcm_mode && !p->encoder))
         return false;
     if (!starfish_ctx_get_seek_target_ns(p->ctx, &seek_target_ns) || seek_target_ns <= 0) {
         if (log_missing) {
@@ -289,7 +317,7 @@ static bool sync_written_samples_to_seek_target(struct ao *ao, bool log_missing)
     }
 
     p->written_samples = av_rescale_q(seek_target_ns, (AVRational){1, 1000000000},
-                                      p->encoder->time_base);
+                                      audio_time_base(ao));
     MP_INFO(ao, "ao_starfish synced audio pts base to seek target ns=%" PRId64
             " samples=%" PRId64 "\n",
             seek_target_ns, p->written_samples);
@@ -329,15 +357,58 @@ static bool prime_silence_frames(struct ao *ao, int frames, const char *reason)
     return true;
 }
 
+// PCM counterpart of prime_silence_frames: queue zeroed interleaved PCM so the
+// pipeline has a little audio ahead of the first real samples. Lock held.
+static bool prime_pcm_silence(struct ao *ao, int frames, const char *reason)
+{
+    struct priv *p = ao->priv;
+
+    if (frames <= 0)
+        return true;
+
+    const int total_samples = frames * p->frame_samples;
+    const size_t bytes = (size_t)total_samples * p->bytes_per_frame;
+    uint8_t *silence = av_mallocz(bytes);
+    if (!silence) {
+        MP_WARN(ao, "Failed to allocate PCM silence for %s\n",
+                reason ? reason : "prime");
+        return false;
+    }
+
+    int64_t pts_ns = av_rescale_q(p->written_samples, audio_time_base(ao),
+                                  (AVRational){1, 1000000000});
+    if (pts_ns < 0)
+        pts_ns = 0;
+    p->written_samples += total_samples;
+
+    bool ok = queue_encoded_packet_locked(ao, silence, bytes,
+                                          apply_audio_delay_to_pts(ao, pts_ns),
+                                          total_samples);
+    av_free(silence);
+    if (ok) {
+        MP_INFO(ao, "%s Starfish audio with %d silent PCM samples\n",
+                reason ? reason : "Primed", total_samples);
+    } else {
+        MP_WARN(ao, "Failed to %s Starfish audio with PCM silence\n",
+                reason ? reason : "prime");
+    }
+    return ok;
+}
+
 static bool ensure_audio_primed(struct ao *ao)
 {
     struct priv *p = ao->priv;
 
     if (p->primed)
         return true;
-    if (!prime_silence_frames(ao, STARFISH_AUDIO_START_PRIME_FRAMES,
-                              "Pre-primed"))
+    if (p->pcm_mode) {
+        if (!prime_pcm_silence(ao, STARFISH_AUDIO_START_PRIME_FRAMES,
+                               "Pre-primed"))
+            return false;
+    } else if (!prime_silence_frames(ao, STARFISH_AUDIO_START_PRIME_FRAMES,
+                                     "Pre-primed")) {
         return false;
+    }
 
     p->primed = true;
     return true;
@@ -347,15 +418,17 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
 {
     struct priv *p = ao->priv;
 
-    if (!p->encoder || pts_ns < 0)
+    if (pts_ns < 0 || (!p->pcm_mode && !p->encoder))
         return false;
 
     free_pending_packets_locked(p);
-    av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
-    if (!reopen_encoder_locked(ao))
-        return false;
+    if (!p->pcm_mode) {
+        av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
+        if (!reopen_encoder_locked(ao))
+            return false;
+    }
     p->written_samples = av_rescale_q(pts_ns, (AVRational){1, 1000000000},
-                                      p->encoder->time_base);
+                                      audio_time_base(ao));
     p->primed = true;
     p->needs_sync = false;
     p->buffered_samples = 0;
@@ -522,9 +595,6 @@ static int encode_silence_frame(struct ao *ao, int samples)
 static int init(struct ao *ao)
 {
     struct priv *p = ao->priv;
-    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-    enum AVSampleFormat sample_fmt;
-    int mp_format;
 
     p->ctx = starfish_ctx_get_current();
     if (!p->ctx) {
@@ -541,66 +611,96 @@ static int init(struct ao *ao)
     }
     p->lock_initialized = true;
 
-    if (!codec) {
-        MP_VERBOSE(ao, "AAC encoder is not available\n");
-        starfish_ctx_unref(p->ctx);
-        p->ctx = NULL;
-        return -1;
+    p->pcm_mode = env_wants_pcm_audio();
+
+    if (p->pcm_mode) {
+        // Decode-to-PCM path: advertise interleaved S16 so mpv's filter chain
+        // delivers exactly what the Starfish PCM sink wants; we then hand those
+        // buffers straight to the audio ES (esData=2). No encoder/FIFO.
+        ao->samplerate = 48000;
+        ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
+        ao->format = STARFISH_PCM_FORMAT;
+        p->bytes_per_frame = ao->channels.num * (STARFISH_PCM_BITS_PER_SAMPLE / 8);
+        p->frame_samples = 1024;
+        p->outburst = p->frame_samples;
+        p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
+
+        if (!starfish_ctx_configure_audio_pcm(p->ctx, ao->channels.num,
+                                              ao->samplerate,
+                                              STARFISH_PCM_BITS_PER_SAMPLE,
+                                              STARFISH_PCM_FORMAT_TOKEN)) {
+            MP_VERBOSE(ao, "Failed to configure Starfish PCM audio\n");
+            uninit(ao);
+            return -1;
+        }
+    } else {
+        // ---- Legacy AAC encode path (removable once PCM is the only mode) ----
+        const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
+        enum AVSampleFormat sample_fmt;
+        int mp_format;
+
+        if (!codec) {
+            MP_VERBOSE(ao, "AAC encoder is not available\n");
+            starfish_ctx_unref(p->ctx);
+            p->ctx = NULL;
+            return -1;
+        }
+
+        sample_fmt = select_encoder_format(codec);
+        mp_format = af_from_avformat(sample_fmt);
+        if (mp_format == AF_FORMAT_UNKNOWN) {
+            MP_VERBOSE(ao, "No mpv audio format for AAC encoder sample format %d\n", sample_fmt);
+            starfish_ctx_unref(p->ctx);
+            p->ctx = NULL;
+            return -1;
+        }
+
+        ao->samplerate = 48000;
+        ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
+        ao->format = mp_format;
+
+        p->encoder = avcodec_alloc_context3(codec);
+        p->packet = av_packet_alloc();
+        if (!p->encoder || !p->packet) {
+            uninit(ao);
+            return -1;
+        }
+
+        p->encoder->sample_fmt = sample_fmt;
+        p->encoder->sample_rate = ao->samplerate;
+        p->encoder->time_base = (AVRational){1, ao->samplerate};
+        p->encoder->bit_rate = 192000;
+        p->encoder->profile = AV_PROFILE_AAC_LOW;
+        av_channel_layout_default(&p->encoder->ch_layout, ao->channels.num);
+
+        if (avcodec_open2(p->encoder, codec, NULL) < 0) {
+            MP_ERR(ao, "Failed to open AAC encoder\n");
+            uninit(ao);
+            return -1;
+        }
+
+        p->frame_samples = p->encoder->frame_size > 0 ? p->encoder->frame_size : 1024;
+        p->outburst = p->frame_samples;
+        p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
+        p->fifo = av_audio_fifo_alloc(p->encoder->sample_fmt, p->encoder->ch_layout.nb_channels,
+                                      ao->samplerate * STARFISH_AUDIO_BUFFER_SEC);
+        if (!p->fifo) {
+            MP_ERR(ao, "Failed to allocate AAC FIFO\n");
+            uninit(ao);
+            return -1;
+        }
+
+        if (!starfish_ctx_configure_audio_aac(p->ctx, ao->channels.num, ao->samplerate,
+                                              AV_PROFILE_AAC_LOW, true)) {
+            MP_VERBOSE(ao, "Failed to configure Starfish AAC audio\n");
+            uninit(ao);
+            return -1;
+        }
     }
 
-    sample_fmt = select_encoder_format(codec);
-    mp_format = af_from_avformat(sample_fmt);
-    if (mp_format == AF_FORMAT_UNKNOWN) {
-        MP_VERBOSE(ao, "No mpv audio format for AAC encoder sample format %d\n", sample_fmt);
-        starfish_ctx_unref(p->ctx);
-        p->ctx = NULL;
-        return -1;
-    }
-
-    ao->samplerate = 48000;
-    ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
-    ao->format = mp_format;
-
-    p->encoder = avcodec_alloc_context3(codec);
-    p->packet = av_packet_alloc();
-    if (!p->encoder || !p->packet) {
-        uninit(ao);
-        return -1;
-    }
-
-    p->encoder->sample_fmt = sample_fmt;
-    p->encoder->sample_rate = ao->samplerate;
-    p->encoder->time_base = (AVRational){1, ao->samplerate};
-    p->encoder->bit_rate = 192000;
-    p->encoder->profile = AV_PROFILE_AAC_LOW;
-    av_channel_layout_default(&p->encoder->ch_layout, ao->channels.num);
-
-    if (avcodec_open2(p->encoder, codec, NULL) < 0) {
-        MP_ERR(ao, "Failed to open AAC encoder\n");
-        uninit(ao);
-        return -1;
-    }
-
-    p->frame_samples = p->encoder->frame_size > 0 ? p->encoder->frame_size : 1024;
-    p->outburst = p->frame_samples;
-    p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
-    p->fifo = av_audio_fifo_alloc(p->encoder->sample_fmt, p->encoder->ch_layout.nb_channels,
-                                  ao->samplerate * STARFISH_AUDIO_BUFFER_SEC);
-    if (!p->fifo) {
-        MP_ERR(ao, "Failed to allocate AAC FIFO\n");
-        uninit(ao);
-        return -1;
-    }
-
-    if (!starfish_ctx_configure_audio_aac(p->ctx, ao->channels.num, ao->samplerate,
-                                          AV_PROFILE_AAC_LOW, true)) {
-        MP_VERBOSE(ao, "Failed to configure Starfish AAC audio\n");
-        uninit(ao);
-        return -1;
-    }
-
-    MP_INFO(ao, "ao_starfish init samplerate=%d channels=%d frame_samples=%d\n",
-            ao->samplerate, ao->channels.num, p->frame_samples);
+    MP_INFO(ao, "ao_starfish init mode=%s samplerate=%d channels=%d frame_samples=%d\n",
+            p->pcm_mode ? "pcm" : "aac", ao->samplerate, ao->channels.num,
+            p->frame_samples);
     starfish_ctx_set_wakeup_cb(p->ctx, STARFISH_STREAM_AUDIO, wake_ao, ao);
     starfish_ctx_set_audio_prime_cb(p->ctx, audio_prime_cb, ao);
     pthread_mutex_lock(&p->lock);
@@ -769,6 +869,24 @@ static bool audio_write(struct ao *ao, void **data, int samples)
     }
     if (!ensure_audio_primed(ao))
         goto done;
+    if (p->pcm_mode) {
+        // data[0] is interleaved S16 (single plane); queue it verbatim as a
+        // PCM ES frame with a sample-accurate PTS.
+        int64_t pts_ns = av_rescale_q(p->written_samples, audio_time_base(ao),
+                                      (AVRational){1, 1000000000});
+        if (pts_ns < 0)
+            pts_ns = 0;
+        const size_t bytes = (size_t)samples * p->bytes_per_frame;
+        if (!queue_encoded_packet_locked(ao, data[0], bytes,
+                                         apply_audio_delay_to_pts(ao, pts_ns),
+                                         samples))
+            goto done;
+        p->written_samples += samples;
+        if (p->buffered_samples < p->latency_samples)
+            p->buffered_samples = p->latency_samples;
+        ok = true;
+        goto done;
+    }
     if (av_audio_fifo_realloc(p->fifo, av_audio_fifo_size(p->fifo) + samples) < 0)
         goto done;
     if (av_audio_fifo_write(p->fifo, data, samples) < samples)
