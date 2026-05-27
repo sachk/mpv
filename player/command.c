@@ -8343,7 +8343,6 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
             mpctx->delay += mpctx->opts->audio_delay - mpctx->ao_chain->delay;
             mpctx->ao_chain->delay = mpctx->opts->audio_delay;
         }
-        audio_update_external_clock(mpctx, true);
         mp_wakeup_core(mpctx);
     }
 

@@ -80,7 +80,7 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
       << "\"trickType\":\"client-side\""
       << "},"
       << "\"externalStreamingInfo\":{"
-      << "\"audioSync\":true,"
+      << "\"audioSync\":" << (params->audio_sync ? "true" : "false") << ","
       << "\"streamQualityInfo\":true,"
       << "\"streamQualityInfoNonFlushable\":true,"
       << "\"streamQualityInfoCorruptedFrame\":true,"
@@ -112,6 +112,19 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
         << "\"format\":\"" << (params->audio_raw ? "raw" : "adts") << "\","
         << "\"frequency\":" << std::fixed << std::setprecision(3)
         << (params->audio_samplerate / 1000.0) << std::defaultfloat << "}";
+  }
+
+  if (params->need_audio && params->audio_codec &&
+      strcmp(params->audio_codec, "PCM") == 0) {
+    out << ",\"pcmInfo\":{"
+        << "\"channels\":" << params->audio_channels << ','
+        << "\"frequency\":" << std::fixed << std::setprecision(3)
+        << (params->audio_samplerate / 1000.0) << std::defaultfloat << ','
+        << "\"bitsPerSample\":" << params->audio_bits_per_sample << ','
+        << "\"format\":\""
+        << json_escape(params->audio_pcm_format ? params->audio_pcm_format
+                                                : "S16LE")
+        << "\"}";
   }
 
   out << ",\"esInfo\":{"

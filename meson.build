@@ -521,6 +521,7 @@ else
         sources += files(
             'audio/out/ao_starfish.c',
             'video/decode/vd_starfish.c',
+            'video/out/starfish/starfish_backend.cpp',
             'video/out/starfish/starfish_ctx.cpp',
             'video/out/starfish/starfish_json.cpp',
             'video/out/vo_starfish.c',

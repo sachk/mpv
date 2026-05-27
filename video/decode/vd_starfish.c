@@ -8,7 +8,11 @@
 #include "rpu_parser.h"
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>
+#include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/intreadwrite.h>
+#include <libavutil/mem.h>
+#include <libavutil/rational.h>
 
 #include "common/av_common.h"
 #include "common/codecs.h"
@@ -40,6 +44,10 @@ struct priv {
   bool allow_initial_geometry;
   bool wait_for_keyframe;
   bool pending_ctx_flush;
+  bool hdr10plus_dovi_active;
+  int hdr10plus_dovi_logs;
+  uint8_t *hdr10plus_dovi_rpu;
+  size_t hdr10plus_dovi_rpu_len;
   struct mp_decoder public;
 };
 
@@ -209,8 +217,370 @@ static void maybe_output_eof(struct mp_filter *f) {
   mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
 }
 
+static bool start_code_at(const uint8_t *buf, size_t len, size_t pos,
+                          size_t *header_len) {
+  if (pos + 3 <= len && buf[pos] == 0 && buf[pos + 1] == 0 &&
+      buf[pos + 2] == 1) {
+    *header_len = 3;
+    return true;
+  }
+  if (pos + 4 <= len && buf[pos] == 0 && buf[pos + 1] == 0 &&
+      buf[pos + 2] == 0 && buf[pos + 3] == 1) {
+    *header_len = 4;
+    return true;
+  }
+  return false;
+}
+
+static bool has_hevc_vcl_nal(const uint8_t *buf, size_t len) {
+  for (size_t i = 0; i + 5 < len; i++) {
+    size_t header_len;
+    if (!start_code_at(buf, len, i, &header_len))
+      continue;
+
+    uint8_t nal_type = (buf[i + header_len] >> 1) & 0x3F;
+    if (nal_type <= 31)
+      return true;
+  }
+  return false;
+}
+
+static double rational_10000_nits(AVRational q) {
+  if (!q.den)
+    return 0.0;
+  return 10000.0 * av_q2d(q);
+}
+
+static uint16_t clamp_u16(unsigned v, unsigned lo, unsigned hi) {
+  if (v < lo)
+    return lo;
+  if (v > hi)
+    return hi;
+  return v;
+}
+
+static uint16_t nits_to_pq_12bit(double nits) {
+  if (!(nits > 0.0) || !isfinite(nits))
+    return 0;
+
+  const double y = nits / 10000.0;
+  const double m1 = 2610.0 / 16384.0;
+  const double m2 = (2523.0 / 4096.0) * 128.0;
+  const double c1 = 3424.0 / 4096.0;
+  const double c2 = (2413.0 / 4096.0) * 32.0;
+  const double c3 = (2392.0 / 4096.0) * 32.0;
+  const double ym1 = pow(y, m1);
+  const double pq = pow((c1 + c2 * ym1) / (1.0 + c3 * ym1), m2);
+  return clamp_u16((unsigned)llrint(pq * 4095.0), 0, 4095);
+}
+
+static double hdr10plus_peak_nits(const AVDynamicHDRPlus *hdr10plus) {
+  const AVHDRPlusColorTransformParams *params = &hdr10plus->params[0];
+  double peak = 0.0;
+
+  for (int i = 0; i < params->num_distribution_maxrgb_percentiles; i++) {
+    double nits = rational_10000_nits(params->distribution_maxrgb[i].percentile);
+    if (nits > peak)
+      peak = nits;
+  }
+  for (int i = 0; i < 3; i++) {
+    double nits = rational_10000_nits(params->maxscl[i]);
+    if (nits > peak)
+      peak = nits;
+  }
+
+  return peak;
+}
+
+static uint8_t *unescape_rbsp(void *ctx, const uint8_t *src, size_t src_len,
+                              size_t *dst_len) {
+  uint8_t *dst = talloc_size(ctx, src_len);
+  if (!dst)
+    return NULL;
+
+  size_t out = 0;
+  for (size_t i = 0; i < src_len; i++) {
+    if (i >= 2 && src[i] == 0x03 && src[i - 1] == 0x00 && src[i - 2] == 0x00)
+      continue;
+    dst[out++] = src[i];
+  }
+  *dst_len = out;
+  return dst;
+}
+
+static AVDynamicHDRPlus *hdr10plus_from_t35_payload(const uint8_t *payload,
+                                                    size_t payload_size) {
+  static const uint8_t ITU_T_T35_COUNTRY_CODE_US = 0xB5;
+  static const uint16_t ITU_T_T35_PROVIDER_CODE_SAMSUNG = 0x003C;
+
+  if (payload_size < 6 || payload[0] != ITU_T_T35_COUNTRY_CODE_US)
+    return NULL;
+  uint16_t provider_code = AV_RB16(payload + 1);
+  uint16_t provider_oriented_code = AV_RB16(payload + 3);
+  uint8_t application_identifier = payload[5];
+  if (provider_code != ITU_T_T35_PROVIDER_CODE_SAMSUNG ||
+      provider_oriented_code != 1 || application_identifier != 4)
+    return NULL;
+
+  size_t hdrplus_size;
+  AVDynamicHDRPlus *hdr10plus = av_dynamic_hdr_plus_alloc(&hdrplus_size);
+  if (!hdr10plus)
+    return NULL;
+  if (av_dynamic_hdr_plus_from_t35(hdr10plus, payload + 6,
+                                   payload_size - 6) < 0) {
+    av_free(hdr10plus);
+    return NULL;
+  }
+  return hdr10plus;
+}
+
+static AVDynamicHDRPlus *find_hdr10plus_in_hevc_sei(struct priv *p,
+                                                    const uint8_t *buf,
+                                                    size_t len) {
+  for (size_t i = 0; i + 6 < len; i++) {
+    size_t header_len;
+    if (!start_code_at(buf, len, i, &header_len))
+      continue;
+
+    size_t nalu_start = i + header_len;
+    uint8_t nal_type = (buf[nalu_start] >> 1) & 0x3F;
+    if (nal_type != 39 && nal_type != 40)
+      continue;
+
+    size_t nalu_end = len;
+    for (size_t j = nalu_start + 2; j + 3 < len; j++) {
+      size_t next_header_len;
+      if (start_code_at(buf, len, j, &next_header_len)) {
+        nalu_end = j;
+        break;
+      }
+    }
+    if (nalu_end <= nalu_start + 2)
+      continue;
+
+    size_t rbsp_len = 0;
+    uint8_t *rbsp = unescape_rbsp(p, buf + nalu_start + 2,
+                                  nalu_end - nalu_start - 2, &rbsp_len);
+    if (!rbsp)
+      return NULL;
+
+    size_t pos = 0;
+    while (pos + 2 <= rbsp_len) {
+      unsigned payload_type = 0;
+      while (pos < rbsp_len && rbsp[pos] == 0xFF) {
+        payload_type += 255;
+        pos++;
+      }
+      if (pos >= rbsp_len)
+        break;
+      payload_type += rbsp[pos++];
+
+      unsigned payload_size = 0;
+      while (pos < rbsp_len && rbsp[pos] == 0xFF) {
+        payload_size += 255;
+        pos++;
+      }
+      if (pos >= rbsp_len)
+        break;
+      payload_size += rbsp[pos++];
+      if (payload_size > rbsp_len - pos)
+        break;
+
+      if (payload_type == 4) {
+        AVDynamicHDRPlus *hdr10plus =
+            hdr10plus_from_t35_payload(rbsp + pos, payload_size);
+        if (hdr10plus) {
+          talloc_free(rbsp);
+          return hdr10plus;
+        }
+      }
+      pos += payload_size;
+    }
+
+    talloc_free(rbsp);
+  }
+  return NULL;
+}
+
+static bool hdr10plus_to_l1_l6(struct priv *p,
+                               const AVDynamicHDRPlus *hdr10plus,
+                               uint16_t *l1_min, uint16_t *l1_max,
+                               uint16_t *l1_avg, uint16_t *l6_max_display,
+                               uint16_t *l6_min_display, uint16_t *l6_max_cll,
+                               uint16_t *l6_max_fall) {
+  if (!hdr10plus || hdr10plus->application_version >= 2 ||
+      hdr10plus->num_windows < 1)
+    return false;
+
+  const AVHDRPlusColorTransformParams *params = &hdr10plus->params[0];
+  double peak_nits = hdr10plus_peak_nits(hdr10plus);
+  double avg_nits = rational_10000_nits(params->average_maxrgb);
+  if (!(peak_nits > 0.0))
+    return false;
+  if (!(avg_nits > 0.0))
+    avg_nits = peak_nits;
+
+  *l1_min = 0;
+  *l1_max = clamp_u16(nits_to_pq_12bit(llrint(peak_nits)), 2081, 4095);
+  *l1_avg = clamp_u16(nits_to_pq_12bit(llrint(avg_nits)), 1229,
+                      *l1_max > 0 ? *l1_max - 1 : 4095);
+
+  const struct pl_hdr_metadata *hdr = &p->codec->color.hdr;
+  double target_max = hdr10plus->targeted_system_display_maximum_luminance.den
+                          ? av_q2d(hdr10plus->targeted_system_display_maximum_luminance)
+                          : 0.0;
+  *l6_max_display = clamp_u16((unsigned)llrint(hdr->max_luma > 0.0f
+                                                   ? hdr->max_luma
+                                                   : (target_max > 0.0
+                                                          ? target_max
+                                                          : peak_nits)),
+                              1, 10000);
+  *l6_min_display = clamp_u16((unsigned)llrint(hdr->min_luma > 0.0f
+                                                   ? hdr->min_luma * 10000.0f
+                                                   : 1.0f),
+                              0, 10000);
+  *l6_max_cll = clamp_u16((unsigned)llrint(hdr->max_cll > 0.0f ? hdr->max_cll
+                                                               : peak_nits),
+                          0, 10000);
+  *l6_max_fall = clamp_u16((unsigned)llrint(hdr->max_fall > 0.0f ? hdr->max_fall
+                                                                 : avg_nits),
+                           0, 10000);
+  return true;
+}
+
+static bool insert_dovi_nal(struct priv *p, const uint8_t *buf, size_t len,
+                            const uint8_t *rpu, size_t rpu_len,
+                            const uint8_t **data, size_t *size) {
+  if (!rpu || rpu_len == 0)
+    return false;
+
+  size_t new_len = len + 4 + rpu_len;
+  uint8_t *new_buf = talloc_size(p, new_len);
+  if (!new_buf)
+    return false;
+
+  memcpy(new_buf, buf, len);
+  new_buf[len] = 0;
+  new_buf[len + 1] = 0;
+  new_buf[len + 2] = 0;
+  new_buf[len + 3] = 1;
+  memcpy(new_buf + len + 4, rpu, rpu_len);
+
+  *data = new_buf;
+  *size = new_len;
+  return true;
+}
+
+static bool cache_dovi_rpu(struct priv *p, const dovi_data_t *rpu_data) {
+  if (!rpu_data || !rpu_data->data || rpu_data->len == 0)
+    return false;
+
+  uint8_t *rpu = talloc_size(p, rpu_data->len);
+  if (!rpu)
+    return false;
+  memcpy(rpu, rpu_data->data, rpu_data->len);
+
+  talloc_free(p->hdr10plus_dovi_rpu);
+  p->hdr10plus_dovi_rpu = rpu;
+  p->hdr10plus_dovi_rpu_len = rpu_data->len;
+  return true;
+}
+
+static bool process_hdr10plus_packet(struct priv *p, const uint8_t **data,
+                                     size_t *size) {
+  if (mp_codec_to_av_codec_id(p->codec->codec) != AV_CODEC_ID_HEVC ||
+      (starfish_ctx_get_dovi_profile(p->ctx) != 0 &&
+       !p->hdr10plus_dovi_active) ||
+      !p->pending || !p->pending->avpacket)
+    return false;
+
+  AVDynamicHDRPlus *parsed_hdr10plus = NULL;
+  const AVDynamicHDRPlus *hdr10plus = NULL;
+  size_t sd_size = 0;
+  uint8_t *sd = av_packet_get_side_data(p->pending->avpacket,
+                                        AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+                                        &sd_size);
+  if (sd && sd_size >= sizeof(AVDynamicHDRPlus)) {
+    hdr10plus = (const AVDynamicHDRPlus *)sd;
+  } else {
+    parsed_hdr10plus = find_hdr10plus_in_hevc_sei(p, *data, *size);
+    hdr10plus = parsed_hdr10plus;
+  }
+  if (!hdr10plus) {
+    if (p->hdr10plus_dovi_active && p->hdr10plus_dovi_rpu &&
+        has_hevc_vcl_nal(*data, *size))
+      return insert_dovi_nal(p, *data, *size, p->hdr10plus_dovi_rpu,
+                             p->hdr10plus_dovi_rpu_len, data, size);
+    return false;
+  }
+
+  uint16_t l1_min, l1_max, l1_avg, l6_max_display, l6_min_display;
+  uint16_t l6_max_cll, l6_max_fall;
+  if (!hdr10plus_to_l1_l6(p, hdr10plus, &l1_min, &l1_max, &l1_avg,
+                          &l6_max_display, &l6_min_display, &l6_max_cll,
+                          &l6_max_fall)) {
+    av_free(parsed_hdr10plus);
+    return false;
+  }
+
+  if (!starfish_ctx_enable_generated_dovi(p->ctx)) {
+    if (p->hdr10plus_dovi_logs++ < 4)
+      MP_WARN(p, "HDR10+ metadata found after DoVi mode was fixed; feeding HDR10\n");
+    av_free(parsed_hdr10plus);
+    return false;
+  }
+
+  char *json = talloc_asprintf(
+      p,
+      "{\"length\":1,\"long_play_mode\":true,\"level6\":{"
+      "\"max_display_mastering_luminance\":%u,"
+      "\"min_display_mastering_luminance\":%u,"
+      "\"max_content_light_level\":%u,"
+      "\"max_frame_average_light_level\":%u},"
+      "\"shots\":[{\"start\":0,\"duration\":1,\"metadata_blocks\":[{"
+      "\"Level1\":{\"min_pq\":%u,\"max_pq\":%u,\"avg_pq\":%u}}]}]}",
+      l6_max_display, l6_min_display, l6_max_cll, l6_max_fall, l1_min,
+      l1_max, l1_avg);
+  if (!json) {
+    av_free(parsed_hdr10plus);
+    return false;
+  }
+
+  const RpuOpaqueList *rpus = dovi_generate_from_json(json);
+  talloc_free(json);
+  if (!rpus || rpus->len < 1 || !rpus->list || !rpus->list[0]) {
+    if (p->hdr10plus_dovi_logs++ < 4)
+      MP_WARN(p, "dovi_generate_from_json failed: %s\n",
+              rpus && rpus->error ? rpus->error : "unknown");
+    if (rpus)
+      dovi_rpu_list_free(rpus);
+    av_free(parsed_hdr10plus);
+    return false;
+  }
+
+  const dovi_data_t *rpu_data = dovi_write_unspec62_nalu(rpus->list[0]);
+  bool cached = cache_dovi_rpu(p, rpu_data);
+  bool ok = cached && has_hevc_vcl_nal(*data, *size) &&
+            insert_dovi_nal(p, *data, *size, p->hdr10plus_dovi_rpu,
+                            p->hdr10plus_dovi_rpu_len, data, size);
+  if (rpu_data)
+    dovi_data_free(rpu_data);
+  dovi_rpu_list_free(rpus);
+  av_free(parsed_hdr10plus);
+
+  if (cached && !p->hdr10plus_dovi_active) {
+    p->hdr10plus_dovi_active = true;
+    MP_INFO(p,
+            "vd_starfish: generating Dolby Vision profile 8.1 RPU from HDR10+ metadata\n");
+  }
+  return ok;
+}
+
 static void process_dovi_packet(struct priv *p, const uint8_t **data,
                                 size_t *size) {
+  if (process_hdr10plus_packet(p, data, size))
+    return;
+
   if (starfish_ctx_get_dovi_profile(p->ctx) != 7)
     return;
 
@@ -402,6 +772,8 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
     return CONTROL_TRUE;
   case VDCTRL_SET_START_PTS:
     p->start_pts = *(double *)arg;
+    p->allow_initial_geometry = true;
+    p->sent_initial_geometry = false;
     if (p->pending_ctx_flush) {
       MP_INFO(p, "vd_starfish flushing Starfish for start pts=%f\n",
               p->start_pts);
@@ -482,6 +854,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
   p->codec = codec;
   p->ctx = ctx;
   p->start_pts = MP_NOPTS_VALUE;
+  p->allow_initial_geometry = true;
   p->wait_for_keyframe = true;
   p->public.f = vd;
   p->public.control = control;

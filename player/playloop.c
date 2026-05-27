@@ -20,6 +20,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "client.h"
 #include "command.h"
@@ -48,6 +49,9 @@
 #include "sub/dec_sub.h"
 #include "sub/osd.h"
 #include "video/out/vo.h"
+
+#define STARFISH_OSD_FALLBACK_FRAME_INTERVAL_NS (33LL * 1000 * 1000)
+#define STARFISH_OSD_LOG_INTERVAL_NS (5000LL * 1000 * 1000)
 
 // Wait until mp_wakeup_core() is called, since the last time
 // mp_wait_events() was called.
@@ -104,6 +108,30 @@ void mp_core_lock(struct MPContext *mpctx)
 void mp_core_unlock(struct MPContext *mpctx)
 {
     mp_dispatch_unlock(mpctx->dispatch);
+}
+
+static bool is_starfish_video_out(struct MPContext *mpctx)
+{
+    return mpctx->video_out && mpctx->video_out->driver &&
+           strcmp(mpctx->video_out->driver->name, "starfish") == 0;
+}
+
+static void release_starfish_video_for_audio_clock(struct MPContext *mpctx)
+{
+    if (!mpctx->starfish_video_held_for_audio)
+        return;
+    if (vo_control(mpctx->video_out, VOCTRL_RESUME, NULL) != VO_TRUE)
+        MP_WARN(mpctx, "Starfish video resume while waiting for audio clock failed\n");
+    mpctx->starfish_video_held_for_audio = false;
+    MP_VERBOSE(mpctx, "Starfish video released for live audio clock\n");
+}
+
+static int64_t starfish_synthetic_frame_interval_ns(struct MPContext *mpctx)
+{
+    double fps = mpctx->vo_chain ? mpctx->vo_chain->filter->container_fps : 0;
+    if (!isfinite(fps) || fps < 20.0 || fps > 120.0)
+        return STARFISH_OSD_FALLBACK_FRAME_INTERVAL_NS;
+    return MP_TIME_S_TO_NS(1.0 / fps);
 }
 
 // Process any queued user input.
@@ -174,8 +202,6 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
         if (mpctx->ao) {
             bool eof = mpctx->audio_status == STATUS_EOF;
             ao_set_paused(mpctx->ao, internal_paused, eof);
-            if (!internal_paused)
-                audio_update_external_clock(mpctx, true);
         }
 
         if (mpctx->video_out)
@@ -272,6 +298,10 @@ void reset_playback_state(struct MPContext *mpctx)
     mpctx->paused_for_cache = false;
     mpctx->cache_buffer = 100;
     mpctx->cache_update_pts = MP_NOPTS_VALUE;
+    mpctx->starfish_osd_last_redraw_ns = 0;
+    mpctx->starfish_osd_last_log_ns = 0;
+    mpctx->starfish_sub_warmup_until_ns = 0;
+    mpctx->starfish_video_held_for_audio = false;
 
     encode_lavc_discontinuity(mpctx->encode_lavc_ctx);
 
@@ -684,9 +714,10 @@ static void handle_osd_redraw(struct MPContext *mpctx)
 {
     if (!mpctx->video_out || !mpctx->video_out->config_ok || (mpctx->playing && mpctx->stop_play))
         return;
+    bool starfish_vo = is_starfish_video_out(mpctx);
     // If we're playing normally, let OSD be redrawn naturally as part of
     // video display.
-    if (!mpctx->paused) {
+    if (!mpctx->paused && !starfish_vo) {
         if (mpctx->sleeptime < 0.1 && mpctx->video_status == STATUS_PLAYING)
             return;
     }
@@ -696,9 +727,59 @@ static void handle_osd_redraw(struct MPContext *mpctx)
         mp_set_timeout(mpctx, 0.1);
         return;
     }
+    bool starfish_force_redraw = false;
+    if (starfish_vo && !mpctx->paused && mpctx->video_status == STATUS_PLAYING &&
+        mpctx->playback_pts != MP_NOPTS_VALUE)
+    {
+        int64_t now = mp_time_ns();
+        int64_t interval = starfish_synthetic_frame_interval_ns(mpctx);
+        int64_t elapsed = mpctx->starfish_osd_last_redraw_ns
+            ? now - mpctx->starfish_osd_last_redraw_ns
+            : interval;
+        if (elapsed >= interval) {
+            bool subs_ready = update_subtitles(mpctx, mpctx->playback_pts);
+            mpctx->starfish_osd_last_redraw_ns = now;
+            // Starfish drives video presentation itself, so mpv never gets a
+            // per-frame OSD render trigger from video frames. Image subs (PGS)
+            // and animated ASS subs need a periodic redraw to actually appear
+            // at their event PTS — want_redraw_notification only fires once
+            // when the dec_sub is set, not when a new event becomes current.
+            // After a sub track is (re)attached, reinit_sub sets a warmup
+            // deadline so the decoder can drain the historical PCS backlog
+            // (10s of past pairs from the refresh-seek) without each one
+            // flashing on screen for a tick. Until that warmup elapses, only
+            // honor explicit want_redraw_notification, not the synthetic tick.
+            bool any_sub_selected = mpctx->current_track[0][STREAM_SUB] ||
+                                    mpctx->current_track[1][STREAM_SUB];
+            bool in_warmup = mpctx->starfish_sub_warmup_until_ns &&
+                             now < mpctx->starfish_sub_warmup_until_ns;
+            if (!in_warmup && mpctx->starfish_sub_warmup_until_ns)
+                mpctx->starfish_sub_warmup_until_ns = 0;
+            if (any_sub_selected && subs_ready && !in_warmup)
+                starfish_force_redraw = true;
+            if (!mpctx->starfish_osd_last_log_ns ||
+                now - mpctx->starfish_osd_last_log_ns >= STARFISH_OSD_LOG_INTERVAL_NS ||
+                !subs_ready || in_warmup)
+            {
+                MP_VERBOSE(mpctx,
+                           "Starfish OSD tick pts=%.3f subs_ready=%d any_sub=%d warmup=%d force=%d\n",
+                           mpctx->playback_pts, subs_ready, any_sub_selected,
+                           in_warmup, starfish_force_redraw);
+                mpctx->starfish_osd_last_log_ns = now;
+            }
+            // Keep the heartbeat self-sustaining. Starfish drives presentation
+            // on its own thread, so the core gets no per-frame video wakeup;
+            // without rescheduling here the playloop can sleep for seconds,
+            // starving fill_audio_out_buffers (which refills the AO queue on
+            // this thread) and stalling audio. Re-arm the next frame tick.
+            mp_set_timeout(mpctx, MP_TIME_NS_TO_S(interval));
+        } else {
+            mp_set_timeout(mpctx, MP_TIME_NS_TO_S(interval - elapsed));
+        }
+    }
     bool want_redraw = osd_query_and_reset_want_redraw(mpctx->osd) ||
                        vo_want_redraw(mpctx->video_out);
-    if (!want_redraw)
+    if (!want_redraw && !starfish_force_redraw)
         return;
     vo_redraw(mpctx->video_out);
 }
@@ -1133,6 +1214,23 @@ static void handle_dummy_ticks(struct MPContext *mpctx)
     }
 }
 
+static bool query_external_video_clock(struct MPContext *mpctx, double *pts_out)
+{
+    if (!mpctx->video_out)
+        return false;
+    struct voctrl_external_video_clock clock = {0};
+    if (vo_control(mpctx->video_out, VOCTRL_GET_EXTERNAL_VIDEO_CLOCK, &clock)
+        != VO_TRUE)
+        return false;
+    if (clock.pts == MP_NOPTS_VALUE || clock.host_time_ns <= 0)
+        return false;
+    double age = MP_TIME_NS_TO_S(mp_time_ns() - clock.host_time_ns);
+    if (age < 0 || age > 0.250)
+        return false;
+    *pts_out = clock.pts + age * mpctx->opts->playback_speed;
+    return true;
+}
+
 // Update current playback time.
 static void handle_playback_time(struct MPContext *mpctx)
 {
@@ -1141,7 +1239,9 @@ static void handle_playback_time(struct MPContext *mpctx)
         mpctx->video_status >= STATUS_PLAYING &&
         mpctx->video_status < STATUS_EOF)
     {
-        mpctx->playback_pts = mpctx->video_pts;
+        double external_pts = MP_NOPTS_VALUE;
+        mpctx->playback_pts = query_external_video_clock(mpctx, &external_pts)
+                             ? external_pts : mpctx->video_pts;
     } else if (mpctx->audio_status >= STATUS_PLAYING &&
                mpctx->audio_status < STATUS_EOF)
     {
@@ -1172,9 +1272,30 @@ static void handle_playback_restart(struct MPContext *mpctx)
 
     if (mpctx->audio_status < STATUS_READY ||
         mpctx->video_status < STATUS_READY)
+    {
+        if (is_starfish_video_out(mpctx) && !get_internal_paused(mpctx) &&
+            mpctx->video_status >= STATUS_READY &&
+            mpctx->audio_status < STATUS_PLAYING &&
+            !mpctx->starfish_video_held_for_audio)
+        {
+            vo_control(mpctx->video_out, VOCTRL_PAUSE, NULL);
+            mpctx->starfish_video_held_for_audio = true;
+            MP_VERBOSE(mpctx, "Starfish video held for audio prebuffer\n");
+        }
         return;
+    }
 
     handle_update_cache(mpctx);
+
+    if (mpctx->audio_status == STATUS_READY &&
+        mpctx->video_status == STATUS_READY && !mpctx->seek.type)
+    {
+        if (!mpctx->starfish_video_held_for_audio) {
+            audio_start_ao(mpctx);
+            if (mpctx->audio_status == STATUS_READY)
+                return;
+        }
+    }
 
     if (mpctx->video_status == STATUS_READY) {
         mpctx->video_status = STATUS_PLAYING;
@@ -1182,6 +1303,11 @@ static void handle_playback_restart(struct MPContext *mpctx)
         mp_wakeup_core(mpctx);
         MP_DBG(mpctx, "starting video playback\n");
     }
+
+    if (is_starfish_video_out(mpctx) && !get_internal_paused(mpctx) &&
+        mpctx->audio_status == STATUS_READY &&
+        mpctx->video_status >= STATUS_PLAYING)
+        release_starfish_video_for_audio_clock(mpctx);
 
     if (mpctx->audio_status == STATUS_READY) {
         // If a new seek is queued while the current one finishes, don't
@@ -1194,6 +1320,8 @@ static void handle_playback_restart(struct MPContext *mpctx)
         }
 
         audio_start_ao(mpctx);
+        if (mpctx->audio_status == STATUS_READY)
+            return;
     }
 
     if (!mpctx->restart_complete) {

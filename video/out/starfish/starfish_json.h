@@ -27,6 +27,11 @@ struct starfish_json_load_params {
   bool adaptive_resolution;
   int64_t pts_to_decode_ns;
   bool need_audio;
+  bool audio_sync;
+  /* PCM audio (audio_codec == "PCM"); ignored for other codecs.
+   * audio_pcm_format is a gstreamer sample-format token, e.g. "S16LE". */
+  int audio_bits_per_sample;
+  const char *audio_pcm_format;
 };
 
 struct starfish_json_hdr_info_params {

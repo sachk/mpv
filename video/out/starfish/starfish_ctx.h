@@ -88,13 +88,22 @@ STARFISH_CTX_API bool
 starfish_ctx_configure_video(struct starfish_ctx *ctx,
                              const struct mp_codec_params *codec);
 STARFISH_CTX_API bool
+starfish_ctx_enable_generated_dovi(struct starfish_ctx *ctx);
+STARFISH_CTX_API bool
 starfish_ctx_configure_audio_passthrough(struct starfish_ctx *ctx, int format,
-                                         int samplerate,
-                                         const struct mp_chmap *channels);
+                                          int samplerate,
+                                          const struct mp_chmap *channels);
 STARFISH_CTX_API bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx,
                                                        int channels,
                                                        int samplerate,
                                                        int profile, bool raw);
+// Configure uncompressed-PCM audio fed as an elementary stream (esData=2),
+// independent of the AAC path. pcm_format is a gstreamer sample-format token
+// (e.g. "S16LE"); bits_per_sample matches it (16/24/32).
+STARFISH_CTX_API bool
+starfish_ctx_configure_audio_pcm(struct starfish_ctx *ctx, int channels,
+                                 int samplerate, int bits_per_sample,
+                                 const char *pcm_format);
 
 STARFISH_CTX_API int starfish_ctx_feed_video(struct starfish_ctx *ctx,
                                              const void *data, size_t size,
@@ -110,9 +119,6 @@ STARFISH_CTX_API bool starfish_ctx_pause(struct starfish_ctx *ctx);
 STARFISH_CTX_API bool starfish_ctx_set_seek_target(struct starfish_ctx *ctx,
                                                    double pts);
 STARFISH_CTX_API bool starfish_ctx_flush(struct starfish_ctx *ctx, double pts);
-STARFISH_CTX_API bool
-starfish_ctx_set_external_audio_clock(struct starfish_ctx *ctx, double pts,
-                                      int64_t host_time_ns);
 STARFISH_CTX_API bool starfish_ctx_get_seek_target_ns(struct starfish_ctx *ctx,
                                                       int64_t *pts_ns);
 STARFISH_CTX_API bool
@@ -127,6 +133,14 @@ STARFISH_CTX_API int starfish_ctx_get_video_height(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_video_fps(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_current_pts(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx);
+
+// Real Starfish video-master clock. The session worker samples
+// StarfishMediaAPIs::getCurrentPlaytime() periodically; this returns the most
+// recent valid sample without blocking on the SDK. Returns false during
+// pre-roll or while paused (when no recent sample exists).
+STARFISH_CTX_API bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx,
+                                                   double *pts,
+                                                   int64_t *host_time_ns);
 
 #ifdef __cplusplus
 }

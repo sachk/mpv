@@ -346,6 +346,19 @@ typedef struct MPContext {
     bool display_sync_active;
     double audio_drift_compensation;
     double avd_filtered;
+    int64_t starfish_audio_sync_last_ns;
+    int64_t starfish_audio_sync_last_log_ns;
+    int64_t starfish_audio_sync_start_ns;
+    double starfish_audio_sync_avd_filtered;
+    double starfish_audio_start_bias;
+    int starfish_audio_start_reprime_count;
+    bool starfish_video_held_for_audio;
+    int64_t starfish_osd_last_redraw_ns;
+    int64_t starfish_osd_last_log_ns;
+    // Until this host time the Starfish OSD must not force-redraw. Set when
+    // a sub track is (re)attached so the decoder can drain the post-refresh
+    // historical PCS backlog without each pair briefly flashing onscreen.
+    int64_t starfish_sub_warmup_until_ns;
     // Timing error (in seconds) due to rounding on vsync boundaries
     double display_sync_error;
     // Number of mistimed frames.
@@ -381,7 +394,6 @@ typedef struct MPContext {
     double playback_pts;
     // For logging only.
     double logged_async_diff;
-    int64_t last_external_audio_clock_ns;
 
     int last_chapter;
 
@@ -513,7 +525,6 @@ float audio_get_gain(struct MPContext *mpctx);
 void audio_update_volume(struct MPContext *mpctx);
 void reload_audio_output(struct MPContext *mpctx);
 void audio_start_ao(struct MPContext *mpctx);
-void audio_update_external_clock(struct MPContext *mpctx, bool force);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);

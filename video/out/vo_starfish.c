@@ -56,7 +56,8 @@ struct priv {
     double last_osd_pts;
     bool have_osd_pts;
     int logged_osd_pixels;
-    int had_osd_pixels;
+    bool have_osd_alpha_state;
+    bool last_osd_has_pixels;
     bool logged_osd_skip;
     bool logged_draw_frame;
     bool logged_resize;
@@ -460,19 +461,20 @@ static void render_osd_surface(struct vo *vo, double pts)
                     break;
                 }
             }
-            const bool first_nonzero = has_pixels && !p->had_osd_pixels;
-            if (has_pixels)
-                p->had_osd_pixels = 1;
+            const bool alpha_changed = !p->have_osd_alpha_state ||
+                                       has_pixels != p->last_osd_has_pixels;
             const bool should_log =
                 !p->logged_osd_pixels ||               // first frame
-                first_nonzero ||                         // first nonzero frame
+                alpha_changed ||                         // subtitle show/hide
                 p->logged_osd_pixels < 3 ||              // first 3 frames
-                p->logged_osd_pixels % 30 == 0;          // every 30th frame
+                p->logged_osd_pixels % 300 == 0;         // low-rate heartbeat
             if (should_log) {
                 MP_INFO(vo, "Starfish OSD callback alpha=%s size=%dx%d pts=%.3f frame=%d\n",
                         has_pixels ? "nonzero" : "zero", mpi.w, mpi.h, pts,
                         p->logged_osd_pixels);
             }
+            p->have_osd_alpha_state = true;
+            p->last_osd_has_pixels = has_pixels;
             p->logged_osd_pixels++;
         }
         cb(cb_opaque, p->callback_pixels, mpi.w, mpi.h, mpi.stride[0]);
@@ -645,7 +647,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         p->next_image = mp_image_new_ref(frame->current);
     apply_video_geometry(vo, "draw");
     map_video_surface(vo);
-    double osd_pts = frame->current ? frame->current->pts : starfish_ctx_get_current_pts(p->ctx);
+    double osd_pts = starfish_ctx_get_current_pts(p->ctx);
     if (osd_pts == MP_NOPTS_VALUE || !isfinite(osd_pts))
         osd_pts = p->have_osd_pts ? p->last_osd_pts : 0;
     else {
@@ -700,14 +702,14 @@ static int control(struct vo *vo, uint32_t request, void *data)
         return starfish_ctx_resume(p->ctx) ? VO_TRUE : VO_ERROR;
     case VOCTRL_SET_PANSCAN:
         return resize(vo);
-    case VOCTRL_SET_EXTERNAL_AUDIO_CLOCK: {
-        struct voctrl_external_audio_clock *clock = data;
+    case VOCTRL_GET_EXTERNAL_VIDEO_CLOCK: {
+        struct voctrl_external_video_clock *clock = data;
         if (!clock)
             return VO_FALSE;
-        return starfish_ctx_set_external_audio_clock(p->ctx, clock->pts,
-                                                     clock->host_time_ns)
+        return starfish_ctx_get_video_clock(p->ctx, &clock->pts,
+                                            &clock->host_time_ns)
                    ? VO_TRUE
-                   : VO_ERROR;
+                   : VO_FALSE;
     }
     }
 
