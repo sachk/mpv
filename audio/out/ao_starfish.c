@@ -876,18 +876,27 @@ static bool audio_write(struct ao *ao, void **data, int samples)
     if (!ensure_audio_primed(ao))
         goto done;
     if (p->pcm_mode) {
-        // data[0] is interleaved S16 (single plane); queue it verbatim as a
-        // PCM ES frame with a sample-accurate PTS.
-        int64_t pts_ns = av_rescale_q(p->written_samples, audio_time_base(ao),
-                                      (AVRational){1, 1000000000});
-        if (pts_ns < 0)
-            pts_ns = 0;
-        const size_t bytes = (size_t)samples * p->bytes_per_frame;
-        if (!queue_encoded_packet_locked(ao, data[0], bytes,
-                                         apply_audio_delay_to_pts(ao, pts_ns),
-                                         samples))
-            goto done;
-        p->written_samples += samples;
+        // data[0] is interleaved S16 (single plane). Starfish expects audio ES
+        // packets to carry frame-sized PTS cadence; feeding a whole mpv write
+        // as one PCM access unit makes the media clock infer the wrong rate.
+        uint8_t *src = data[0];
+        for (int pos = 0; pos < samples; ) {
+            int chunk = MPMIN(p->frame_samples, samples - pos);
+            int64_t pts_ns = av_rescale_q(p->written_samples,
+                                          audio_time_base(ao),
+                                          (AVRational){1, 1000000000});
+            if (pts_ns < 0)
+                pts_ns = 0;
+            const size_t bytes = (size_t)chunk * p->bytes_per_frame;
+            if (!queue_encoded_packet_locked(ao,
+                                             src + (size_t)pos * p->bytes_per_frame,
+                                             bytes,
+                                             apply_audio_delay_to_pts(ao, pts_ns),
+                                             chunk))
+                goto done;
+            p->written_samples += chunk;
+            pos += chunk;
+        }
         if (p->buffered_samples < p->latency_samples)
             p->buffered_samples = p->latency_samples;
         ok = true;
