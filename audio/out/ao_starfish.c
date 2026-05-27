@@ -67,7 +67,11 @@ struct priv {
 };
 
 #define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.08
-#define STARFISH_AUDIO_BUFFER_SEC 3.0
+// Conduit buffer between mpv and Starfish only. The real play-ahead lives in
+// the Starfish ES queue (~1.6s, MAX_FEED_AHEAD_NS). A large value here just
+// makes mpv dump one giant write() at startup (a ~3s AAC encode spike causing
+// stutter) and coarsens the refill cadence, so keep it small.
+#define STARFISH_AUDIO_BUFFER_SEC 0.5
 #define STARFISH_AUDIO_START_PRIME_FRAMES 1
 
 // PCM mode: decoded audio is fed to Starfish as a raw-PCM elementary stream
