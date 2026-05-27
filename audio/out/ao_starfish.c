@@ -72,7 +72,7 @@ struct priv {
 // makes mpv dump one giant write() at startup (a ~3s AAC encode spike causing
 // stutter) and coarsens the refill cadence, so keep it small.
 #define STARFISH_AUDIO_BUFFER_SEC 0.5
-#define STARFISH_AUDIO_START_PRIME_FRAMES 1
+#define STARFISH_AUDIO_START_PRIME_FRAMES 3
 
 // PCM mode: decoded audio is fed to Starfish as a raw-PCM elementary stream
 // instead of being re-encoded to AAC. Kept as a distinct path so the legacy
@@ -348,16 +348,16 @@ static bool prime_silence_frames(struct ao *ao, int frames, const char *reason)
         primed_packets += ret;
     }
 
-    if (primed_packets > 0) {
-        MP_INFO(ao,
-                "%s Starfish audio with %d silent samples across %d frames (%d packets)\n",
-                reason ? reason : "Primed", primed_frames * p->frame_samples,
-                primed_frames, primed_packets);
-    } else {
+    if (primed_packets <= 0) {
         MP_WARN(ao, "AAC %s produced no output packets after %d silent frames\n",
                 reason ? reason : "prime", primed_frames);
+        return false;
     }
 
+    MP_INFO(ao,
+            "%s Starfish audio with %d silent samples across %d frames (%d packets)\n",
+            reason ? reason : "Primed", primed_frames * p->frame_samples,
+            primed_frames, primed_packets);
     return true;
 }
 
@@ -455,6 +455,8 @@ static bool audio_prime_cb(void *opaque, int64_t pts_ns)
     pthread_mutex_unlock(&p->lock);
     if (ok)
         ok = feed_pending_packets(ao);
+    if (ok)
+        ao_wakeup(ao);
     return ok;
 }
 
