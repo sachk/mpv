@@ -1014,25 +1014,26 @@ static bool get_sync_pts(struct MPContext *mpctx, double *pts,
         double audio_start_bias = split_clock
             ? mpctx->starfish_audio_start_bias
             : 0;
+        double audio_start_delay = split_clock ? opts->audio_delay : 0;
         double external_pts = MP_NOPTS_VALUE;
         if (query_external_video_clock(mpctx, &external_pts)) {
-            *pts = external_pts - opts->audio_delay + audio_start_bias;
+            *pts = external_pts - audio_start_delay + audio_start_bias;
             return true;
         }
 
         if (!require_live_starfish_clock || !split_clock) {
             if (mpctx->hrseek_active && mpctx->hrseek_pts != MP_NOPTS_VALUE) {
-                *pts = mpctx->hrseek_pts - opts->audio_delay +
+                *pts = mpctx->hrseek_pts - audio_start_delay +
                        audio_start_bias;
                 return true;
             }
             if (mpctx->video_pts != MP_NOPTS_VALUE) {
-                *pts = mpctx->video_pts - opts->audio_delay +
+                *pts = mpctx->video_pts - audio_start_delay +
                        audio_start_bias;
                 return true;
             }
             if (mpctx->playback_pts != MP_NOPTS_VALUE) {
-                *pts = mpctx->playback_pts - opts->audio_delay +
+                *pts = mpctx->playback_pts - audio_start_delay +
                        audio_start_bias;
                 return true;
             }
