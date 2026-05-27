@@ -118,13 +118,14 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
       strcmp(params->audio_codec, "PCM") == 0) {
     out << ",\"pcmInfo\":{"
         << "\"channels\":" << params->audio_channels << ','
-        << "\"frequency\":" << std::fixed << std::setprecision(3)
-        << (params->audio_samplerate / 1000.0) << std::defaultfloat << ','
+        << "\"channelMode\":\""
+        << (params->audio_channels == 1 ? "mono" : "stereo") << "\","
+        << "\"sampleRate\":" << params->audio_samplerate << ','
         << "\"bitsPerSample\":" << params->audio_bits_per_sample << ','
         << "\"format\":\""
         << json_escape(params->audio_pcm_format ? params->audio_pcm_format
                                                 : "S16LE")
-        << "\"}";
+        << "\",\"layout\":\"interleaved\"}";
   }
 
   out << ",\"esInfo\":{"
