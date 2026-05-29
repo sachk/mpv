@@ -60,6 +60,7 @@ struct priv {
     double requested_audio_delay;
     double active_audio_delay;
     bool audio_delay_pending;
+    int64_t audio_delay_grace_until_ns;
     struct encoded_packet *pending_head;
     struct encoded_packet *pending_tail;
     int pending_samples;
@@ -79,6 +80,7 @@ struct priv {
 // side close to the actual target latency and let Starfish own play-ahead.
 #define STARFISH_AUDIO_BUFFER_SEC 0.25
 #define STARFISH_AUDIO_START_PRIME_FRAMES 3
+#define STARFISH_AUDIO_DELAY_GRACE_NS (500LL * 1000 * 1000)
 
 // PCM mode: decoded audio is fed to Starfish as a raw-PCM elementary stream
 // instead of being re-encoded to AAC. Kept as a distinct path so the legacy
@@ -144,10 +146,14 @@ static void latch_audio_delay_locked(struct ao *ao, double delay,
                                      const char *reason)
 {
     struct priv *p = ao->priv;
+    bool runtime_change = p->audio_delay_initialized;
     p->requested_audio_delay = delay;
     p->active_audio_delay = delay;
     p->audio_delay_pending = false;
     p->audio_delay_initialized = true;
+    if (runtime_change)
+        p->audio_delay_grace_until_ns = mp_time_ns() +
+                                        STARFISH_AUDIO_DELAY_GRACE_NS;
     MP_INFO(ao, "ao_starfish audio-delay effective %.3f (%s)\n",
             p->active_audio_delay, reason ? reason : "latch");
 }
@@ -904,6 +910,7 @@ static void reset(struct ao *ao)
     p->primed = false;
     p->logged_write = false;
     p->audio_delay_pending = false;
+    p->audio_delay_grace_until_ns = 0;
     p->buffered_samples = 0;
     p->written_samples = 0;
     free_pending_packets_locked(p);
@@ -1082,6 +1089,10 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
     drain(ao);
     queued_total = p->buffered_samples + p->pending_samples + queued_fifo;
     active_audio_delay_locked(ao);
+    int64_t now_ns = mp_time_ns();
+    bool delay_grace = p->audio_delay_grace_until_ns > now_ns;
+    if (!delay_grace)
+        p->audio_delay_grace_until_ns = 0;
 
     if (p->needs_sync) {
         // A seek/reset can leave Starfish needing the next video segment to
@@ -1096,7 +1107,9 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
         return;
     }
 
-    state->queued_samples = queued_total;
+    state->queued_samples = delay_grace
+        ? MPMAX(queued_total, p->frame_samples)
+        : queued_total;
     state->free_samples = MPMAX(ao->device_buffer - p->latency_samples -
                                 state->queued_samples, 0);
     state->free_samples = state->free_samples / p->outburst * p->outburst;
@@ -1104,8 +1117,13 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
         state->free_samples = 0;
     if (p->audio_delay_pending)
         state->free_samples = 0;
-    state->delay = queued_total / ao->samplerate;
-    state->playing = p->playing && !p->paused && queued_total > 0;
+    state->delay = state->queued_samples / ao->samplerate;
+    // Runtime audio-delay changes intentionally stop feeding until the old
+    // Starfish queue drains. Give mpv a short virtual playing window after the
+    // latch so it refills with the new PTS instead of restarting the AO as an
+    // underrun.
+    state->playing = p->playing && !p->paused &&
+                     (queued_total > 0 || delay_grace);
     pthread_mutex_unlock(&p->lock);
 }
 
