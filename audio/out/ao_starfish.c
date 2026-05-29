@@ -73,14 +73,17 @@ struct priv {
     int bytes_per_frame;
 };
 
-#define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.08
+#define STARFISH_AAC_TARGET_LATENCY_SEC 0.08
+#define STARFISH_PCM_TARGET_LATENCY_SEC 0.04
 // Conduit buffer between mpv and Starfish only. The real play-ahead lives in
 // the Starfish ES queue (~1.6s, MAX_FEED_AHEAD_NS). A large value here just
 // makes mpv wait too long before it declares audio ready, which leaves
 // Starfish video preroll ahead of the first real audio packets. Keep the mpv
 // side close to the actual target latency and let Starfish own play-ahead.
-#define STARFISH_AUDIO_BUFFER_SEC 0.50
-#define STARFISH_AUDIO_START_PRIME_FRAMES 3
+#define STARFISH_AAC_BUFFER_SEC 0.50
+#define STARFISH_PCM_BUFFER_SEC 0.20
+#define STARFISH_AAC_START_PRIME_FRAMES 3
+#define STARFISH_PCM_START_PRIME_FRAMES 1
 #define STARFISH_AUDIO_DELAY_GRACE_NS (500LL * 1000 * 1000)
 #define STARFISH_AUDIO_UNDERRUN_GRACE_NS (5LL * 1000 * 1000 * 1000)
 
@@ -124,6 +127,23 @@ static bool env_wants_pcm_audio(void)
 {
     const char *codec = getenv("STARFISH_AUDIO_CODEC");
     return codec && (strcmp(codec, "pcm") == 0 || strcmp(codec, "PCM") == 0);
+}
+
+static double target_latency_sec(struct priv *p)
+{
+    return p->pcm_mode ? STARFISH_PCM_TARGET_LATENCY_SEC
+                       : STARFISH_AAC_TARGET_LATENCY_SEC;
+}
+
+static double conduit_buffer_sec(struct priv *p)
+{
+    return p->pcm_mode ? STARFISH_PCM_BUFFER_SEC : STARFISH_AAC_BUFFER_SEC;
+}
+
+static int start_prime_frames(struct priv *p)
+{
+    return p->pcm_mode ? STARFISH_PCM_START_PRIME_FRAMES
+                       : STARFISH_AAC_START_PRIME_FRAMES;
 }
 
 static double current_audio_delay(struct ao *ao)
@@ -243,7 +263,7 @@ static bool reopen_encoder_locked(struct ao *ao)
 
     p->frame_samples = p->encoder->frame_size > 0 ? p->encoder->frame_size : 1024;
     p->outburst = p->frame_samples;
-    p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
+    p->latency_samples = ao->samplerate * target_latency_sec(p);
     return true;
 }
 
@@ -507,10 +527,10 @@ static bool ensure_audio_primed(struct ao *ao)
     if (p->primed)
         return true;
     if (p->pcm_mode) {
-        if (!prime_pcm_silence(ao, STARFISH_AUDIO_START_PRIME_FRAMES,
+        if (!prime_pcm_silence(ao, start_prime_frames(p),
                                "Pre-primed"))
             return false;
-    } else if (!prime_silence_frames(ao, STARFISH_AUDIO_START_PRIME_FRAMES,
+    } else if (!prime_silence_frames(ao, start_prime_frames(p),
                                      "Pre-primed")) {
         return false;
     }
@@ -534,8 +554,7 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
     // backward seek lands much further back and must flush + re-prime, or
     // audio will stay positioned at the pre-seek PTS while video jumps.
     const int64_t keep_window =
-        (int64_t)(STARFISH_AUDIO_BUFFER_SEC * ao->samplerate) +
-        p->latency_samples;
+        (int64_t)(conduit_buffer_sec(p) * ao->samplerate) + p->latency_samples;
     if (p->pcm_mode && p->primed && target_samples <= p->written_samples &&
         p->written_samples - target_samples <= keep_window) {
         p->needs_sync = false;
@@ -754,7 +773,7 @@ static int init(struct ao *ao)
         p->bytes_per_frame = ao->channels.num * (STARFISH_PCM_BITS_PER_SAMPLE / 8);
         p->frame_samples = 1024;
         p->outburst = p->frame_samples;
-        p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
+        p->latency_samples = ao->samplerate * target_latency_sec(p);
 
         if (!starfish_ctx_configure_audio_pcm(p->ctx, ao->channels.num,
                                               ao->samplerate,
@@ -813,9 +832,9 @@ static int init(struct ao *ao)
 
         p->frame_samples = p->encoder->frame_size > 0 ? p->encoder->frame_size : 1024;
         p->outburst = p->frame_samples;
-        p->latency_samples = ao->samplerate * STARFISH_AUDIO_TARGET_LATENCY_SEC;
+        p->latency_samples = ao->samplerate * target_latency_sec(p);
         p->fifo = av_audio_fifo_alloc(p->encoder->sample_fmt, p->encoder->ch_layout.nb_channels,
-                                      ao->samplerate * STARFISH_AUDIO_BUFFER_SEC);
+                                      ao->samplerate * conduit_buffer_sec(p));
         if (!p->fifo) {
             MP_ERR(ao, "Failed to allocate AAC FIFO\n");
             uninit(ao);
@@ -864,7 +883,7 @@ static int init(struct ao *ao)
         return -1;
     }
     ao->device_buffer = p->latency_samples +
-                        ao->samplerate * STARFISH_AUDIO_BUFFER_SEC;
+                        ao->samplerate * conduit_buffer_sec(p);
     p->last_time = mp_time_sec();
     MP_INFO(ao, "ao_starfish buffering latency=%d device_buffer=%d\n",
             p->latency_samples, ao->device_buffer);

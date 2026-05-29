@@ -14,6 +14,11 @@ constexpr unsigned int MIN_SRC_BUFFER_LEVEL_AUDIO = 1 * 1024 * 1024;
 constexpr unsigned int MIN_SRC_BUFFER_LEVEL_VIDEO = 1 * 1024 * 1024;
 constexpr unsigned int MAX_SRC_BUFFER_LEVEL_AUDIO = 2 * 1024 * 1024;
 constexpr unsigned int MAX_SRC_BUFFER_LEVEL_VIDEO = 8 * 1024 * 1024;
+// Kodi uses the 1-2 MB audio source window for compressed ES. Raw PCM reaches
+// the same byte count in seconds, so keep its Starfish source queue short
+// enough for seek/resume to restart promptly.
+constexpr unsigned int MIN_SRC_BUFFER_LEVEL_AUDIO_PCM = 32 * 1024;
+constexpr unsigned int MAX_SRC_BUFFER_LEVEL_AUDIO_PCM = 256 * 1024;
 
 // libpf-1.0.so's mediapipeline::setPCMinfo() reads pcmInfo.sampleRate as a
 // kHz double (same convention as aacInfo.frequency). The parser compares the
@@ -84,6 +89,12 @@ static std::string json_escape(const char *src) {
 std::string
 starfish_json_build_load(const struct starfish_json_load_params *params) {
   std::ostringstream out;
+  const bool pcm_audio = params->need_audio && params->audio_codec &&
+                         strcmp(params->audio_codec, "PCM") == 0;
+  const unsigned int min_audio_buffer =
+      pcm_audio ? MIN_SRC_BUFFER_LEVEL_AUDIO_PCM : MIN_SRC_BUFFER_LEVEL_AUDIO;
+  const unsigned int max_audio_buffer =
+      pcm_audio ? MAX_SRC_BUFFER_LEVEL_AUDIO_PCM : MAX_SRC_BUFFER_LEVEL_AUDIO;
   out << "{\"args\":[{"
       << "\"mediaTransportType\":\"BUFFERSTREAM\","
       << "\"option\":{"
@@ -184,8 +195,8 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
       << MAX_SRC_BUFFER_LEVEL_VIDEO << "},"
       << "\"qBufferLevelAudio\":" << MAX_QUEUE_BUFFER_LEVEL << ','
       << "\"srcBufferLevelAudio\":{\"minimum\":"
-      << MIN_SRC_BUFFER_LEVEL_AUDIO << ",\"maximum\":"
-      << MAX_SRC_BUFFER_LEVEL_AUDIO << "}"
+      << min_audio_buffer << ",\"maximum\":"
+      << max_audio_buffer << "}"
       << "}"
       << "}";
 
