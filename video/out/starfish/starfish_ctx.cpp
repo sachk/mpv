@@ -66,6 +66,11 @@ constexpr int64_t CLOCK_EXPORT_STABLE_WINDOW_NS = 250LL * 1000 * 1000;
 constexpr double CLOCK_EXPORT_MIN_RATE = 0.80;
 constexpr double CLOCK_EXPORT_MAX_RATE = 1.20;
 constexpr int64_t PENDING_PLAYING_CLOCK_TOLERANCE_NS = 5LL * 1000 * 1000 * 1000;
+constexpr int64_t VIDEO_DELAY_MAX_NS = 500LL * 1000 * 1000;
+constexpr int64_t VIDEO_DELAY_SAMPLE_MAX_NS = 800LL * 1000 * 1000;
+constexpr int64_t VIDEO_DELAY_SAMPLE_MIN_NS = -50LL * 1000 * 1000;
+constexpr int64_t VIDEO_DELAY_TIMELINE_WINDOW_NS = 30LL * 1000 * 1000 * 1000;
+constexpr double VIDEO_DELAY_ALPHA = 0.15;
 constexpr auto SEGMENT_READY_PLAY_WATCHDOG = std::chrono::milliseconds(1500);
 constexpr auto WORKER_IDLE_WAIT = std::chrono::milliseconds(20);
 constexpr auto BUFFERFULL_BACKOFF = std::chrono::milliseconds(25);
@@ -89,7 +94,20 @@ enum class dovi_policy {
 struct queued_packet {
   std::shared_ptr<std::vector<uint8_t>> data;
   int64_t pts_ns = 0;
+  int64_t feed_pts_ns = 0;
   bool keyframe = false;
+};
+
+struct video_delay_sample {
+  int64_t media_pts_ns = 0;
+  int64_t feed_pts_ns = 0;
+  int64_t feed_host_ns = 0;
+  int64_t clock_at_feed_ns = 0;
+};
+
+struct video_timeline_point {
+  int64_t feed_pts_ns = 0;
+  int64_t media_pts_ns = 0;
 };
 
 struct wakeup_client {
@@ -258,8 +276,14 @@ struct starfish_ctx {
   /* fed packet tracking */
   int64_t fed_video_pts_ns = INT64_MIN;
   int64_t fed_audio_pts_ns = INT64_MIN;
+  int64_t last_video_feed_pts_ns = INT64_MIN;
+  int64_t video_feed_delay_ns = 0;
+  int video_delay_sample_count = 0;
+  int video_delay_log_count = 0;
   int video_bufferfull_logs = 0;
   int audio_bufferfull_logs = 0;
+  std::deque<video_delay_sample> video_delay_samples;
+  std::deque<video_timeline_point> video_timeline;
 
   /* packet queues */
   std::deque<queued_packet> video_queue;
@@ -523,6 +547,89 @@ static int64_t choose_segment_start_ns(starfish_ctx *ctx,
   return packet_pts_ns;
 }
 
+static int64_t media_pts_to_feed_pts_locked(starfish_ctx *ctx,
+                                            int64_t media_pts_ns) {
+  if (!ctx->need_audio || ctx->video_feed_delay_ns <= 0)
+    return media_pts_ns;
+  if (media_pts_ns <= ctx->video_feed_delay_ns)
+    return 0;
+  return media_pts_ns - ctx->video_feed_delay_ns;
+}
+
+static void add_video_timeline_point_locked(starfish_ctx *ctx,
+                                            int64_t feed_pts_ns,
+                                            int64_t media_pts_ns) {
+  ctx->video_timeline.push_back({feed_pts_ns, media_pts_ns});
+  while (ctx->video_timeline.size() > 256 ||
+         (!ctx->video_timeline.empty() &&
+          feed_pts_ns - ctx->video_timeline.front().feed_pts_ns >
+              VIDEO_DELAY_TIMELINE_WINDOW_NS))
+    ctx->video_timeline.pop_front();
+}
+
+static int64_t map_starfish_raw_to_media_locked(starfish_ctx *ctx,
+                                                int64_t raw_ns) {
+  for (auto it = ctx->video_timeline.rbegin();
+       it != ctx->video_timeline.rend(); ++it) {
+    if (it->feed_pts_ns <= raw_ns + STALE_READY_TOLERANCE_NS)
+      return raw_ns + (it->media_pts_ns - it->feed_pts_ns);
+  }
+
+  if (ctx->pts_offset_valid)
+    return raw_ns + ctx->pts_offset_ns;
+
+  return raw_ns;
+}
+
+static void update_video_feed_delay_locked(starfish_ctx *ctx,
+                                           int64_t measured_ns,
+                                           const char *source) {
+  if (measured_ns < VIDEO_DELAY_SAMPLE_MIN_NS ||
+      measured_ns > VIDEO_DELAY_SAMPLE_MAX_NS)
+    return;
+
+  measured_ns = MPCLAMP(measured_ns, 0, VIDEO_DELAY_MAX_NS);
+  if (ctx->video_delay_sample_count == 0) {
+    ctx->video_feed_delay_ns = measured_ns;
+  } else {
+    ctx->video_feed_delay_ns = (int64_t)llround(
+        ctx->video_feed_delay_ns +
+        VIDEO_DELAY_ALPHA * (measured_ns - ctx->video_feed_delay_ns));
+  }
+  ctx->video_delay_sample_count++;
+
+  if (ctx->video_delay_log_count < 12 ||
+      ctx->video_delay_sample_count % 120 == 0) {
+    mp_info(ctx->log,
+            "Starfish video delay sample source=%s measured=%.1fms estimate=%.1fms samples=%d\n",
+            source ? source : "clock", measured_ns / 1e6,
+            ctx->video_feed_delay_ns / 1e6, ctx->video_delay_sample_count);
+    ctx->video_delay_log_count++;
+  }
+}
+
+static void note_video_clock_reached_locked(starfish_ctx *ctx,
+                                            int64_t media_clock_ns,
+                                            int64_t host_time_ns,
+                                            const char *source) {
+  while (!ctx->video_delay_samples.empty()) {
+    video_delay_sample s = ctx->video_delay_samples.front();
+    if (s.media_pts_ns > media_clock_ns)
+      break;
+    ctx->video_delay_samples.pop_front();
+
+    const int64_t expected_wait_ns = s.media_pts_ns - s.clock_at_feed_ns;
+    if (expected_wait_ns < 0)
+      continue;
+    const int64_t clock_overshoot_ns =
+        MPMAX(media_clock_ns - s.media_pts_ns, 0);
+    const int64_t reached_host_ns = host_time_ns - clock_overshoot_ns;
+    const int64_t actual_wait_ns = reached_host_ns - s.feed_host_ns;
+    update_video_feed_delay_locked(ctx, actual_wait_ns - expected_wait_ns,
+                                   source);
+  }
+}
+
 static int64_t decode_start_for_segment_ns(starfish_ctx *ctx,
                                            int64_t segment_pts_ns) {
   if (segment_pts_ns > 0 && ctx->audio_decode_preroll_ns > 0)
@@ -542,6 +649,9 @@ static void prepare_segment_timeline_locked(starfish_ctx *ctx,
   ctx->min_ready_pts_ns = start_pts_ns;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
+  ctx->last_video_feed_pts_ns = INT64_MIN;
+  ctx->video_delay_samples.clear();
+  ctx->video_timeline.clear();
   ctx->pending_segment_ready_frame = false;
   ctx->pending_segment_ready_pts_ns = INT64_MIN;
   ctx->pending_segment_ready_have_pts = false;
@@ -760,6 +870,7 @@ static bool maybe_start_delayed_play_locked(starfish_ctx *ctx,
 static bool pending_ready_matches_clock_locked(
     starfish_ctx *ctx, std::unique_lock<std::mutex> &lk, int64_t *ready_ns,
     const char *reason);
+static int64_t project_fresh_clock_locked(starfish_ctx *ctx, int64_t now);
 
 static bool maybe_force_pending_segment_ready_locked(
     starfish_ctx *ctx, std::unique_lock<std::mutex> &lk) {
@@ -879,9 +990,11 @@ static feed_result try_drain(starfish_ctx *ctx,
                                                 : SF_BACKEND_AUDIO,
       .data = packet.data->data(),
       .size = packet.data->size(),
-      .pts_ns = packet.pts_ns,
+      .pts_ns = stream == STARFISH_STREAM_VIDEO ? packet.feed_pts_ns
+                                                : packet.pts_ns,
   };
   sf_backend_feed_result r = sf_backend_feed(ctx->backend, &bp);
+  const int64_t feed_done_host_ns = mp_time_ns();
   lk.lock();
 
   if (ctx->stop || ctx->flush_requested)
@@ -893,9 +1006,10 @@ static feed_result try_drain(starfish_ctx *ctx,
                                                   : &ctx->audio_bufferfull_logs;
       if (*logs < 8) {
         mp_info(ctx->log,
-                "Starfish %s BufferFull pts=%.3f queue=%.2fMB\n",
+                "Starfish %s BufferFull pts=%.3f feed=%.3f queue=%.2fMB\n",
                 stream == STARFISH_STREAM_VIDEO ? "video" : "audio",
-                (double)packet.pts_ns / 1e9, *queue_bytes / 1024.0 / 1024.0);
+                (double)packet.pts_ns / 1e9,
+                (double)bp.pts_ns / 1e9, *queue_bytes / 1024.0 / 1024.0);
         (*logs)++;
       }
     }
@@ -907,6 +1021,7 @@ static feed_result try_drain(starfish_ctx *ctx,
             packet.pts_ns);
     // Drop the packet so we don't spin retrying the same bad data.
   }
+  const bool feed_ok = r == SF_BACKEND_FEED_OK;
 
   *queue_bytes -= packet.data->size();
   queue->pop_front();
@@ -916,11 +1031,26 @@ static feed_result try_drain(starfish_ctx *ctx,
             "Starfish segment decode started packet_pts=%.3f target=%.3f\n",
             (double)packet.pts_ns / 1e9, (double)segment_pts_ns / 1e9);
   }
-  if (stream == STARFISH_STREAM_VIDEO) {
+  if (stream == STARFISH_STREAM_VIDEO && feed_ok) {
     ctx->fed_video_pts_ns = packet.pts_ns;
+    add_video_timeline_point_locked(ctx, packet.feed_pts_ns, packet.pts_ns);
+    int64_t clock_at_feed_ns =
+        project_fresh_clock_locked(ctx, feed_done_host_ns);
+    if (clock_at_feed_ns == INT64_MIN && ctx->started)
+      clock_at_feed_ns = ctx->current_pts_ns;
+    if (clock_at_feed_ns != INT64_MIN && packet.pts_ns >= clock_at_feed_ns) {
+      ctx->video_delay_samples.push_back({
+          packet.pts_ns,
+          packet.feed_pts_ns,
+          feed_done_host_ns,
+          clock_at_feed_ns,
+      });
+      while (ctx->video_delay_samples.size() > 256)
+        ctx->video_delay_samples.pop_front();
+    }
     maybe_start_delayed_play_locked(ctx, lk);
     maybe_release_pending_segment_frame_locked(ctx, packet.pts_ns);
-  } else {
+  } else if (stream == STARFISH_STREAM_AUDIO && feed_ok) {
     ctx->fed_audio_pts_ns = packet.pts_ns;
   }
 
@@ -954,7 +1084,8 @@ static void sample_clock_if_due(starfish_ctx *ctx,
              sample.query_duration_ns / 1e6);
     return;
   }
-  const int64_t new_ns = (int64_t)llround(sample.pts * 1e9);
+  const int64_t raw_ns = (int64_t)llround(sample.pts * 1e9);
+  const int64_t new_ns = map_starfish_raw_to_media_locked(ctx, raw_ns);
   if (ctx->clock_sample_valid) {
     const int64_t old_ns = (int64_t)llround(ctx->clock_sample_pts * 1e9);
     if (new_ns + CLOCK_BACKWARD_TOLERANCE_NS < old_ns) {
@@ -996,13 +1127,17 @@ static void sample_clock_if_due(starfish_ctx *ctx,
     ctx->clock_stability_probe_host_ns = sample.host_time_ns;
   }
   ctx->clock_sample_valid = true;
-  ctx->clock_sample_pts = sample.pts;
+  ctx->clock_sample_pts = (double)new_ns / 1e9;
   ctx->clock_sample_host_ns = sample.host_time_ns;
+  note_video_clock_reached_locked(ctx, new_ns, sample.host_time_ns, "clock");
   if (new_ns > ctx->current_pts_ns)
     ctx->current_pts_ns = new_ns;
   if (ctx->log_next_clock_sample) {
-    mp_info(ctx->log, "Starfish clock sample pts=%.3f query=%.1fms\n",
-            sample.pts, sample.query_duration_ns / 1e6);
+    mp_info(ctx->log,
+            "Starfish clock sample raw=%.3f mapped=%.3f videoDelay=%.1fms query=%.1fms\n",
+            sample.pts, (double)new_ns / 1e9,
+            (double)ctx->video_feed_delay_ns / 1e6,
+            sample.query_duration_ns / 1e6);
     ctx->log_next_clock_sample = false;
   }
 }
@@ -1045,12 +1180,14 @@ static bool pending_ready_matches_clock_locked(
   if (!sample_clock_now_locked(ctx, lk, &sample))
     return true;
 
-  const int64_t clock_ns = (int64_t)llround(sample.pts * 1e9);
+  const int64_t raw_clock_ns = (int64_t)llround(sample.pts * 1e9);
+  const int64_t clock_ns = map_starfish_raw_to_media_locked(ctx, raw_clock_ns);
   const int64_t delta_ns = llabs(clock_ns - *ready_ns);
   if (delta_ns > PENDING_PLAYING_CLOCK_TOLERANCE_NS) {
     mp_info(ctx->log,
             "Starfish ignoring stale %s for pending segment ready=%.3f clock=%.3f delta=%.3f\n",
-            reason ? reason : "event", (double)*ready_ns / 1e9, sample.pts,
+            reason ? reason : "event", (double)*ready_ns / 1e9,
+            (double)clock_ns / 1e9,
             (double)delta_ns / 1e9);
     ctx->pending_segment_ready_watchdog =
         std::chrono::steady_clock::now() + BUFFERFULL_BACKOFF;
@@ -1058,15 +1195,16 @@ static bool pending_ready_matches_clock_locked(
   }
 
   ctx->clock_sample_valid = true;
-  ctx->clock_sample_pts = sample.pts;
+  ctx->clock_sample_pts = (double)clock_ns / 1e9;
   ctx->clock_sample_host_ns = sample.host_time_ns;
+  note_video_clock_reached_locked(ctx, clock_ns, sample.host_time_ns, "clock");
   if (clock_ns > ctx->current_pts_ns)
     ctx->current_pts_ns = clock_ns;
   if (clock_ns != *ready_ns) {
     mp_info(ctx->log,
             "Starfish using clock for pending %s ready packet=%.3f clock=%.3f\n",
             reason ? reason : "event", (double)*ready_ns / 1e9,
-            sample.pts);
+            (double)clock_ns / 1e9);
     *ready_ns = clock_ns;
     ctx->pending_segment_ready_pts_ns = clock_ns;
   }
@@ -1258,11 +1396,11 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
 
   bool wake_video = false;
   bool wake_audio = false;
+  const int64_t event_host_ns = mp_time_ns();
 
   switch (type) {
   case SF_EVENT_FRAME_READY: {
     int64_t raw = num_value;
-    int64_t mapped = raw;
     if (!ctx->pts_offset_valid) {
       int64_t anchor = raw;
       if (ctx->min_ready_pts_ns != INT64_MIN)
@@ -1273,14 +1411,12 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
         anchor = ctx->fed_video_pts_ns;
       ctx->pts_offset_ns = anchor - raw;
       ctx->pts_offset_valid = true;
-      mapped = raw + ctx->pts_offset_ns;
       mp_info(ctx->log,
               "Starfish frame timeline anchored raw=%" PRId64 " anchor=%" PRId64
-              " offset=%" PRId64 " mapped=%" PRId64 "\n",
-              raw, anchor, ctx->pts_offset_ns, mapped);
-    } else {
-      mapped = raw + ctx->pts_offset_ns;
+              " fallback_offset=%" PRId64 "\n",
+              raw, anchor, ctx->pts_offset_ns);
     }
+    int64_t mapped = map_starfish_raw_to_media_locked(ctx, raw);
     if (ctx->flush_requested || ctx->need_segment ||
         ctx->state == pipeline_state::IDLE ||
         ctx->state == pipeline_state::FAILED)
@@ -1297,6 +1433,7 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
               (double)mapped / 1e9);
       break;
     }
+    note_video_clock_reached_locked(ctx, mapped, event_host_ns, "frameready");
     if (ctx->pending_segment_ready_frame &&
         ctx->pending_segment_ready_await_play) {
       ctx->pending_segment_ready_pts_ns = mapped;
@@ -1843,11 +1980,17 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data,
   if (ctx->video_queue_bytes + size > VIDEO_QUEUE_LIMIT)
     return STARFISH_FEED_AGAIN;
   const int64_t pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
+  int64_t feed_pts_ns = media_pts_to_feed_pts_locked(ctx, pts_ns);
+  if (ctx->last_video_feed_pts_ns != INT64_MIN &&
+      feed_pts_ns <= ctx->last_video_feed_pts_ns)
+    feed_pts_ns = ctx->last_video_feed_pts_ns + 1000000;
+  ctx->last_video_feed_pts_ns = feed_pts_ns;
 
   queued_packet packet;
   packet.data = std::make_shared<std::vector<uint8_t>>(
       (const uint8_t *)data, (const uint8_t *)data + size);
   packet.pts_ns = pts_ns;
+  packet.feed_pts_ns = feed_pts_ns;
   packet.keyframe = keyframe;
   ctx->video_queue_bytes += size;
   ctx->video_queue.push_back(std::move(packet));
@@ -1871,6 +2014,7 @@ int starfish_ctx_feed_audio(struct starfish_ctx *ctx, const void *data,
   packet.data = std::make_shared<std::vector<uint8_t>>(
       (const uint8_t *)data, (const uint8_t *)data + size);
   packet.pts_ns = pts_ns;
+  packet.feed_pts_ns = pts_ns;
   ctx->audio_queue_bytes += size;
   ctx->audio_queue.push_back(std::move(packet));
   ctx->cv.notify_all();
