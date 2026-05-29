@@ -56,6 +56,10 @@ struct priv {
     bool needs_sync;
     bool logged_audio_delay;
     double last_audio_delay;
+    bool audio_delay_initialized;
+    double requested_audio_delay;
+    double active_audio_delay;
+    bool audio_delay_pending;
     struct encoded_packet *pending_head;
     struct encoded_packet *pending_tail;
     int pending_samples;
@@ -129,15 +133,63 @@ static double current_audio_delay(struct ao *ao)
     return p->opts->audio_delay;
 }
 
+static double queued_audio_samples_locked(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    int queued_fifo = p->fifo ? av_audio_fifo_size(p->fifo) : 0;
+    return p->buffered_samples + p->pending_samples + queued_fifo;
+}
+
+static void latch_audio_delay_locked(struct ao *ao, double delay,
+                                     const char *reason)
+{
+    struct priv *p = ao->priv;
+    p->requested_audio_delay = delay;
+    p->active_audio_delay = delay;
+    p->audio_delay_pending = false;
+    p->audio_delay_initialized = true;
+    MP_INFO(ao, "ao_starfish audio-delay effective %.3f (%s)\n",
+            p->active_audio_delay, reason ? reason : "latch");
+}
+
+static double active_audio_delay_locked(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    double requested = current_audio_delay(ao);
+
+    if (!p->audio_delay_initialized)
+        latch_audio_delay_locked(ao, requested, "init");
+
+    if (fabs(requested - p->requested_audio_delay) >= 0.0005) {
+        double queued = queued_audio_samples_locked(ao);
+        p->requested_audio_delay = requested;
+        if (queued <= p->frame_samples) {
+            latch_audio_delay_locked(ao, requested, "no queued audio");
+        } else {
+            p->audio_delay_pending = true;
+            MP_INFO(ao,
+                    "ao_starfish audio-delay requested %.3f; waiting for "
+                    "%.3fs queued audio before latch\n",
+                    requested, queued / ao->samplerate);
+        }
+    }
+
+    if (p->audio_delay_pending &&
+        queued_audio_samples_locked(ao) <= p->frame_samples)
+        latch_audio_delay_locked(ao, p->requested_audio_delay, "queue drained");
+
+    return p->active_audio_delay;
+}
+
 // Starfish does A/V sync internally from the PTS we attach to each audio ES
 // packet, so accurate PTS is what keeps lipsync; there is no AO-side delay
 // compensation needed. We add the user's audio-delay opt here so the setting
 // in the UI (used to dial in TV/AVR processing latency) actually shifts where
 // audio lands relative to video without touching the video PTS path.
-static int64_t apply_audio_delay_to_pts(struct ao *ao, int64_t pts_ns)
+static int64_t apply_audio_delay_to_pts_locked(struct ao *ao, int64_t pts_ns)
 {
     struct priv *p = ao->priv;
-    const double delay = current_audio_delay(ao);
+    const double delay = active_audio_delay_locked(ao);
     const int64_t delayed_pts_ns =
         pts_ns + (int64_t)llround(delay * 1000000000.0);
 
@@ -418,7 +470,7 @@ static bool prime_pcm_silence(struct ao *ao, int frames, const char *reason)
             pts_ns = 0;
         if (!queue_encoded_packet_locked(ao, silence,
                                          (size_t)chunk * p->bytes_per_frame,
-                                         apply_audio_delay_to_pts(ao, pts_ns),
+                                         apply_audio_delay_to_pts_locked(ao, pts_ns),
                                          chunk)) {
             ok = false;
             break;
@@ -582,7 +634,7 @@ static bool encode_pending_audio(struct ao *ao, bool flush_tail)
 
             if (!queue_encoded_packet_locked(ao, p->packet->data,
                                              p->packet->size,
-                                             apply_audio_delay_to_pts(ao, pts_ns),
+                                             apply_audio_delay_to_pts_locked(ao, pts_ns),
                                              p->frame_samples)) {
                 av_packet_unref(p->packet);
                 return false;
@@ -644,7 +696,7 @@ static int encode_silence_frame(struct ao *ao, int samples)
             pts_ns = 0;
 
         if (!queue_encoded_packet_locked(ao, p->packet->data, p->packet->size,
-                                         apply_audio_delay_to_pts(ao, pts_ns),
+                                         apply_audio_delay_to_pts_locked(ao, pts_ns),
                                          samples)) {
             av_packet_unref(p->packet);
             return -1;
@@ -772,6 +824,7 @@ static int init(struct ao *ao)
     starfish_ctx_set_wakeup_cb(p->ctx, STARFISH_STREAM_AUDIO, wake_ao, ao);
     starfish_ctx_set_audio_prime_cb(p->ctx, audio_prime_cb, ao);
     pthread_mutex_lock(&p->lock);
+    active_audio_delay_locked(ao);
     int64_t start_target_ns = 0;
     bool needs_segment_prime = false;
     if (starfish_ctx_get_audio_reset_target_ns(p->ctx, &start_target_ns,
@@ -850,6 +903,7 @@ static void reset(struct ao *ao)
     p->playing = false;
     p->primed = false;
     p->logged_write = false;
+    p->audio_delay_pending = false;
     p->buffered_samples = 0;
     p->written_samples = 0;
     free_pending_packets_locked(p);
@@ -976,7 +1030,7 @@ static bool audio_write(struct ao *ao, void **data, int samples)
             if (!queue_encoded_packet_locked(ao,
                                              src + (size_t)pos * p->bytes_per_frame,
                                              bytes,
-                                             apply_audio_delay_to_pts(ao, pts_ns),
+                                             apply_audio_delay_to_pts_locked(ao, pts_ns),
                                              chunk))
                 goto done;
             p->written_samples += chunk;
@@ -1027,12 +1081,15 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
     queued_fifo = p->fifo ? av_audio_fifo_size(p->fifo) : 0;
     drain(ao);
     queued_total = p->buffered_samples + p->pending_samples + queued_fifo;
+    active_audio_delay_locked(ao);
 
     state->queued_samples = queued_total;
     state->free_samples = MPMAX(ao->device_buffer - p->latency_samples -
                                 state->queued_samples, 0);
     state->free_samples = state->free_samples / p->outburst * p->outburst;
     if (p->feed_blocked)
+        state->free_samples = 0;
+    if (p->audio_delay_pending)
         state->free_samples = 0;
     state->delay = queued_total / ao->samplerate;
     state->playing = p->playing && !p->paused && !p->needs_sync &&
