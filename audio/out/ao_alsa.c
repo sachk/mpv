@@ -821,6 +821,11 @@ static int init_device(struct ao *ao, int mode)
     CHECK_ALSA_ERROR("Unable to get period size");
 
     p->can_pause = snd_pcm_hw_params_can_pause(alsa_hwparams);
+    const char *no_hw_pause = getenv("WEBOS_ALSA_NO_HW_PAUSE");
+    if (no_hw_pause && strcmp(no_hw_pause, "0") != 0) {
+        MP_VERBOSE(ao, "disabling ALSA hardware pause due to WEBOS_ALSA_NO_HW_PAUSE\n");
+        p->can_pause = false;
+    }
 
     snd_pcm_sw_params_t *alsa_swparams;
     snd_pcm_sw_params_alloca(&alsa_swparams);

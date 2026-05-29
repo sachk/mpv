@@ -56,6 +56,9 @@ enum {
     VD_WAIT = 3,        // no EOF, but no output; wait until wakeup
 };
 
+static bool is_starfish_video_out(struct MPContext *mpctx);
+static bool starfish_split_clock(struct MPContext *mpctx);
+
 static const char av_desync_help_text[] =
 "\n"
 "Audio/Video desynchronisation detected! Possible reasons include too slow\n"
@@ -684,11 +687,17 @@ static void update_av_diff(struct MPContext *mpctx, double offset)
     if (mpctx->vo_chain && mpctx->vo_chain->is_sparse)
         return;
 
+    if (is_starfish_video_out(mpctx) && !starfish_split_clock(mpctx))
+        return;
+
     double a_pos = playing_audio_pts(mpctx);
     double v_pos = mpctx->video_pts;
     double external_pos;
-    if (query_external_video_clock(mpctx, &external_pos))
+    if (starfish_split_clock(mpctx) &&
+        query_external_video_clock(mpctx, &external_pos))
+    {
         v_pos = external_pos;
+    }
 
     if (a_pos != MP_NOPTS_VALUE && v_pos != MP_NOPTS_VALUE) {
         mpctx->last_av_difference = a_pos - v_pos
@@ -767,6 +776,19 @@ static bool is_starfish_video_out(struct MPContext *mpctx)
 {
     return mpctx->video_out && mpctx->video_out->driver &&
            strcmp(mpctx->video_out->driver->name, "starfish") == 0;
+}
+
+static bool is_alsa_audio_out(struct MPContext *mpctx)
+{
+    if (!mpctx->ao_chain || !mpctx->ao_chain->ao)
+        return false;
+    const char *name = ao_get_name(mpctx->ao_chain->ao);
+    return name && strcmp(name, "alsa") == 0;
+}
+
+static bool starfish_split_clock(struct MPContext *mpctx)
+{
+    return is_starfish_video_out(mpctx) && is_alsa_audio_out(mpctx);
 }
 
 // Audio drift compensation for display-sync. Tunes the audio-speed scale

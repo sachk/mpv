@@ -99,11 +99,12 @@ STARFISH_CTX_API bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx,
                                                        int profile, bool raw);
 // Configure uncompressed-PCM audio fed as an elementary stream (esData=2),
 // independent of the AAC path. pcm_format is a gstreamer sample-format token
-// (e.g. "S16LE"); bits_per_sample matches it (16/24/32).
+// (e.g. "S16LE"); pcm_layout is "interleaved" or "non-interleaved".
 STARFISH_CTX_API bool
 starfish_ctx_configure_audio_pcm(struct starfish_ctx *ctx, int channels,
                                  int samplerate, int bits_per_sample,
-                                 const char *pcm_format);
+                                 const char *pcm_format,
+                                 const char *pcm_layout);
 
 STARFISH_CTX_API int starfish_ctx_feed_video(struct starfish_ctx *ctx,
                                              const void *data, size_t size,

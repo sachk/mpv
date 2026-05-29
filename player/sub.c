@@ -231,20 +231,6 @@ void reinit_sub(struct MPContext *mpctx, struct track *track)
     int order = get_order(mpctx, track);
     osd_set_sub(mpctx->osd, order, track->d_sub);
 
-    // Starfish has no per-frame VO render to drive the OSD, so playloop.c's
-    // handle_osd_redraw force-redraws at synthetic frame rate while a sub is
-    // active. Right after a track is (re)attached the demuxer is still
-    // dribbling the 10s of historical PCS pairs the refresh-seek requested,
-    // and each freshly-decoded PCS-START has NOPTS endpts for one tick until
-    // its PCS-END arrives — which makes get_current treat each past sub as
-    // the current event and flashes it on screen. Suppress the synthetic
-    // redraws for ~1.5s so the decoder drains the backlog invisibly.
-    if (mpctx->playback_initialized && mpctx->video_status >= STATUS_PLAYING) {
-        int64_t warmup = mp_time_ns() + MP_TIME_MS_TO_NS(1500);
-        if (warmup > mpctx->starfish_sub_warmup_until_ns)
-            mpctx->starfish_sub_warmup_until_ns = warmup;
-    }
-
     // When paused we have to wait for packets to be available.
     // Retry on a timeout until we get a packet. If still not successful,
     // then queue it for later in the playloop (but this will have a delay).

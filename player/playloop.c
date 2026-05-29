@@ -116,6 +116,17 @@ static bool is_starfish_video_out(struct MPContext *mpctx)
            strcmp(mpctx->video_out->driver->name, "starfish") == 0;
 }
 
+static bool is_alsa_audio_out(struct MPContext *mpctx)
+{
+    const char *name = mpctx->ao ? ao_get_name(mpctx->ao) : NULL;
+    return name && strcmp(name, "alsa") == 0;
+}
+
+static bool starfish_split_clock(struct MPContext *mpctx)
+{
+    return is_starfish_video_out(mpctx) && is_alsa_audio_out(mpctx);
+}
+
 static void release_starfish_video_for_audio_clock(struct MPContext *mpctx)
 {
     if (!mpctx->starfish_video_held_for_audio)
@@ -317,7 +328,6 @@ void reset_playback_state(struct MPContext *mpctx)
     mpctx->cache_update_pts = MP_NOPTS_VALUE;
     mpctx->starfish_osd_last_redraw_ns = 0;
     mpctx->starfish_osd_last_log_ns = 0;
-    mpctx->starfish_sub_warmup_until_ns = 0;
     mpctx->starfish_video_held_for_audio = false;
 
     encode_lavc_discontinuity(mpctx->encode_lavc_ctx);
@@ -767,27 +777,18 @@ static void handle_osd_redraw(struct MPContext *mpctx)
             // and animated ASS subs need a periodic redraw to actually appear
             // at their event PTS. want_redraw_notification only fires once
             // when the dec_sub is set, not when a new event becomes current.
-            // After a sub track is (re)attached, reinit_sub sets a warmup
-            // deadline so the decoder can drain the historical PCS backlog
-            // (10s of past pairs from the refresh-seek) without each one
-            // flashing on screen for a tick. Until that warmup elapses, only
-            // honor explicit want_redraw_notification, not the synthetic tick.
             bool any_sub_selected = mpctx->current_track[0][STREAM_SUB] ||
                                     mpctx->current_track[1][STREAM_SUB];
-            bool in_warmup = mpctx->starfish_sub_warmup_until_ns &&
-                             now < mpctx->starfish_sub_warmup_until_ns;
-            if (!in_warmup && mpctx->starfish_sub_warmup_until_ns)
-                mpctx->starfish_sub_warmup_until_ns = 0;
-            if (any_sub_selected && subs_ready && !in_warmup)
+            if (any_sub_selected && subs_ready)
                 starfish_force_redraw = true;
             if (!mpctx->starfish_osd_last_log_ns ||
                 now - mpctx->starfish_osd_last_log_ns >= STARFISH_OSD_LOG_INTERVAL_NS ||
-                !subs_ready || in_warmup)
+                !subs_ready)
             {
                 MP_VERBOSE(mpctx,
-                           "Starfish OSD tick pts=%.3f subs_ready=%d any_sub=%d warmup=%d force=%d\n",
+                           "Starfish OSD tick pts=%.3f subs_ready=%d any_sub=%d force=%d\n",
                            mpctx->playback_pts, subs_ready, any_sub_selected,
-                           in_warmup, starfish_force_redraw);
+                           starfish_force_redraw);
                 mpctx->starfish_osd_last_log_ns = now;
             }
             // Keep the heartbeat self-sustaining. Starfish drives presentation
@@ -1296,7 +1297,7 @@ static void handle_playback_restart(struct MPContext *mpctx)
     if (mpctx->audio_status < STATUS_READY ||
         mpctx->video_status < STATUS_READY)
     {
-        if (is_starfish_video_out(mpctx) && !get_internal_paused(mpctx) &&
+        if (starfish_split_clock(mpctx) && !get_internal_paused(mpctx) &&
             mpctx->video_status >= STATUS_READY &&
             mpctx->audio_status < STATUS_PLAYING &&
             !mpctx->starfish_video_held_for_audio)
@@ -1327,7 +1328,7 @@ static void handle_playback_restart(struct MPContext *mpctx)
         MP_DBG(mpctx, "starting video playback\n");
     }
 
-    if (is_starfish_video_out(mpctx) && !get_internal_paused(mpctx) &&
+    if (starfish_split_clock(mpctx) && !get_internal_paused(mpctx) &&
         mpctx->audio_status == STATUS_READY &&
         mpctx->video_status >= STATUS_PLAYING)
         release_starfish_video_for_audio_clock(mpctx);

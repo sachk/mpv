@@ -175,6 +175,7 @@ bool sf_backend_load(struct sf_backend *b,
 {
     if (!b || !b->media || !params || !params->payload_json)
         return false;
+    mp_info(b->log, "Starfish Load payload: %s\n", params->payload_json);
     bool ok = try_bool(b->log, "Load", [&] {
         return b->media->Load(params->payload_json,
                               &player_callback_trampoline, b);
