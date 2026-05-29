@@ -15,6 +15,28 @@ constexpr unsigned int MIN_SRC_BUFFER_LEVEL_VIDEO = 1 * 1024 * 1024;
 constexpr unsigned int MAX_SRC_BUFFER_LEVEL_AUDIO = 2 * 1024 * 1024;
 constexpr unsigned int MAX_SRC_BUFFER_LEVEL_VIDEO = 8 * 1024 * 1024;
 
+// libpf-1.0.so's mediapipeline::setPCMinfo() reads pcmInfo.sampleRate as a
+// kHz double (same convention as aacInfo.frequency). The parser compares the
+// JSON value against an in-binary float LUT and picks the matching entry's
+// internal index, which getAudioCaps then translates back to Hz via
+// mediapipeline::transSampleRate. Accepted kHz values (LUT_SampleRateType):
+//   48.0, 32.0, 24.0, 16.0, 12.0, 8.0, 22.05.
+// Notably 44.1 kHz is NOT in this LUT; it's only ever the downstream
+// fallback when the lookup misses. Returns 0.0 for unsupported rates so the
+// caller can decide whether to emit the field at all.
+constexpr double pcm_samplerate_khz(int hz) {
+  switch (hz) {
+  case 48000: return 48.0;
+  case 32000: return 32.0;
+  case 24000: return 24.0;
+  case 16000: return 16.0;
+  case 12000: return 12.0;
+  case 8000:  return 8.0;
+  case 22050: return 22.05;
+  default:    return 0.0;
+  }
+}
+
 } // namespace
 
 static std::string json_escape(const char *src) {
@@ -69,8 +91,10 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
       << "\"needAudio\":" << (params->need_audio ? "true" : "false") << ','
       << "\"seekMode\":\"keep-rate\","
       << "\"queryPosition\":true,"
-      << "\"useCurrentTimeWithSystemClock\":true,"
       << "\"useDroppedFrameEvent\":true,";
+
+  if (!params->need_audio)
+    out << "\"useCurrentTimeWithSystemClock\":true,";
 
   if (params->window_id && params->window_id[0])
     out << "\"windowId\":\"" << json_escape(params->window_id) << "\",";
@@ -116,16 +140,24 @@ starfish_json_build_load(const struct starfish_json_load_params *params) {
 
   if (params->need_audio && params->audio_codec &&
       strcmp(params->audio_codec, "PCM") == 0) {
+    // libpf-1.0.so's mediapipeline::setPCMinfo() reads exactly these five
+    // fields and nothing else; every alias we used to send
+    // (channels/numberOfChannel/frequency/freq/rate/pcmFormat) was ignored.
+    const char *pcm_format = params->audio_pcm_format ? params->audio_pcm_format
+                                                      : "S16LE";
+    const char *pcm_layout = params->audio_pcm_layout ? params->audio_pcm_layout
+                                                      : "interleaved";
+    const char *channel_mode =
+        params->audio_channels == 1 ? "mono"
+        : params->audio_channels == 2 ? "stereo"
+        : "6-channel";
     out << ",\"pcmInfo\":{"
-        << "\"channels\":" << params->audio_channels << ','
-        << "\"channelMode\":\""
-        << (params->audio_channels == 1 ? "mono" : "stereo") << "\","
-        << "\"sampleRate\":" << params->audio_samplerate << ','
+        << "\"sampleRate\":" << std::fixed << std::setprecision(3)
+        << pcm_samplerate_khz(params->audio_samplerate) << std::defaultfloat << ','
+        << "\"channelMode\":\"" << channel_mode << "\","
         << "\"bitsPerSample\":" << params->audio_bits_per_sample << ','
-        << "\"format\":\""
-        << json_escape(params->audio_pcm_format ? params->audio_pcm_format
-                                                : "S16LE")
-        << "\",\"layout\":\"interleaved\"}";
+        << "\"format\":\"" << json_escape(pcm_format) << "\","
+        << "\"layout\":\"" << json_escape(pcm_layout) << "\"}";
   }
 
   out << ",\"esInfo\":{"

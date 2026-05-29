@@ -3951,43 +3951,27 @@ static void initiate_refresh_seek(struct demux_internal *in,
         for (int n = 0; n < in->num_streams; n++) {
             struct demux_stream *ds = in->streams[n]->ds;
 
-            // Preserve buffered packets for already-flowing streams so the
-            // consumer (e.g. ALSA via the audio decoder) keeps draining its
-            // queue while the demuxer rewinds and re-reads for the newly
-            // selected stream. The refreshing filter in add_packet_locked
-            // drops incoming packets while dp->dts < queue->last_dts (set
-            // when each packet was originally queued), so duplicates aren't
-            // appended on top of the existing buffer.
-            bool preserve_queue = ds != stream && ds->selected &&
-                                  ds->queue->head &&
-                                  (ds->last_ret_pos != -1 ||
-                                   ds->last_ret_dts != MP_NOPTS_VALUE) &&
-                                  (ds->queue->correct_dts ||
-                                   ds->queue->correct_pos);
+            bool correct_pos = ds->queue->correct_pos;
+            bool correct_dts = ds->queue->correct_dts;
 
-            if (preserve_queue) {
+            // We need to re-read all packets anyway, so discard the buffered
+            // data. (In theory, we could keep the packets, and be able to use
+            // it for seeking if partially read streams are deselected again,
+            // but this causes other problems like queue overflows when
+            // selecting a new stream.)
+            ds_clear_reader_queue_state(ds);
+            clear_queue(ds->queue);
+
+            // Streams which didn't have any packets yet will return all packets,
+            // other streams return packets only starting from the last position.
+            if (ds->selected && (ds->last_ret_pos != -1 ||
+                                 ds->last_ret_dts != MP_NOPTS_VALUE))
+            {
                 ds->refreshing = true;
-            } else {
-                bool correct_pos = ds->queue->correct_pos;
-                bool correct_dts = ds->queue->correct_dts;
-
-                // No buffered data worth keeping — discard and let the
-                // refresh refill from scratch.
-                ds_clear_reader_queue_state(ds);
-                clear_queue(ds->queue);
-
-                // Streams which didn't have any packets yet will return all
-                // packets, other streams return packets only starting from
-                // the last position.
-                if (ds->selected && (ds->last_ret_pos != -1 ||
-                                     ds->last_ret_dts != MP_NOPTS_VALUE))
-                {
-                    ds->refreshing = true;
-                    ds->queue->correct_dts = correct_dts;
-                    ds->queue->correct_pos = correct_pos;
-                    ds->queue->last_pos = ds->last_ret_pos;
-                    ds->queue->last_dts = ds->last_ret_dts;
-                }
+                ds->queue->correct_dts = correct_dts;
+                ds->queue->correct_pos = correct_pos;
+                ds->queue->last_pos = ds->last_ret_pos;
+                ds->queue->last_dts = ds->last_ret_dts;
             }
 
             update_seek_ranges(in->current_range);

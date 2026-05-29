@@ -59,9 +59,6 @@ enum {
 #define STARFISH_AUDIO_SYNC_TRANSIENT_THRESHOLD 0.060
 #define STARFISH_AUDIO_SYNC_LARGE_TRANSIENT_MAX 0.010
 #define STARFISH_AUDIO_SYNC_LARGE_TRANSIENT_THRESHOLD 0.200
-#define STARFISH_AUDIO_START_REPRIME_THRESHOLD 0.030
-#define STARFISH_AUDIO_START_REPRIME_MAX 0.250
-#define STARFISH_AUDIO_START_REPRIME_LIMIT 2
 
 static void ao_process(struct mp_filter *f);
 static void reset_starfish_audio_sync(struct MPContext *mpctx);
@@ -257,7 +254,6 @@ void reset_audio_state(struct MPContext *mpctx)
     mpctx->delay = 0;
     mpctx->logged_async_diff = -1;
     mpctx->starfish_audio_start_bias = 0;
-    mpctx->starfish_audio_start_reprime_count = 0;
     reset_starfish_audio_sync(mpctx);
 }
 
@@ -1016,7 +1012,7 @@ static bool get_sync_pts(struct MPContext *mpctx, double *pts,
             : 0;
         double audio_start_delay = split_clock ? opts->audio_delay : 0;
         double external_pts = MP_NOPTS_VALUE;
-        if (query_external_video_clock(mpctx, &external_pts)) {
+        if (split_clock && query_external_video_clock(mpctx, &external_pts)) {
             *pts = external_pts - audio_start_delay + audio_start_bias;
             return true;
         }
@@ -1085,26 +1081,6 @@ void audio_start_ao(struct MPContext *mpctx)
             desired_pts = pts - mpctx->starfish_audio_start_bias;
     }
     double apts = playing_audio_pts(mpctx);
-    if (starfish_split_clock(mpctx) && desired_pts != MP_NOPTS_VALUE &&
-        apts != MP_NOPTS_VALUE && apts + STARFISH_AUDIO_START_REPRIME_THRESHOLD < desired_pts &&
-        mpctx->starfish_audio_start_reprime_count < STARFISH_AUDIO_START_REPRIME_LIMIT)
-    {
-        double delta = MPCLAMP(desired_pts - apts, 0,
-                               STARFISH_AUDIO_START_REPRIME_MAX);
-        mpctx->starfish_audio_start_bias += delta;
-        mpctx->starfish_audio_start_reprime_count++;
-        MP_VERBOSE(mpctx,
-                   "Starfish re-prime audio start desired=%f audio=%f delta=%f bias=%f\n",
-                   desired_pts, apts, delta, mpctx->starfish_audio_start_bias);
-        ao_reset(ao_c->ao);
-        ao_c->start_pts_known = false;
-        ao_c->start_pts = MP_NOPTS_VALUE;
-        mpctx->audio_status = STATUS_SYNCING;
-        ao_c->delaying_audio_start = true;
-        mp_filter_wakeup(ao_c->ao_filter);
-        mp_wakeup_core(mpctx);
-        return;
-    }
     if (desired_pts != MP_NOPTS_VALUE && apts != MP_NOPTS_VALUE &&
         desired_pts < apts && mpctx->video_status != STATUS_EOF)
     {

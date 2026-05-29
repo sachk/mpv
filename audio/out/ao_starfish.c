@@ -69,9 +69,10 @@ struct priv {
 #define STARFISH_AUDIO_TARGET_LATENCY_SEC 0.08
 // Conduit buffer between mpv and Starfish only. The real play-ahead lives in
 // the Starfish ES queue (~1.6s, MAX_FEED_AHEAD_NS). A large value here just
-// makes mpv dump one giant write() at startup (a ~3s AAC encode spike causing
-// stutter) and coarsens the refill cadence, so keep it small.
-#define STARFISH_AUDIO_BUFFER_SEC 0.5
+// makes mpv wait too long before it declares audio ready, which leaves
+// Starfish video preroll ahead of the first real audio packets. Keep the mpv
+// side close to the actual target latency and let Starfish own play-ahead.
+#define STARFISH_AUDIO_BUFFER_SEC 0.25
 #define STARFISH_AUDIO_START_PRIME_FRAMES 3
 
 // PCM mode: decoded audio is fed to Starfish as a raw-PCM elementary stream
@@ -80,6 +81,13 @@ struct priv {
 #define STARFISH_PCM_FORMAT AF_FORMAT_S16
 #define STARFISH_PCM_BITS_PER_SAMPLE 16
 #define STARFISH_PCM_FORMAT_TOKEN "S16LE"
+#define STARFISH_PCM_LAYOUT_TOKEN "interleaved"
+// PCM output rate fed to mpv's filter chain, used as the audio time-base for
+// PTS, and reported in the load payload (libpf maps it to its sampleRate
+// enum). 48 kHz is the only rate worth targeting today: libpf's
+// LUT_SampleRateType has no 44.1 kHz entry, so 44.1 only ever shows up as a
+// downstream fallback when the enum lookup fails.
+#define STARFISH_PCM_OUTPUT_RATE 48000
 
 static void uninit(struct ao *ao);
 static int encode_silence_frame(struct ao *ao, int samples);
@@ -112,6 +120,11 @@ static double current_audio_delay(struct ao *ao)
     return p->opts->audio_delay;
 }
 
+// Starfish does A/V sync internally from the PTS we attach to each audio ES
+// packet, so accurate PTS is what keeps lipsync; there is no AO-side delay
+// compensation needed. We add the user's audio-delay opt here so the setting
+// in the UI (used to dial in TV/AVR processing latency) actually shifts where
+// audio lands relative to video without touching the video PTS path.
 static int64_t apply_audio_delay_to_pts(struct ao *ao, int64_t pts_ns)
 {
     struct priv *p = ao->priv;
@@ -121,7 +134,8 @@ static int64_t apply_audio_delay_to_pts(struct ao *ao, int64_t pts_ns)
 
     if (!p->logged_audio_delay || fabs(delay - p->last_audio_delay) >= 0.0005) {
         MP_INFO(ao, "ao_starfish audio-delay applied delay=%.3f base_pts=%.3f feed_pts=%.3f\n",
-                delay, (double)pts_ns / 1000000000.0,
+                delay,
+                (double)pts_ns / 1000000000.0,
                 (double)MPMAX(delayed_pts_ns, 0) / 1000000000.0);
         p->logged_audio_delay = true;
         p->last_audio_delay = delay;
@@ -361,8 +375,8 @@ static bool prime_silence_frames(struct ao *ao, int frames, const char *reason)
     return true;
 }
 
-// PCM counterpart of prime_silence_frames: queue zeroed interleaved PCM so the
-// pipeline has a little audio ahead of the first real samples. Lock held.
+// PCM counterpart of prime_silence_frames: queue zeroed PCM so the pipeline has
+// a little audio ahead of the first real samples. Lock held.
 static bool prime_pcm_silence(struct ao *ao, int frames, const char *reason)
 {
     struct priv *p = ao->priv;
@@ -370,28 +384,44 @@ static bool prime_pcm_silence(struct ao *ao, int frames, const char *reason)
     if (frames <= 0)
         return true;
 
-    const int total_samples = frames * p->frame_samples;
-    const size_t bytes = (size_t)total_samples * p->bytes_per_frame;
-    uint8_t *silence = av_mallocz(bytes);
+    const size_t max_bytes = (size_t)p->frame_samples * p->bytes_per_frame;
+    uint8_t *silence = av_mallocz(max_bytes);
     if (!silence) {
         MP_WARN(ao, "Failed to allocate PCM silence for %s\n",
                 reason ? reason : "prime");
         return false;
     }
 
-    int64_t pts_ns = av_rescale_q(p->written_samples, audio_time_base(ao),
-                                  (AVRational){1, 1000000000});
-    if (pts_ns < 0)
-        pts_ns = 0;
-    p->written_samples += total_samples;
+    const int total_samples = frames * p->frame_samples;
+    const int64_t real_start_samples = p->written_samples;
+    int64_t silence_samples = real_start_samples - total_samples;
+    if (silence_samples < 0)
+        silence_samples = 0;
 
-    bool ok = queue_encoded_packet_locked(ao, silence, bytes,
-                                          apply_audio_delay_to_pts(ao, pts_ns),
-                                          total_samples);
+    bool ok = true;
+    int queued_samples = 0;
+    while (silence_samples < real_start_samples) {
+        int chunk = (int)MPMIN((int64_t)p->frame_samples,
+                               real_start_samples - silence_samples);
+        int64_t pts_ns = av_rescale_q(silence_samples, audio_time_base(ao),
+                                      (AVRational){1, 1000000000});
+        if (pts_ns < 0)
+            pts_ns = 0;
+        if (!queue_encoded_packet_locked(ao, silence,
+                                         (size_t)chunk * p->bytes_per_frame,
+                                         apply_audio_delay_to_pts(ao, pts_ns),
+                                         chunk)) {
+            ok = false;
+            break;
+        }
+        silence_samples += chunk;
+        queued_samples += chunk;
+    }
+    p->written_samples = real_start_samples;
     av_free(silence);
     if (ok) {
-        MP_INFO(ao, "%s Starfish audio with %d silent PCM samples\n",
-                reason ? reason : "Primed", total_samples);
+        MP_INFO(ao, "%s Starfish audio with %d silent PCM pre-roll samples\n",
+                reason ? reason : "Primed", queued_samples);
     } else {
         MP_WARN(ao, "Failed to %s Starfish audio with PCM silence\n",
                 reason ? reason : "prime");
@@ -425,14 +455,34 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
     if (pts_ns < 0 || (!p->pcm_mode && !p->encoder))
         return false;
 
+    int64_t target_samples = av_rescale_q(pts_ns, (AVRational){1, 1000000000},
+                                          audio_time_base(ao));
+    // "Keep existing prime" only handles the startup race where mpv pre-feeds
+    // a few hundred ms of audio before Starfish issues its first segment-
+    // prime callback (target lands just behind what we already wrote). A real
+    // backward seek lands much further back and must flush + re-prime, or
+    // audio will stay positioned at the pre-seek PTS while video jumps.
+    const int64_t keep_window =
+        (int64_t)(STARFISH_AUDIO_BUFFER_SEC * ao->samplerate) +
+        p->latency_samples;
+    if (p->pcm_mode && p->primed && target_samples <= p->written_samples &&
+        p->written_samples - target_samples <= keep_window) {
+        p->needs_sync = false;
+        MP_INFO(ao,
+                "ao_starfish keep existing PCM prime at %s pts=%" PRId64
+                " target_samples=%" PRId64 " written_samples=%" PRId64 "\n",
+                reason ? reason : "request", pts_ns, target_samples,
+                p->written_samples);
+        return true;
+    }
+
     free_pending_packets_locked(p);
     if (!p->pcm_mode) {
         av_audio_fifo_drain(p->fifo, av_audio_fifo_size(p->fifo));
         if (!reopen_encoder_locked(ao))
             return false;
     }
-    p->written_samples = av_rescale_q(pts_ns, (AVRational){1, 1000000000},
-                                      audio_time_base(ao));
+    p->written_samples = target_samples;
     p->primed = false;
     p->needs_sync = false;
     p->buffered_samples = 0;
@@ -620,10 +670,12 @@ static int init(struct ao *ao)
     p->pcm_mode = env_wants_pcm_audio();
 
     if (p->pcm_mode) {
-        // Decode-to-PCM path: advertise interleaved S16 so mpv's filter chain
-        // delivers exactly what the Starfish PCM sink wants; we then hand those
-        // buffers straight to the audio ES (esData=2). No encoder/FIFO.
-        ao->samplerate = 48000;
+        // Decode-to-PCM path: advertise interleaved S16. Layout is forced
+        // interleaved because non-interleaved would need true plane-packed
+        // buffers (separate L/R planes back-to-back per access unit), which
+        // mpv's filter chain doesn't deliver here without extra packing.
+        // Sample rate matches what we declare to libpf in pcmInfo.
+        ao->samplerate = STARFISH_PCM_OUTPUT_RATE;
         ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
         ao->format = STARFISH_PCM_FORMAT;
         p->bytes_per_frame = ao->channels.num * (STARFISH_PCM_BITS_PER_SAMPLE / 8);
@@ -634,7 +686,8 @@ static int init(struct ao *ao)
         if (!starfish_ctx_configure_audio_pcm(p->ctx, ao->channels.num,
                                               ao->samplerate,
                                               STARFISH_PCM_BITS_PER_SAMPLE,
-                                              STARFISH_PCM_FORMAT_TOKEN)) {
+                                              STARFISH_PCM_FORMAT_TOKEN,
+                                              STARFISH_PCM_LAYOUT_TOKEN)) {
             MP_VERBOSE(ao, "Failed to configure Starfish PCM audio\n");
             uninit(ao);
             return -1;

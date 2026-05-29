@@ -29,9 +29,16 @@ struct starfish_json_load_params {
   bool need_audio;
   bool audio_sync;
   /* PCM audio (audio_codec == "PCM"); ignored for other codecs.
-   * audio_pcm_format is a gstreamer sample-format token, e.g. "S16LE". */
+   * audio_pcm_format is a libpf format token from the setPCMinfo string
+   *   table: "S16LE"/"S16BE"/"U16LE"/"U16BE"/"S24LE"/"S24BE"/"U24LE"/"U24BE"/
+   *   "S24_32LE"/"S24_32BE"/"U24_32LE"/"U24_32BE"/"S32LE"/"S32BE"/"U32LE"/
+   *   "U32BE"/"S20LE"/"S20BE"/"U20LE"/"U20BE"/"S18LE"/"S18BE"/"U18LE"/"U18BE"/
+   *   "F32LE"/"F32BE"/"F64LE"/"F64BE"/"S8"/"U8".
+   * audio_pcm_layout is "interleaved" or "non-interleaved"; the only two
+   *   strings libpf accepts. (Not "planar".) */
   int audio_bits_per_sample;
   const char *audio_pcm_format;
+  const char *audio_pcm_layout;
 };
 
 struct starfish_json_hdr_info_params {

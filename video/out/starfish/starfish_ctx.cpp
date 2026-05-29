@@ -55,6 +55,7 @@ namespace {
 constexpr size_t VIDEO_QUEUE_LIMIT = 8 * 1024 * 1024;
 constexpr size_t AUDIO_QUEUE_LIMIT = 2 * 1024 * 1024;
 constexpr int64_t MAX_FEED_AHEAD_NS = 1600LL * 1000 * 1000;
+constexpr int64_t PCM_DECODE_PREROLL_NS = 0;
 constexpr int64_t STALE_READY_TOLERANCE_NS = 1000LL * 1000;
 constexpr int64_t READY_CEILING_SLACK_NS = 5LL * 1000 * 1000 * 1000;
 constexpr int64_t CLOCK_SAMPLE_PERIOD_NS = 20LL * 1000 * 1000;
@@ -114,7 +115,8 @@ bool env_wants_audio_hint() {
 }
 
 // Which Starfish audio ES the app wants. "pcm" routes decoded audio as raw
-// PCM; anything else (default) keeps the legacy AAC encode path.
+// PCM (codec token "PCM", parsed by libpf's setPCMinfo); anything else
+// (default) keeps the legacy AAC encode path.
 bool env_wants_pcm_audio() {
   const char *codec = getenv("STARFISH_AUDIO_CODEC");
   return codec && (strcmp(codec, "pcm") == 0 || strcmp(codec, "PCM") == 0);
@@ -203,6 +205,8 @@ struct starfish_ctx {
   /* PCM-only (audio_codec == "PCM") */
   int audio_bits_per_sample = 0;
   std::string audio_pcm_format;
+  std::string audio_pcm_layout;
+  int64_t audio_decode_preroll_ns = 0;
 
   /* DOVI / HDR */
   dovi_policy dovi_mode = dovi_policy::AUTO;
@@ -519,6 +523,13 @@ static int64_t choose_segment_start_ns(starfish_ctx *ctx,
   return packet_pts_ns;
 }
 
+static int64_t decode_start_for_segment_ns(starfish_ctx *ctx,
+                                           int64_t segment_pts_ns) {
+  if (segment_pts_ns > 0 && ctx->audio_decode_preroll_ns > 0)
+    return std::max<int64_t>(0, segment_pts_ns - ctx->audio_decode_preroll_ns);
+  return segment_pts_ns;
+}
+
 static void prepare_segment_timeline_locked(starfish_ctx *ctx,
                                             int64_t start_pts_ns,
                                             const char *reason) {
@@ -591,6 +602,7 @@ static bool try_start_load(starfish_ctx *ctx,
                                      ? 0
                                      : ctx->video_queue.front().pts_ns;
   const int64_t load_pts_ns = choose_segment_start_ns(ctx, first_video_pts_ns);
+  const int64_t decode_pts_ns = decode_start_for_segment_ns(ctx, load_pts_ns);
 
   struct starfish_json_load_params p = {
       .app_id = get_app_id(),
@@ -612,12 +624,14 @@ static bool try_start_load(starfish_ctx *ctx,
       .max_height = 0,
       .max_framerate = 0,
       .adaptive_resolution = false,
-      .pts_to_decode_ns = load_pts_ns,
+      .pts_to_decode_ns = decode_pts_ns,
       .need_audio = ctx->need_audio,
       .audio_sync = ctx->need_audio,
       .audio_bits_per_sample = ctx->audio_bits_per_sample,
       .audio_pcm_format =
           ctx->audio_pcm_format.empty() ? nullptr : ctx->audio_pcm_format.c_str(),
+      .audio_pcm_layout =
+          ctx->audio_pcm_layout.empty() ? nullptr : ctx->audio_pcm_layout.c_str(),
   };
 
   std::string payload = starfish_json_build_load(&p);
@@ -625,15 +639,15 @@ static bool try_start_load(starfish_ctx *ctx,
   ctx->ended = false;
   ctx->eos_pushed = false;
   ctx->eos_pending = false;
-  prepare_segment_timeline_locked(ctx, p.pts_to_decode_ns, "initial-load");
+  prepare_segment_timeline_locked(ctx, load_pts_ns, "initial-load");
 
   mp_info(ctx->log,
           "Starfish Load: video=%s audio=%s size=%dx%d fps=%d/%d window=%s "
-          "dovi=%d pts_to_decode=%" PRId64 "\n",
+          "dovi=%d pts_to_decode=%" PRId64 " timeline=%.3f\n",
           p.video_codec, p.audio_codec ? p.audio_codec : "(none)", p.width,
           p.height, p.fps_num, p.fps_den,
           p.window_id ? p.window_id : "(acb)", p.dolby_vision,
-          p.pts_to_decode_ns);
+          p.pts_to_decode_ns, (double)load_pts_ns / 1e9);
 
   lk.unlock();
   bool ok = ensure_backend(ctx);
@@ -702,8 +716,10 @@ static bool delayed_play_ready_locked(starfish_ctx *ctx) {
   int64_t frame_ns = 50LL * 1000 * 1000;
   if (ctx->fps > 0.0)
     frame_ns = (int64_t)llround(1e9 / ctx->fps);
-  return ctx->fed_video_pts_ns + frame_ns >=
-         ctx->play_after_preroll_target_ns;
+  if (ctx->fed_video_pts_ns + frame_ns < ctx->play_after_preroll_target_ns)
+    return false;
+
+  return true;
 }
 
 static bool maybe_start_delayed_play_locked(starfish_ctx *ctx,
@@ -793,15 +809,11 @@ static feed_result try_drain(starfish_ctx *ctx,
   if (queue->empty())
     return feed_result::NO_PACKET;
 
-  if (ctx->started) {
-    const int64_t fed = stream == STARFISH_STREAM_VIDEO
-                            ? ctx->fed_video_pts_ns
-                            : ctx->fed_audio_pts_ns;
-    if (fed != INT64_MIN && fed - ctx->current_pts_ns > MAX_FEED_AHEAD_NS)
-      return feed_result::BLOCKED;
-  }
-
   queued_packet packet = queue->front();
+  if (ctx->current_pts_ns != INT64_MIN &&
+      packet.pts_ns - ctx->current_pts_ns > MAX_FEED_AHEAD_NS)
+    return feed_result::BLOCKED;
+
   const bool audio_only = ctx->video_codec.empty();
   const bool do_segment =
       ctx->need_segment && (stream == STARFISH_STREAM_VIDEO || audio_only);
@@ -851,12 +863,15 @@ static feed_result try_drain(starfish_ctx *ctx,
   }
 
   if (do_segment) {
-    if (!sf_backend_set_time_to_decode(ctx->backend, segment_pts_ns))
+    const int64_t decode_pts_ns =
+        decode_start_for_segment_ns(ctx, segment_pts_ns);
+    if (!sf_backend_set_time_to_decode(ctx->backend, decode_pts_ns))
       mp_warn(ctx->log, "Starfish setTimeToDecode failed target=%" PRId64 "\n",
-              segment_pts_ns);
+              decode_pts_ns);
     if (!sf_backend_send_segment_event(ctx->backend))
       mp_warn(ctx->log, "Starfish sendSegmentEvent failed\n");
-    mp_info(ctx->log, "Starfish segment restart sent\n");
+    mp_info(ctx->log, "Starfish segment restart sent decode=%.3f timeline=%.3f\n",
+            (double)decode_pts_ns / 1e9, (double)segment_pts_ns / 1e9);
   }
 
   sf_backend_packet bp = {
@@ -1161,10 +1176,17 @@ static void worker_loop(starfish_ctx *ctx) {
       if (!ctx->video_queue.empty() || !ctx->audio_queue.empty()) {
         const bool have_video = !ctx->video_queue.empty();
         const bool have_audio = !ctx->audio_queue.empty();
+        const bool segment_audio_preroll =
+            ctx->need_audio && have_audio &&
+            ctx->pending_segment_ready_frame &&
+            ctx->pending_segment_ready_pts_ns != INT64_MIN &&
+            ctx->audio_queue.front().pts_ns <=
+                ctx->pending_segment_ready_pts_ns + MAX_FEED_AHEAD_NS;
         const bool prefer_audio =
             !ctx->need_segment && have_audio &&
-            (!have_video || ctx->audio_queue.front().pts_ns <=
-                                ctx->video_queue.front().pts_ns);
+            (segment_audio_preroll ||
+             !have_video || ctx->audio_queue.front().pts_ns <=
+                              ctx->video_queue.front().pts_ns);
         enum starfish_stream_type first =
             prefer_audio ? STARFISH_STREAM_AUDIO : STARFISH_STREAM_VIDEO;
         enum starfish_stream_type second =
@@ -1468,11 +1490,19 @@ struct starfish_ctx *starfish_ctx_create(struct mp_log *log) {
   ctx->log = mp_log_new(nullptr, log, "starfish");
   if (env_wants_audio_hint()) {
     if (env_wants_pcm_audio()) {
+      // PCM route: the load payload's pcmInfo block is parsed by libpf's
+      // mediapipeline::setPCMinfo() via rapidjson, reading exactly five
+      // fields under option.externalStreamingInfo.contents.pcmInfo:
+      // sampleRate, channelMode, format, layout, bitsPerSample.
+      // sampleRate is a kHz double matched against an in-binary LUT
+      // (48.0/32.0/24.0/16.0/12.0/8.0/22.05); the JSON serializer emits the
+      // right form. See STARFISH_PCM_REVERSE_ENGINEERING.md.
       ctx->audio_codec = "PCM";
       ctx->audio_channels = 2;
       ctx->audio_samplerate = 48000;
       ctx->audio_bits_per_sample = 16;
       ctx->audio_pcm_format = "S16LE";
+      ctx->audio_pcm_layout = "interleaved";
       ctx->audio_raw = false;
       ctx->need_audio = true;
     } else {
@@ -1756,20 +1786,24 @@ bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx, int channels,
   ctx->audio_profile = profile;
   ctx->audio_raw = raw;
   ctx->need_audio = true;
+  ctx->audio_decode_preroll_ns = 0;
   return true;
 }
 
 bool starfish_ctx_configure_audio_pcm(struct starfish_ctx *ctx, int channels,
                                       int samplerate, int bits_per_sample,
-                                      const char *pcm_format) {
+                                      const char *pcm_format,
+                                      const char *pcm_layout) {
   const std::string format = pcm_format ? pcm_format : "S16LE";
+  const std::string layout = pcm_layout ? pcm_layout : "interleaved";
   std::lock_guard<std::mutex> lk(ctx->lock);
   if (is_loaded_state(ctx->state)) {
     const bool same = ctx->need_audio && ctx->audio_codec == "PCM" &&
                       ctx->audio_channels == channels &&
                       ctx->audio_samplerate == samplerate &&
                       ctx->audio_bits_per_sample == bits_per_sample &&
-                      ctx->audio_pcm_format == format;
+                      ctx->audio_pcm_format == format &&
+                      ctx->audio_pcm_layout == layout;
     if (!same) {
       mp_warn(ctx->log, "Rejecting Starfish PCM reconfigure while loaded\n");
       return false;
@@ -1778,6 +1812,7 @@ bool starfish_ctx_configure_audio_pcm(struct starfish_ctx *ctx, int channels,
     ctx->audio_queue_bytes = 0;
     ctx->fed_audio_pts_ns = INT64_MIN;
     ctx->audio_bufferfull_logs = 0;
+    ctx->audio_decode_preroll_ns = PCM_DECODE_PREROLL_NS;
     ctx->cv.notify_all();
     return true;
   }
@@ -1786,9 +1821,11 @@ bool starfish_ctx_configure_audio_pcm(struct starfish_ctx *ctx, int channels,
   ctx->audio_samplerate = samplerate;
   ctx->audio_bits_per_sample = bits_per_sample;
   ctx->audio_pcm_format = format;
+  ctx->audio_pcm_layout = layout;
   ctx->audio_profile = 0;
   ctx->audio_raw = false;
   ctx->need_audio = true;
+  ctx->audio_decode_preroll_ns = PCM_DECODE_PREROLL_NS;
   return true;
 }
 
@@ -1805,11 +1842,12 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data,
     return STARFISH_FEED_AGAIN;
   if (ctx->video_queue_bytes + size > VIDEO_QUEUE_LIMIT)
     return STARFISH_FEED_AGAIN;
+  const int64_t pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
 
   queued_packet packet;
   packet.data = std::make_shared<std::vector<uint8_t>>(
       (const uint8_t *)data, (const uint8_t *)data + size);
-  packet.pts_ns = pts == MP_NOPTS_VALUE ? 0 : (int64_t)(pts * 1e9);
+  packet.pts_ns = pts_ns;
   packet.keyframe = keyframe;
   ctx->video_queue_bytes += size;
   ctx->video_queue.push_back(std::move(packet));

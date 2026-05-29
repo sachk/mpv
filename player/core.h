@@ -351,14 +351,9 @@ typedef struct MPContext {
     int64_t starfish_audio_sync_start_ns;
     double starfish_audio_sync_avd_filtered;
     double starfish_audio_start_bias;
-    int starfish_audio_start_reprime_count;
     bool starfish_video_held_for_audio;
     int64_t starfish_osd_last_redraw_ns;
     int64_t starfish_osd_last_log_ns;
-    // Until this host time the Starfish OSD must not force-redraw. Set when
-    // a sub track is (re)attached so the decoder can drain the post-refresh
-    // historical PCS backlog without each pair briefly flashing onscreen.
-    int64_t starfish_sub_warmup_until_ns;
     // Timing error (in seconds) due to rounding on vsync boundaries
     double display_sync_error;
     // Number of mistimed frames.
