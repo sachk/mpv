@@ -13,6 +13,7 @@
 #include <libavutil/audio_fifo.h>
 #include <libavutil/mem.h>
 
+#include "audio/aframe.h"
 #include "audio/chmap.h"
 #include "audio/fmt-conversion.h"
 #include "audio/format.h"
@@ -101,6 +102,14 @@ static enum AVSampleFormat select_encoder_format(const AVCodec *codec);
 static inline AVRational audio_time_base(struct ao *ao)
 {
     return (AVRational){1, ao->samplerate};
+}
+
+static int64_t audio_pts_to_samples(struct ao *ao, double pts)
+{
+    if (pts == MP_NOPTS_VALUE)
+        return INT64_MIN;
+    int64_t samples = llround(pts * ao->samplerate);
+    return MPMAX(samples, 0);
 }
 
 static bool env_wants_pcm_audio(void)
@@ -913,6 +922,17 @@ static bool audio_write(struct ao *ao, void **data, int samples)
 {
     struct priv *p = ao->priv;
     bool ok = false;
+    struct mp_aframe *af = *(struct mp_aframe **)data;
+    if (!af)
+        return false;
+
+    void **planes = (void **)mp_aframe_get_data_rw(af);
+    if (!planes)
+        return false;
+    samples = mp_aframe_get_size(af);
+    if (samples <= 0)
+        return true;
+    double frame_pts = mp_aframe_get_pts(af);
 
     if (!feed_pending_packets(ao))
         return false;
@@ -929,10 +949,22 @@ static bool audio_write(struct ao *ao, void **data, int samples)
     if (!ensure_audio_primed(ao))
         goto done;
     if (p->pcm_mode) {
-        // data[0] is interleaved S16 (single plane). Starfish expects audio ES
-        // packets to carry frame-sized PTS cadence; feeding a whole mpv write
+        // planes[0] is interleaved S16 (single plane). Starfish expects audio ES
+        // packets to carry frame-sized PTS cadence; feeding a whole mpv frame
         // as one PCM access unit makes the media clock infer the wrong rate.
-        uint8_t *src = data[0];
+        int64_t frame_samples = audio_pts_to_samples(ao, frame_pts);
+        if (frame_samples != INT64_MIN) {
+            int64_t delta = frame_samples - p->written_samples;
+            if (llabs(delta) > p->frame_samples) {
+                MP_VERBOSE(ao,
+                           "ao_starfish PCM PTS realign frame_pts=%.6f "
+                           "sample_delta=%" PRId64 "\n",
+                           frame_pts, delta);
+            }
+            p->written_samples = frame_samples;
+        }
+
+        uint8_t *src = planes[0];
         for (int pos = 0; pos < samples; ) {
             int chunk = MPMIN(p->frame_samples, samples - pos);
             int64_t pts_ns = av_rescale_q(p->written_samples,
@@ -955,9 +987,20 @@ static bool audio_write(struct ao *ao, void **data, int samples)
         ok = true;
         goto done;
     }
+    int64_t frame_samples = audio_pts_to_samples(ao, frame_pts);
+    if (frame_samples != INT64_MIN && av_audio_fifo_size(p->fifo) == 0) {
+        int64_t delta = frame_samples - p->written_samples;
+        if (llabs(delta) > p->frame_samples) {
+            MP_VERBOSE(ao,
+                       "ao_starfish AAC PTS realign frame_pts=%.6f "
+                       "sample_delta=%" PRId64 "\n",
+                       frame_pts, delta);
+        }
+        p->written_samples = frame_samples;
+    }
     if (av_audio_fifo_realloc(p->fifo, av_audio_fifo_size(p->fifo) + samples) < 0)
         goto done;
-    if (av_audio_fifo_write(p->fifo, data, samples) < samples)
+    if (av_audio_fifo_write(p->fifo, planes, samples) < samples)
         goto done;
     if (!encode_pending_audio(ao, false))
         goto done;
@@ -1000,6 +1043,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
 const struct ao_driver audio_out_starfish = {
     .description = "LG webOS Starfish",
     .name = "starfish",
+    .write_frames = true,
     .init = init,
     .uninit = uninit,
     .reset = reset,
