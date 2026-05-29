@@ -473,6 +473,7 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
     /* Use the target time as "current position" for further relative
      * seeks etc until a new video frame has been decoded */
     mpctx->last_seek_pts = seek_pts;
+    mark_starfish_audio_sync_seek(mpctx);
     if (seek_pts != MP_NOPTS_VALUE) {
         for (int n = 0; n < mpctx->num_tracks; n++) {
             struct track *track = mpctx->tracks[n];

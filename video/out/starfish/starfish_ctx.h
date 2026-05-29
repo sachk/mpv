@@ -128,6 +128,7 @@ starfish_ctx_get_audio_reset_target_ns(struct starfish_ctx *ctx,
                                        bool *needs_segment_prime);
 STARFISH_CTX_API bool starfish_ctx_push_eos(struct starfish_ctx *ctx);
 STARFISH_CTX_API bool starfish_ctx_has_ended(struct starfish_ctx *ctx);
+STARFISH_CTX_API bool starfish_ctx_is_failed(struct starfish_ctx *ctx);
 
 STARFISH_CTX_API int starfish_ctx_get_video_width(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_video_height(struct starfish_ctx *ctx);

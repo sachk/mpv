@@ -32,6 +32,7 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "options/options.h"
@@ -91,8 +92,12 @@ struct priv {
     bool device_lost;
     snd_pcm_format_t alsa_fmt;
     bool can_pause;
+    bool bounded_io;
     snd_pcm_uframes_t buffersize;
     snd_pcm_uframes_t outburst;
+    int64_t last_recover_log_ns;
+    int64_t last_delay_clamp_log_ns;
+    int64_t last_write_timeout_log_ns;
 
     snd_output_t *output;
 
@@ -100,6 +105,12 @@ struct priv {
 
     struct ao_alsa_opts *opts;
 };
+
+static bool env_flag(const char *name)
+{
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
 
 #define CHECK_ALSA_ERROR(message) \
     do { \
@@ -821,11 +832,12 @@ static int init_device(struct ao *ao, int mode)
     CHECK_ALSA_ERROR("Unable to get period size");
 
     p->can_pause = snd_pcm_hw_params_can_pause(alsa_hwparams);
-    const char *no_hw_pause = getenv("WEBOS_ALSA_NO_HW_PAUSE");
-    if (no_hw_pause && strcmp(no_hw_pause, "0") != 0) {
+    if (env_flag("WEBOS_ALSA_NO_HW_PAUSE")) {
         MP_VERBOSE(ao, "disabling ALSA hardware pause due to WEBOS_ALSA_NO_HW_PAUSE\n");
         p->can_pause = false;
     }
+    p->bounded_io = env_flag("WEBOS_ALSA_BOUNDED_IO") ||
+                    env_flag("WEBOS_ALSA_NO_HW_PAUSE");
 
     snd_pcm_sw_params_t *alsa_swparams;
     snd_pcm_sw_params_alloca(&alsa_swparams);
@@ -859,6 +871,16 @@ static int init_device(struct ao *ao, int mode)
 
     err = snd_pcm_prepare(p->alsa);
     CHECK_ALSA_ERROR("pcm prepare error");
+
+    if (p->bounded_io) {
+        err = snd_pcm_nonblock(p->alsa, 1);
+        CHECK_ALSA_WARN("Unable to set nonblocking mode");
+        if (err < 0) {
+            p->bounded_io = false;
+        } else {
+            MP_VERBOSE(ao, "using bounded ALSA I/O for webOS-style direct hw output\n");
+        }
+    }
 
     return 0;
 
@@ -960,8 +982,14 @@ static bool recover_and_get_state(struct ao *ao, struct mp_pcm_state *state)
             break;
         }
 
-        MP_VERBOSE(ao, "attempt %d to recover from state '%s'...\n",
-                   n + 1, snd_pcm_state_name(pcmst));
+        int64_t now = mp_time_ns();
+        if (!p->last_recover_log_ns ||
+            now - p->last_recover_log_ns >= MP_TIME_S_TO_NS(1))
+        {
+            MP_VERBOSE(ao, "attempt %d to recover from state '%s'...\n",
+                       n + 1, snd_pcm_state_name(pcmst));
+            p->last_recover_log_ns = now;
+        }
 
         switch (pcmst) {
         // Underrun; recover. (We never use draining.)
@@ -1012,14 +1040,46 @@ alsa_error:
 
     if (state) {
         snd_pcm_sframes_t del = state_ok ? snd_pcm_status_get_delay(st) : 0;
-        state->delay = MPMAX(del, 0) / (double)ao->samplerate;
-        state->free_samples = state_ok ? snd_pcm_status_get_avail(st) : 0;
+        snd_pcm_sframes_t avail = state_ok ? snd_pcm_status_get_avail(st) : 0;
+        if (p->bounded_io) {
+            if (avail < 0 || avail > (snd_pcm_sframes_t)ao->device_buffer) {
+                int64_t now = mp_time_ns();
+                if (!p->last_delay_clamp_log_ns ||
+                    now - p->last_delay_clamp_log_ns >= MP_TIME_S_TO_NS(1))
+                {
+                    MP_VERBOSE(ao, "clamping ALSA avail=%ld buffer=%d\n",
+                               (long)avail, ao->device_buffer);
+                    p->last_delay_clamp_log_ns = now;
+                }
+                avail = MPCLAMP(avail, 0, ao->device_buffer);
+            }
+            state->free_samples = avail;
+        } else {
+            state->free_samples = avail;
+        }
         state->free_samples = MPCLAMP(state->free_samples, 0, ao->device_buffer);
         // Align to period size.
         state->free_samples = state->free_samples / p->outburst * p->outburst;
         state->queued_samples = ao->device_buffer - state->free_samples;
-        state->playing = pcmst == SND_PCM_STATE_RUNNING ||
-                         pcmst == SND_PCM_STATE_PAUSED;
+        if (p->bounded_io) {
+            if (del < 0 || del > (snd_pcm_sframes_t)ao->device_buffer) {
+                int64_t now = mp_time_ns();
+                if (!p->last_delay_clamp_log_ns ||
+                    now - p->last_delay_clamp_log_ns >= MP_TIME_S_TO_NS(1))
+                {
+                    MP_VERBOSE(ao,
+                               "ignoring ALSA delay=%ld, using queued=%d\n",
+                               (long)del, state->queued_samples);
+                    p->last_delay_clamp_log_ns = now;
+                }
+            }
+            state->delay = state->queued_samples / (double)ao->samplerate;
+        } else {
+            state->delay = MPMAX(del, 0) / (double)ao->samplerate;
+        }
+        state->playing = (pcmst == SND_PCM_STATE_RUNNING ||
+                          pcmst == SND_PCM_STATE_PAUSED) &&
+                         state->queued_samples > 0;
     }
 
     return state_ok;
@@ -1037,8 +1097,18 @@ static void audio_start(struct ao *ao)
 
     recover_and_get_state(ao, NULL);
 
+    snd_pcm_state_t pcmst = snd_pcm_state(p->alsa);
+    if (pcmst == SND_PCM_STATE_RUNNING || pcmst == SND_PCM_STATE_PAUSED)
+        return;
+
     err = snd_pcm_start(p->alsa);
+    if (err == -EPIPE || err == -ESTRPIPE) {
+        MP_VERBOSE(ao, "pcm start saw %s, recovering\n", snd_strerror(err));
+        if (recover_and_get_state(ao, NULL))
+            err = snd_pcm_start(p->alsa);
+    }
     CHECK_ALSA_ERROR("pcm start error");
+    ao_wakeup(ao);
 
 alsa_error: ;
 }
@@ -1054,6 +1124,7 @@ static void audio_reset(struct ao *ao)
     CHECK_ALSA_ERROR("pcm prepare error");
 
     recover_and_get_state(ao, NULL);
+    ao_wakeup(ao);
 
 alsa_error: ;
 }
@@ -1083,6 +1154,33 @@ alsa_error:
     return false;
 }
 
+static void offset_audio_planes(struct ao *ao, void **dst, void **src,
+                                int offset)
+{
+    for (int n = 0; n < ao->num_planes; n++)
+        dst[n] = (uint8_t *)src[n] + (size_t)offset * ao->sstride;
+}
+
+static bool wait_for_write_ready(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    int err = snd_pcm_wait(p->alsa, 100);
+    if (err > 0)
+        return true;
+    int64_t now = mp_time_ns();
+    if (!p->last_write_timeout_log_ns ||
+        now - p->last_write_timeout_log_ns >= MP_TIME_S_TO_NS(1))
+    {
+        if (err == 0) {
+            MP_WARN(ao, "ALSA write wait timed out\n");
+        } else {
+            MP_WARN(ao, "ALSA write wait error: %s\n", snd_strerror(err));
+        }
+        p->last_write_timeout_log_ns = now;
+    }
+    return false;
+}
+
 static bool audio_write(struct ao *ao, void **data, int samples)
 {
     struct priv *p = ao->priv;
@@ -1092,19 +1190,52 @@ static bool audio_write(struct ao *ao, void **data, int samples)
     if (!recover_and_get_state(ao, NULL))
         return false;
 
-    snd_pcm_sframes_t err = 0;
-    if (af_fmt_is_planar(ao->format)) {
-        err = snd_pcm_writen(p->alsa, data, samples);
-    } else {
-        err = snd_pcm_writei(p->alsa, data[0], samples);
+    int written = 0;
+    while (written < samples) {
+        void *planes[MP_NUM_CHANNELS] = {0};
+        void **write_data = data;
+        if (written > 0) {
+            offset_audio_planes(ao, planes, data, written);
+            write_data = planes;
+        }
+
+        snd_pcm_sframes_t err = af_fmt_is_planar(ao->format)
+            ? snd_pcm_writen(p->alsa, write_data, samples - written)
+            : snd_pcm_writei(p->alsa, write_data[0], samples - written);
+
+        if (err > 0) {
+            written += err;
+            continue;
+        }
+
+        if (err == -EAGAIN) {
+            if (!wait_for_write_ready(ao))
+                return false;
+            continue;
+        }
+
+        if (err == -EPIPE || err == -ESTRPIPE) {
+            MP_VERBOSE(ao, "ALSA write saw %s after %d/%d frames, recovering\n",
+                       snd_strerror(err), written, samples);
+            if (!recover_and_get_state(ao, NULL))
+                return false;
+            continue;
+        }
+
+        CHECK_ALSA_ERROR("pcm write error");
+
+        if (err == 0) {
+            if (!p->bounded_io)
+                break;
+            if (!wait_for_write_ready(ao))
+                return false;
+        }
     }
 
-    CHECK_ALSA_ERROR("pcm write error");
-    if (err >= 0 && err != samples) {
-        MP_ERR(ao, "unexpected partial write (%d of %d frames), dropping audio\n",
-               (int)err, samples);
-    }
+    if (written != samples)
+        MP_WARN(ao, "short ALSA write (%d of %d frames)\n", written, samples);
 
+    ao_wakeup(ao);
     return true;
 
 alsa_error:
