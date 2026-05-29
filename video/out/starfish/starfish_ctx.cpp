@@ -1080,7 +1080,10 @@ static bool maybe_force_pending_segment_ready_locked(
     return false;
 
   int64_t ready = ctx->pending_segment_ready_pts_ns;
-  if (!pending_ready_matches_clock_locked(ctx, lk, &ready, "watchdog", true) ||
+  // The SDK clock can remain pinned to the pre-seek segment until the new
+  // segment produces a frame. The watchdog is the recovery path for that exact
+  // no-frame state, so only trust our own fresh sampled clock here.
+  if (!pending_ready_matches_clock_locked(ctx, lk, &ready, "watchdog", false) ||
       !ctx->pending_segment_ready_frame ||
       ctx->pending_segment_ready_pts_ns != ready)
     return false;
