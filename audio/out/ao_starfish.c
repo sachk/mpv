@@ -61,6 +61,7 @@ struct priv {
     double active_audio_delay;
     bool audio_delay_pending;
     int64_t audio_delay_grace_until_ns;
+    int64_t underrun_grace_until_ns;
     struct encoded_packet *pending_head;
     struct encoded_packet *pending_tail;
     int pending_samples;
@@ -78,9 +79,10 @@ struct priv {
 // makes mpv wait too long before it declares audio ready, which leaves
 // Starfish video preroll ahead of the first real audio packets. Keep the mpv
 // side close to the actual target latency and let Starfish own play-ahead.
-#define STARFISH_AUDIO_BUFFER_SEC 0.25
+#define STARFISH_AUDIO_BUFFER_SEC 0.50
 #define STARFISH_AUDIO_START_PRIME_FRAMES 3
 #define STARFISH_AUDIO_DELAY_GRACE_NS (500LL * 1000 * 1000)
+#define STARFISH_AUDIO_UNDERRUN_GRACE_NS (5LL * 1000 * 1000 * 1000)
 
 // PCM mode: decoded audio is fed to Starfish as a raw-PCM elementary stream
 // instead of being re-encoded to AAC. Kept as a distinct path so the legacy
@@ -375,6 +377,8 @@ static bool feed_pending_packets(struct ao *ao)
         if (r == STARFISH_FEED_OK) {
             drain(ao);
             p->buffered_samples += pkt->samples;
+            p->underrun_grace_until_ns =
+                mp_time_ns() + STARFISH_AUDIO_UNDERRUN_GRACE_NS;
         }
         pthread_mutex_unlock(&p->lock);
         free_encoded_packet(pkt);
@@ -553,6 +557,8 @@ static bool prime_at_ns_locked(struct ao *ao, int64_t pts_ns, const char *reason
     p->primed = false;
     p->needs_sync = false;
     p->buffered_samples = 0;
+    p->underrun_grace_until_ns =
+        mp_time_ns() + STARFISH_AUDIO_UNDERRUN_GRACE_NS;
     MP_INFO(ao, "ao_starfish prime at %s pts=%" PRId64 " samples=%" PRId64 "\n",
             reason ? reason : "request", pts_ns, p->written_samples);
     return ensure_audio_primed(ao);
@@ -911,6 +917,8 @@ static void reset(struct ao *ao)
     p->logged_write = false;
     p->audio_delay_pending = false;
     p->audio_delay_grace_until_ns = 0;
+    p->underrun_grace_until_ns =
+        mp_time_ns() + STARFISH_AUDIO_UNDERRUN_GRACE_NS;
     p->buffered_samples = 0;
     p->written_samples = 0;
     free_pending_packets_locked(p);
@@ -946,6 +954,8 @@ static void start(struct ao *ao)
     p->paused = false;
     p->playing = true;
     p->last_time = mp_time_sec();
+    p->underrun_grace_until_ns =
+        mp_time_ns() + STARFISH_AUDIO_UNDERRUN_GRACE_NS;
     MP_INFO(ao, "ao_starfish start\n");
     if (p->needs_sync) {
         MP_INFO(ao, "ao_starfish start waiting for Starfish segment audio prime\n");
@@ -1045,6 +1055,8 @@ static bool audio_write(struct ao *ao, void **data, int samples)
         }
         if (p->buffered_samples < p->latency_samples)
             p->buffered_samples = p->latency_samples;
+        p->underrun_grace_until_ns =
+            mp_time_ns() + STARFISH_AUDIO_UNDERRUN_GRACE_NS;
         ok = true;
         goto done;
     }
@@ -1067,6 +1079,8 @@ static bool audio_write(struct ao *ao, void **data, int samples)
         goto done;
     if (p->buffered_samples < p->latency_samples)
         p->buffered_samples = p->latency_samples;
+    p->underrun_grace_until_ns =
+        mp_time_ns() + STARFISH_AUDIO_UNDERRUN_GRACE_NS;
     ok = true;
 
 done:
@@ -1093,6 +1107,9 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
     bool delay_grace = p->audio_delay_grace_until_ns > now_ns;
     if (!delay_grace)
         p->audio_delay_grace_until_ns = 0;
+    bool underrun_grace = p->underrun_grace_until_ns > now_ns;
+    if (!underrun_grace)
+        p->underrun_grace_until_ns = 0;
 
     if (p->needs_sync) {
         // A seek/reset can leave Starfish needing the next video segment to
@@ -1107,7 +1124,13 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
         return;
     }
 
-    state->queued_samples = delay_grace
+    if (p->playing && !p->paused && queued_total > 0) {
+        p->underrun_grace_until_ns =
+            now_ns + STARFISH_AUDIO_UNDERRUN_GRACE_NS;
+        underrun_grace = true;
+    }
+
+    state->queued_samples = (delay_grace || underrun_grace)
         ? MPMAX(queued_total, p->frame_samples)
         : queued_total;
     state->free_samples = MPMAX(ao->device_buffer - p->latency_samples -
@@ -1123,7 +1146,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
     // latch so it refills with the new PTS instead of restarting the AO as an
     // underrun.
     state->playing = p->playing && !p->paused &&
-                     (queued_total > 0 || delay_grace);
+                     (queued_total > 0 || delay_grace || underrun_grace);
     pthread_mutex_unlock(&p->lock);
 }
 
