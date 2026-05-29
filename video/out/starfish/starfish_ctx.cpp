@@ -54,14 +54,17 @@ namespace {
 
 constexpr size_t VIDEO_QUEUE_LIMIT = 32 * 1024 * 1024;
 constexpr size_t AUDIO_QUEUE_LIMIT = 2 * 1024 * 1024;
-constexpr int64_t MAX_DECODER_ACCEPT_AHEAD_NS = 3000LL * 1000 * 1000;
-constexpr int64_t MAX_FEED_AHEAD_NS = 6000LL * 1000 * 1000;
+// Kodi's webOS pipeline caps Starfish feed-ahead at 1.6s. Keeping the same
+// order of magnitude avoids multi-second stale queues after seek/resume.
+constexpr int64_t MAX_DECODER_ACCEPT_AHEAD_NS = 1600LL * 1000 * 1000;
+constexpr int64_t MAX_FEED_AHEAD_NS = 1600LL * 1000 * 1000;
 constexpr int64_t PCM_DECODE_PREROLL_NS = 0;
 constexpr int64_t STALE_READY_TOLERANCE_NS = 1000LL * 1000;
 constexpr int64_t READY_CEILING_SLACK_NS = 5LL * 1000 * 1000 * 1000;
 constexpr int64_t CLOCK_SAMPLE_PERIOD_NS = 20LL * 1000 * 1000;
 constexpr int64_t CLOCK_SAMPLE_SLOW_NS = 50LL * 1000 * 1000;
 constexpr int64_t CLOCK_BACKWARD_TOLERANCE_NS = 100LL * 1000 * 1000;
+constexpr int64_t CLOCK_FED_VIDEO_SLACK_NS = 500LL * 1000 * 1000;
 constexpr int64_t CLOCK_FRESHNESS_NS = 250LL * 1000 * 1000;
 constexpr int64_t CLOCK_EXPORT_STABLE_WINDOW_NS = 250LL * 1000 * 1000;
 constexpr double CLOCK_EXPORT_MIN_RATE = 0.80;
@@ -306,6 +309,8 @@ struct starfish_ctx {
   int64_t last_failure_wake_ns = 0;
   int64_t last_clock_jump_log_ns = 0;
   int clock_jump_suppressed = 0;
+  int64_t last_clock_reject_log_ns = 0;
+  int clock_reject_suppressed = 0;
   int64_t video_backpressure_pts_ns = INT64_MIN;
   std::string failure_reason;
   bool bufferlow_active = false;
@@ -689,11 +694,12 @@ static int64_t choose_segment_start_ns(starfish_ctx *ctx,
 
 static int64_t media_pts_to_feed_pts_locked(starfish_ctx *ctx,
                                             int64_t media_pts_ns) {
-  if (!ctx->need_audio || ctx->video_feed_delay_ns <= 0)
-    return media_pts_ns;
-  if (media_pts_ns <= ctx->video_feed_delay_ns)
-    return 0;
-  return media_pts_ns - ctx->video_feed_delay_ns;
+  // Kodi's webOS path only subtracts the user AV delay here; mpv applies that
+  // on the audio side. Starfish's audioSync expects video and audio ES packets
+  // on one media timeline, so do not fold measured display/decoder latency into
+  // feed timestamps.
+  (void)ctx;
+  return media_pts_ns;
 }
 
 static void add_video_timeline_point_locked(starfish_ctx *ctx,
@@ -792,6 +798,11 @@ static void prepare_segment_timeline_locked(starfish_ctx *ctx,
   ctx->last_video_feed_pts_ns = INT64_MIN;
   ctx->video_delay_samples.clear();
   ctx->video_timeline.clear();
+  if (ctx->need_audio) {
+    ctx->video_feed_delay_ns = 0;
+    ctx->video_delay_sample_count = 0;
+    ctx->video_delay_log_count = 0;
+  }
   ctx->pending_segment_ready_frame = false;
   ctx->pending_segment_ready_pts_ns = INT64_MIN;
   ctx->pending_segment_ready_have_pts = false;
@@ -811,6 +822,8 @@ static void prepare_segment_timeline_locked(starfish_ctx *ctx,
   ctx->last_decoder_backpressure_log_ns = 0;
   ctx->last_clock_jump_log_ns = 0;
   ctx->clock_jump_suppressed = 0;
+  ctx->last_clock_reject_log_ns = 0;
+  ctx->clock_reject_suppressed = 0;
   ctx->video_backpressure_pts_ns = INT64_MIN;
   ctx->bufferlow_active = false;
   ctx->bufferlow_start_ns = 0;
@@ -1255,7 +1268,8 @@ static feed_result try_drain(starfish_ctx *ctx,
         project_fresh_clock_locked(ctx, feed_done_host_ns);
     if (clock_at_feed_ns == INT64_MIN && ctx->started)
       clock_at_feed_ns = ctx->current_pts_ns;
-    if (clock_at_feed_ns != INT64_MIN && packet.pts_ns >= clock_at_feed_ns) {
+    if (!ctx->need_audio && clock_at_feed_ns != INT64_MIN &&
+        packet.pts_ns >= clock_at_feed_ns) {
       ctx->video_delay_samples.push_back({
           packet.pts_ns,
           packet.feed_pts_ns,
@@ -1278,6 +1292,49 @@ static feed_result try_drain(starfish_ctx *ctx,
 }
 
 /* ----- clock sampler ----------------------------------------------- */
+
+static bool clock_ahead_of_fed_video_locked(starfish_ctx *ctx,
+                                            int64_t clock_ns) {
+  return ctx->fed_video_pts_ns != INT64_MIN &&
+         clock_ns > ctx->fed_video_pts_ns + CLOCK_FED_VIDEO_SLACK_NS;
+}
+
+static void log_clock_reject_locked(starfish_ctx *ctx, const char *reason,
+                                    int64_t raw_ns, int64_t mapped_ns) {
+  const int64_t now = mp_time_ns();
+  ctx->clock_reject_suppressed++;
+  if (ctx->last_clock_reject_log_ns &&
+      now - ctx->last_clock_reject_log_ns < WORKER_STATUS_PERIOD_NS)
+    return;
+
+  mp_warn(ctx->log,
+          "Starfish rejected %s clock raw=%.3f mapped=%.3f current=%.3f "
+          "fed_v=%.3f fed_a=%.3f suppressed=%d\n",
+          reason ? reason : "implausible", (double)raw_ns / 1e9,
+          (double)mapped_ns / 1e9, ns_to_sec_or_neg(ctx->current_pts_ns),
+          ns_to_sec_or_neg(ctx->fed_video_pts_ns),
+          ns_to_sec_or_neg(ctx->fed_audio_pts_ns),
+          ctx->clock_reject_suppressed - 1);
+  ctx->last_clock_reject_log_ns = now;
+  ctx->clock_reject_suppressed = 0;
+}
+
+static bool clock_sample_plausible_locked(starfish_ctx *ctx, int64_t raw_ns,
+                                          int64_t mapped_ns) {
+  if (clock_ahead_of_fed_video_locked(ctx, mapped_ns)) {
+    log_clock_reject_locked(ctx, "ahead-of-fed-video", raw_ns, mapped_ns);
+    return false;
+  }
+
+  if (!ctx->clock_export_ready && ctx->current_pts_ns != INT64_MIN &&
+      llabs(mapped_ns - ctx->current_pts_ns) >
+          PENDING_PLAYING_CLOCK_TOLERANCE_NS) {
+    log_clock_reject_locked(ctx, "off-segment", raw_ns, mapped_ns);
+    return false;
+  }
+
+  return true;
+}
 
 static void sample_clock_if_due(starfish_ctx *ctx,
                                 std::unique_lock<std::mutex> &lk) {
@@ -1303,24 +1360,44 @@ static void sample_clock_if_due(starfish_ctx *ctx,
   }
   const int64_t raw_ns = (int64_t)llround(sample.pts * 1e9);
   const int64_t new_ns = map_starfish_raw_to_media_locked(ctx, raw_ns);
-  if (ctx->clock_sample_valid) {
-    const int64_t old_ns = (int64_t)llround(ctx->clock_sample_pts * 1e9);
-    if (new_ns + CLOCK_BACKWARD_TOLERANCE_NS < old_ns) {
-      const int64_t jump_now = mp_time_ns();
-      ctx->clock_jump_suppressed++;
-      if (!ctx->last_clock_jump_log_ns ||
-          jump_now - ctx->last_clock_jump_log_ns >= WORKER_STATUS_PERIOD_NS) {
-        mp_verbose(ctx->log,
-                   "Starfish mapped clock jumped back old_mapped=%.3f "
-                   "raw_new=%.3f mapped_new=%.3f suppressed=%d\n",
-                   ctx->clock_sample_pts, sample.pts, (double)new_ns / 1e9,
-                   ctx->clock_jump_suppressed - 1);
-        ctx->last_clock_jump_log_ns = jump_now;
-        ctx->clock_jump_suppressed = 0;
-      }
-      return;
-    }
+  if (!clock_sample_plausible_locked(ctx, raw_ns, new_ns))
+    return;
 
+  bool had_clock = ctx->clock_sample_valid;
+  int64_t old_ns = INT64_MIN;
+  if (had_clock) {
+    old_ns = (int64_t)llround(ctx->clock_sample_pts * 1e9);
+    if (new_ns + CLOCK_BACKWARD_TOLERANCE_NS < old_ns) {
+      if (clock_ahead_of_fed_video_locked(ctx, old_ns)) {
+        mp_warn(ctx->log,
+                "Starfish replacing stale accepted clock old=%.3f new=%.3f "
+                "fed_v=%.3f\n",
+                (double)old_ns / 1e9, (double)new_ns / 1e9,
+                ns_to_sec_or_neg(ctx->fed_video_pts_ns));
+        ctx->clock_sample_valid = false;
+        ctx->clock_export_ready = false;
+        ctx->clock_stability_probe_pts_ns = INT64_MIN;
+        ctx->clock_stability_probe_host_ns = 0;
+        had_clock = false;
+      } else {
+        const int64_t jump_now = mp_time_ns();
+        ctx->clock_jump_suppressed++;
+        if (!ctx->last_clock_jump_log_ns ||
+            jump_now - ctx->last_clock_jump_log_ns >= WORKER_STATUS_PERIOD_NS) {
+          mp_verbose(ctx->log,
+                     "Starfish mapped clock jumped back old_mapped=%.3f "
+                     "raw_new=%.3f mapped_new=%.3f suppressed=%d\n",
+                     ctx->clock_sample_pts, sample.pts, (double)new_ns / 1e9,
+                     ctx->clock_jump_suppressed - 1);
+          ctx->last_clock_jump_log_ns = jump_now;
+          ctx->clock_jump_suppressed = 0;
+        }
+        return;
+      }
+    }
+  }
+
+  if (had_clock) {
     if (!ctx->clock_export_ready) {
       if (ctx->clock_stability_probe_pts_ns == INT64_MIN ||
           ctx->clock_stability_probe_host_ns <= 0 ||
