@@ -41,6 +41,7 @@ struct priv {
   bool input_eof;
   bool sent_eof;
   bool sent_initial_geometry;
+  bool emitted_output;
   bool allow_initial_geometry;
   bool wait_for_keyframe;
   bool pending_ctx_flush;
@@ -174,6 +175,7 @@ static void output_ready_frame(struct mp_filter *f) {
   mpi->pkt_duration = frame.duration;
   mpi->nominal_fps = starfish_ctx_get_video_fps(p->ctx);
 
+  p->emitted_output = true;
   mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, mpi));
 }
 
@@ -201,6 +203,7 @@ static void output_initial_geometry_frame(struct mp_filter *f) {
   mpi->nominal_fps = starfish_ctx_get_video_fps(p->ctx);
 
   p->sent_initial_geometry = true;
+  p->emitted_output = true;
   MP_INFO(p, "vd_starfish emitted reset geometry frame %dx%d pts=%f\n",
           width, height, mpi->pts);
   mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, mpi));
@@ -772,7 +775,7 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
     return CONTROL_TRUE;
   case VDCTRL_SET_START_PTS:
     p->start_pts = *(double *)arg;
-    p->allow_initial_geometry = true;
+    p->allow_initial_geometry = !p->emitted_output;
     p->sent_initial_geometry = false;
     if (p->pending_ctx_flush) {
       MP_INFO(p, "vd_starfish flushing Starfish for start pts=%f\n",
@@ -792,6 +795,13 @@ static int control(struct mp_filter *f, enum dec_ctrl cmd, void *arg) {
 }
 
 static void vd_starfish_process(struct mp_filter *f) {
+  struct priv *p = f->priv;
+  if (starfish_ctx_is_failed(p->ctx)) {
+    MP_ERR(p, "vd_starfish: Starfish pipeline failed\n");
+    mp_filter_internal_mark_failed(f);
+    return;
+  }
+
   process_input(f);
   output_initial_geometry_frame(f);
   if (feed_pending(f))

@@ -59,9 +59,14 @@ enum {
 #define STARFISH_AUDIO_SYNC_TRANSIENT_THRESHOLD 0.060
 #define STARFISH_AUDIO_SYNC_LARGE_TRANSIENT_MAX 0.010
 #define STARFISH_AUDIO_SYNC_LARGE_TRANSIENT_THRESHOLD 0.200
+#define STARFISH_AUDIO_SYNC_HARD_REALIGN_THRESHOLD 0.350
+#define STARFISH_AUDIO_SYNC_HARD_REALIGN_COOLDOWN_NS (2000LL * 1000 * 1000)
+#define STARFISH_AUDIO_START_REALIGN_THRESHOLD 0.080
 
 static void ao_process(struct mp_filter *f);
 static void reset_starfish_audio_sync(struct MPContext *mpctx);
+static bool starfish_split_clock(struct MPContext *mpctx);
+static void realign_starfish_audio_start(struct MPContext *mpctx, double pts);
 
 static void update_speed_filters(struct MPContext *mpctx)
 {
@@ -254,6 +259,10 @@ void reset_audio_state(struct MPContext *mpctx)
     mpctx->delay = 0;
     mpctx->logged_async_diff = -1;
     mpctx->starfish_audio_start_bias = 0;
+    mpctx->starfish_audio_sync_last_realign_ns = 0;
+    mpctx->starfish_audio_clock_wait_start_ns = 0;
+    mpctx->starfish_audio_clock_wait_logged = false;
+    mpctx->starfish_audio_sync_resync_pending = false;
     reset_starfish_audio_sync(mpctx);
 }
 
@@ -877,6 +886,17 @@ static void reset_starfish_audio_sync(struct MPContext *mpctx)
     }
 }
 
+void mark_starfish_audio_sync_seek(struct MPContext *mpctx)
+{
+    if (starfish_split_clock(mpctx)) {
+        mpctx->starfish_audio_sync_resync_pending = true;
+        mpctx->starfish_audio_sync_last_realign_ns = 0;
+        mpctx->starfish_audio_clock_wait_start_ns = 0;
+        mpctx->starfish_audio_clock_wait_logged = false;
+        reset_starfish_audio_sync(mpctx);
+    }
+}
+
 static void sync_alsa_to_starfish_clock(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -910,17 +930,24 @@ static void sync_alsa_to_starfish_clock(struct MPContext *mpctx)
         return;
     }
 
-    if (!mpctx->starfish_audio_sync_start_ns) {
-        mpctx->starfish_audio_sync_start_ns = now;
-        mpctx->starfish_audio_sync_last_ns = now;
-        mp_set_timeout(mpctx, MP_TIME_NS_TO_S(STARFISH_AUDIO_SYNC_PERIOD_NS));
-        return;
+    double av_diff = audio_pts - video_pts + opts->audio_delay;
+    if (mpctx->starfish_audio_sync_resync_pending) {
+        MP_VERBOSE(mpctx,
+                   "Starfish ALSA post-seek sync check audio=%f video=%f diff=%f\n",
+                   audio_pts, video_pts, av_diff);
+        mpctx->starfish_audio_sync_resync_pending = false;
     }
 
     double elapsed = mpctx->starfish_audio_sync_last_ns
         ? MP_TIME_NS_TO_S(now - mpctx->starfish_audio_sync_last_ns)
         : MP_TIME_NS_TO_S(STARFISH_AUDIO_SYNC_PERIOD_NS);
     mpctx->starfish_audio_sync_last_ns = now;
+
+    if (!mpctx->starfish_audio_sync_start_ns) {
+        mpctx->starfish_audio_sync_start_ns = now;
+        mp_set_timeout(mpctx, MP_TIME_NS_TO_S(STARFISH_AUDIO_SYNC_PERIOD_NS));
+        return;
+    }
 
     if (now - mpctx->starfish_audio_sync_start_ns < STARFISH_AUDIO_SYNC_SETTLE_NS)
     {
@@ -943,7 +970,20 @@ static void sync_alsa_to_starfish_clock(struct MPContext *mpctx)
         return;
     }
 
-    double av_diff = audio_pts - video_pts + opts->audio_delay;
+    if (fabs(av_diff) >= STARFISH_AUDIO_SYNC_HARD_REALIGN_THRESHOLD &&
+        (!mpctx->starfish_audio_sync_last_realign_ns ||
+         now - mpctx->starfish_audio_sync_last_realign_ns >=
+             STARFISH_AUDIO_SYNC_HARD_REALIGN_COOLDOWN_NS))
+    {
+        double target = video_pts - opts->audio_delay +
+                        mpctx->starfish_audio_start_bias;
+        MP_WARN(mpctx,
+                "Starfish ALSA hard realign audio=%f video=%f diff=%f target=%f\n",
+                audio_pts, video_pts, av_diff, target);
+        mpctx->starfish_audio_sync_last_realign_ns = now;
+        realign_starfish_audio_start(mpctx, target);
+        return;
+    }
 
     double alpha = elapsed / (STARFISH_AUDIO_SYNC_FILTER_TIME + elapsed);
     mpctx->starfish_audio_sync_avd_filtered +=
@@ -1061,6 +1101,33 @@ static bool get_sync_pts(struct MPContext *mpctx, double *pts,
     return true;
 }
 
+static void realign_starfish_audio_start(struct MPContext *mpctx, double pts)
+{
+    struct ao_chain *ao_c = mpctx->ao_chain;
+    if (!ao_c || !ao_c->ao)
+        return;
+
+    MP_VERBOSE(mpctx, "Starfish ALSA reclip queued audio to %f\n", pts);
+    ao_reset(ao_c->ao);
+    ao_chain_reset_state(ao_c);
+    ao_c->start_pts_known = true;
+    ao_c->start_pts = pts;
+    mpctx->audio_status = STATUS_SYNCING;
+    mpctx->delay = 0;
+    mpctx->last_av_difference = 0;
+    mpctx->logged_async_diff = -1;
+    mpctx->starfish_audio_sync_last_ns = 0;
+    mpctx->starfish_audio_sync_last_log_ns = 0;
+    mpctx->starfish_audio_sync_start_ns = 0;
+    mpctx->starfish_audio_sync_avd_filtered = 0;
+    if (!mpctx->display_sync_active && mpctx->speed_factor_a != 1.0) {
+        mpctx->speed_factor_a = 1.0;
+        update_playback_speed(mpctx);
+    }
+    mp_filter_wakeup(ao_c->ao_filter);
+    mp_wakeup_core(mpctx);
+}
+
 // Look whether audio can be started yet - if audio has to start some time
 // after video.
 // Caller needs to ensure mpctx->restart_complete is OK
@@ -1069,11 +1136,31 @@ void audio_start_ao(struct MPContext *mpctx)
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (!ao_c || !ao_c->ao || mpctx->audio_status != STATUS_READY)
         return;
+    bool split_clock = starfish_split_clock(mpctx) &&
+                       mpctx->video_status != STATUS_EOF;
     double pts = MP_NOPTS_VALUE;
-    if (!get_sync_pts(mpctx, &pts, true))
+    if (split_clock) {
+        if (!get_sync_pts(mpctx, &pts, true)) {
+            int64_t now = mp_time_ns();
+            if (!mpctx->starfish_audio_clock_wait_start_ns)
+                mpctx->starfish_audio_clock_wait_start_ns = now;
+
+            if (!mpctx->starfish_audio_clock_wait_logged) {
+                MP_VERBOSE(mpctx,
+                           "waiting for stable Starfish video clock before ALSA start\n");
+                mpctx->starfish_audio_clock_wait_logged = true;
+            }
+            mp_set_timeout(mpctx, MP_TIME_NS_TO_S(STARFISH_AUDIO_SYNC_PERIOD_NS));
+            return;
+        }
+        mpctx->starfish_audio_clock_wait_start_ns = 0;
+        mpctx->starfish_audio_clock_wait_logged = false;
+    } else if (!get_sync_pts(mpctx, &pts, false)) {
         return;
+    }
+
     double desired_pts = pts;
-    if (starfish_split_clock(mpctx) && mpctx->video_status != STATUS_EOF) {
+    if (split_clock) {
         double external_pts = MP_NOPTS_VALUE;
         if (query_external_video_clock(mpctx, &external_pts))
             desired_pts = external_pts - mpctx->opts->audio_delay;
@@ -1081,6 +1168,13 @@ void audio_start_ao(struct MPContext *mpctx)
             desired_pts = pts - mpctx->starfish_audio_start_bias;
     }
     double apts = playing_audio_pts(mpctx);
+    if (split_clock && desired_pts != MP_NOPTS_VALUE &&
+        apts != MP_NOPTS_VALUE && desired_pts > apts &&
+        desired_pts - apts > STARFISH_AUDIO_START_REALIGN_THRESHOLD)
+    {
+        realign_starfish_audio_start(mpctx, desired_pts);
+        return;
+    }
     if (desired_pts != MP_NOPTS_VALUE && apts != MP_NOPTS_VALUE &&
         desired_pts < apts && mpctx->video_status != STATUS_EOF)
     {
@@ -1099,6 +1193,10 @@ void audio_start_ao(struct MPContext *mpctx)
     MP_VERBOSE(mpctx, "starting audio playback\n");
     ao_c->delaying_audio_start = false;
     ao_start(ao_c->ao);
+    mpctx->starfish_audio_clock_wait_start_ns = 0;
+    mpctx->starfish_audio_clock_wait_logged = false;
+    if (!split_clock)
+        mpctx->starfish_audio_sync_resync_pending = false;
     mpctx->audio_status = STATUS_PLAYING;
     if (ao_c->out_eof) {
         mpctx->audio_status = STATUS_DRAINING;

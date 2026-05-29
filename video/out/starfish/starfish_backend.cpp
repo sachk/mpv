@@ -6,6 +6,8 @@
 
 #include "starfish_backend.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <inttypes.h>
 #include <memory>
@@ -27,42 +29,114 @@ namespace {
 std::mutex g_prime_lock;
 std::unique_ptr<StarfishMediaAPIs> g_primed_media;
 
+constexpr int64_t kSdkSlowCallNs = 50LL * 1000 * 1000;
+
+bool sdk_verbose_call_logging()
+{
+    const char *value = getenv("STARFISH_SDK_CALL_LOG");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+bool sdk_call_is_chatty(const char *what)
+{
+    return what && (strcmp(what, "Feed") == 0 ||
+                    strcmp(what, "getCurrentPlaytime") == 0);
+}
+
+bool sdk_call_use_trace(const char *what)
+{
+    return sdk_call_is_chatty(what) && !sdk_verbose_call_logging();
+}
+
+void log_sdk_call_begin(struct mp_log *log, const char *what)
+{
+    if (sdk_call_use_trace(what))
+        mp_trace(log, "Starfish SDK begin %s\n", what ? what : "(unknown)");
+    else
+        mp_info(log, "Starfish SDK begin %s\n", what ? what : "(unknown)");
+}
+
+void log_sdk_call_end(struct mp_log *log, const char *what, int64_t start_ns,
+                      bool ok)
+{
+    const int64_t elapsed_ns = mp_time_ns() - start_ns;
+    if (sdk_call_use_trace(what)) {
+        mp_trace(log, "Starfish SDK end %s ok=%d duration=%.1fms\n",
+                 what ? what : "(unknown)", ok, elapsed_ns / 1e6);
+    } else {
+        mp_info(log, "Starfish SDK end %s ok=%d duration=%.1fms\n",
+                what ? what : "(unknown)", ok, elapsed_ns / 1e6);
+    }
+    if (elapsed_ns > kSdkSlowCallNs) {
+        mp_warn(log, "Starfish SDK slow %s ok=%d duration=%.1fms\n",
+                what ? what : "(unknown)", ok, elapsed_ns / 1e6);
+    }
+}
+
 template <typename F>
 bool try_bool(struct mp_log *log, const char *what, F &&fn)
 {
+    const int64_t start_ns = mp_time_ns();
+    log_sdk_call_begin(log, what);
+    bool ok = false;
     try {
-        return fn();
+        ok = fn();
     } catch (const std::exception &e) {
         mp_err(log, "Starfish %s threw: %s\n", what, e.what());
     } catch (...) {
         mp_err(log, "Starfish %s threw unknown exception\n", what);
     }
-    return false;
+    log_sdk_call_end(log, what, start_ns, ok);
+    return ok;
 }
 
 template <typename F>
 std::string try_string(struct mp_log *log, const char *what, F &&fn)
 {
+    const int64_t start_ns = mp_time_ns();
+    log_sdk_call_begin(log, what);
+    std::string result;
     try {
-        return fn();
+        result = fn();
     } catch (const std::exception &e) {
         mp_err(log, "Starfish %s threw: %s\n", what, e.what());
     } catch (...) {
         mp_err(log, "Starfish %s threw unknown exception\n", what);
     }
-    return std::string();
+    log_sdk_call_end(log, what, start_ns, !result.empty());
+    return result;
 }
 
 std::unique_ptr<StarfishMediaAPIs> make_media(struct mp_log *log)
 {
-    try {
-        return std::make_unique<StarfishMediaAPIs>();
-    } catch (const std::exception &e) {
-        if (log)
-            mp_err(log, "StarfishMediaAPIs allocation threw: %s\n", e.what());
-    } catch (...) {
-        if (log)
-            mp_err(log, "StarfishMediaAPIs allocation threw unknown exception\n");
+    // StarfishMediaAPIs' constructor creates a ResourceManagerClient that does
+    // an anonymous LS2 registration (LSRegisterPubPriv). When the app is
+    // relaunched quickly -- or a prior playback's pipeline is torn down right
+    // before a new one starts -- the previous registration may not be reaped by
+    // the LS2 hub yet, so the constructor throws "LSRegisterPubPriv FAILED".
+    // With no retry that turned into a permanent black screen for the launch.
+    // The deregistration race clears in well under a second once the old
+    // client's socket is reaped, so retry a few times with a short backoff
+    // before giving up.
+    constexpr int kMaxAttempts = 6;
+    constexpr int64_t kBackoffNs = 150LL * 1000 * 1000; // 150 ms
+    for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+        try {
+            return std::make_unique<StarfishMediaAPIs>();
+        } catch (const std::exception &e) {
+            if (log)
+                mp_err(log,
+                       "StarfishMediaAPIs allocation threw (attempt %d/%d): %s\n",
+                       attempt, kMaxAttempts, e.what());
+        } catch (...) {
+            if (log)
+                mp_err(log,
+                       "StarfishMediaAPIs allocation threw unknown exception "
+                       "(attempt %d/%d)\n",
+                       attempt, kMaxAttempts);
+        }
+        if (attempt < kMaxAttempts)
+            mp_sleep_ns(kBackoffNs);
     }
     return nullptr;
 }
@@ -242,16 +316,21 @@ bool sf_backend_set_time_to_decode(struct sf_backend *b, int64_t pts_ns)
     if (!pipeline)
         return false;
 
+    const int64_t fallback_start_ns = mp_time_ns();
+    log_sdk_call_begin(b->log, "setTimeToDecodeFallback");
+    bool fallback_ok = false;
     try {
         MEDIA_CUSTOM_CONTENT_INFO_T info;
         pipeline->loadSpi_getInfo(&info);
         info.ptsToDecode = pts_ns;
         pipeline->setContentInfo(MEDIA_CUSTOM_SRC_TYPE_ES, &info);
-        return true;
+        fallback_ok = true;
     } catch (...) {
         mp_warn(b->log, "Starfish setTimeToDecode fallback failed\n");
-        return false;
     }
+    log_sdk_call_end(b->log, "setTimeToDecodeFallback", fallback_start_ns,
+                     fallback_ok);
+    return fallback_ok;
 }
 
 bool sf_backend_send_segment_event(struct sf_backend *b)
@@ -332,17 +411,23 @@ bool sf_backend_get_current_playtime(struct sf_backend *b,
         return false;
 
     const int64_t before = mp_time_ns();
+    log_sdk_call_begin(b->log, "getCurrentPlaytime");
     int64_t playtime_ns = -1;
+    bool ok = false;
     try {
         playtime_ns = b->media->getCurrentPlaytime();
+        ok = playtime_ns >= 0;
     } catch (const std::exception &e) {
         mp_warn(b->log, "Starfish getCurrentPlaytime threw: %s\n", e.what());
+        log_sdk_call_end(b->log, "getCurrentPlaytime", before, false);
         return false;
     } catch (...) {
         mp_warn(b->log, "Starfish getCurrentPlaytime threw unknown exception\n");
+        log_sdk_call_end(b->log, "getCurrentPlaytime", before, false);
         return false;
     }
     const int64_t after = mp_time_ns();
+    log_sdk_call_end(b->log, "getCurrentPlaytime", before, ok);
     if (playtime_ns < 0)
         return false;
 
