@@ -1083,6 +1083,19 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
     queued_total = p->buffered_samples + p->pending_samples + queued_fifo;
     active_audio_delay_locked(ao);
 
+    if (p->needs_sync) {
+        // A seek/reset can leave Starfish needing the next video segment to
+        // choose the exact timeline PTS. While waiting for that segment-prime
+        // callback, report a blocked-but-playing AO so mpv keeps feeding video
+        // instead of treating the deliberate audio gap as a device underrun.
+        state->queued_samples = MPMAX(p->latency_samples, p->frame_samples);
+        state->free_samples = 0;
+        state->delay = state->queued_samples / ao->samplerate;
+        state->playing = p->playing && !p->paused;
+        pthread_mutex_unlock(&p->lock);
+        return;
+    }
+
     state->queued_samples = queued_total;
     state->free_samples = MPMAX(ao->device_buffer - p->latency_samples -
                                 state->queued_samples, 0);
@@ -1092,8 +1105,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
     if (p->audio_delay_pending)
         state->free_samples = 0;
     state->delay = queued_total / ao->samplerate;
-    state->playing = p->playing && !p->paused && !p->needs_sync &&
-                     queued_total > 0;
+    state->playing = p->playing && !p->paused && queued_total > 0;
     pthread_mutex_unlock(&p->lock);
 }
 
