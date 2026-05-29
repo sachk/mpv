@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "config.h"
 #include "client.h"
 #include "command.h"
 #include "core.h"
@@ -49,6 +50,9 @@
 #include "sub/dec_sub.h"
 #include "sub/osd.h"
 #include "video/out/vo.h"
+#if HAVE_STARFISH
+#include "video/out/starfish/starfish_ctx.h"
+#endif
 
 #define STARFISH_OSD_FALLBACK_FRAME_INTERVAL_NS (33LL * 1000 * 1000)
 #define STARFISH_OSD_LOG_INTERVAL_NS (5000LL * 1000 * 1000)
@@ -122,9 +126,33 @@ static bool is_alsa_audio_out(struct MPContext *mpctx)
     return name && strcmp(name, "alsa") == 0;
 }
 
+static bool is_starfish_audio_out(struct MPContext *mpctx)
+{
+    const char *name = mpctx->ao ? ao_get_name(mpctx->ao) : NULL;
+    return name && strcmp(name, "starfish") == 0;
+}
+
 static bool starfish_split_clock(struct MPContext *mpctx)
 {
     return is_starfish_video_out(mpctx) && is_alsa_audio_out(mpctx);
+}
+
+static void prime_starfish_seek_target_before_audio_reset(struct MPContext *mpctx,
+                                                          double seek_pts)
+{
+#if HAVE_STARFISH
+    if (!is_starfish_video_out(mpctx) || !is_starfish_audio_out(mpctx) ||
+        seek_pts == MP_NOPTS_VALUE)
+        return;
+
+    struct starfish_ctx *ctx = starfish_ctx_get_current();
+    if (!ctx)
+        return;
+    starfish_ctx_set_seek_target(ctx, seek_pts);
+    starfish_ctx_unref(ctx);
+    MP_VERBOSE(mpctx, "Starfish AO seek target primed before audio reset pts=%f\n",
+               seek_pts);
+#endif
 }
 
 static void release_starfish_video_for_audio_clock(struct MPContext *mpctx)
@@ -458,8 +486,10 @@ static void mp_seek(MPContext *mpctx, struct seek_params seek)
         }
     }
 
-    if (!(seek.flags & MPSEEK_FLAG_NOFLUSH))
+    if (!(seek.flags & MPSEEK_FLAG_NOFLUSH)) {
+        prime_starfish_seek_target_before_audio_reset(mpctx, seek_pts);
         clear_audio_output_buffers(mpctx);
+    }
 
     reset_playback_state(mpctx);
 
