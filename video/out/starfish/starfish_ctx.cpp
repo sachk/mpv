@@ -1336,6 +1336,24 @@ static bool clock_sample_plausible_locked(starfish_ctx *ctx, int64_t raw_ns,
   return true;
 }
 
+static int64_t accept_clock_sample_locked(starfish_ctx *ctx, int64_t pts_ns,
+                                          int64_t host_time_ns,
+                                          const char *source) {
+  if (ctx->clock_sample_valid) {
+    const int64_t old_ns = (int64_t)llround(ctx->clock_sample_pts * 1e9);
+    if (pts_ns < old_ns)
+      pts_ns = old_ns;
+  }
+
+  ctx->clock_sample_valid = true;
+  ctx->clock_sample_pts = (double)pts_ns / 1e9;
+  ctx->clock_sample_host_ns = host_time_ns;
+  note_video_clock_reached_locked(ctx, pts_ns, host_time_ns, source);
+  if (pts_ns > ctx->current_pts_ns)
+    ctx->current_pts_ns = pts_ns;
+  return pts_ns;
+}
+
 static void sample_clock_if_due(starfish_ctx *ctx,
                                 std::unique_lock<std::mutex> &lk) {
   if (ctx->state != pipeline_state::PLAYING || !ctx->started)
@@ -1359,7 +1377,7 @@ static void sample_clock_if_due(starfish_ctx *ctx,
     return;
   }
   const int64_t raw_ns = (int64_t)llround(sample.pts * 1e9);
-  const int64_t new_ns = map_starfish_raw_to_media_locked(ctx, raw_ns);
+  int64_t new_ns = map_starfish_raw_to_media_locked(ctx, raw_ns);
   if (!clock_sample_plausible_locked(ctx, raw_ns, new_ns))
     return;
 
@@ -1395,6 +1413,8 @@ static void sample_clock_if_due(starfish_ctx *ctx,
         return;
       }
     }
+    if (new_ns < old_ns)
+      new_ns = old_ns;
   }
 
   if (had_clock) {
@@ -1430,12 +1450,7 @@ static void sample_clock_if_due(starfish_ctx *ctx,
     ctx->clock_stability_probe_pts_ns = new_ns;
     ctx->clock_stability_probe_host_ns = sample.host_time_ns;
   }
-  ctx->clock_sample_valid = true;
-  ctx->clock_sample_pts = (double)new_ns / 1e9;
-  ctx->clock_sample_host_ns = sample.host_time_ns;
-  note_video_clock_reached_locked(ctx, new_ns, sample.host_time_ns, "clock");
-  if (new_ns > ctx->current_pts_ns)
-    ctx->current_pts_ns = new_ns;
+  new_ns = accept_clock_sample_locked(ctx, new_ns, sample.host_time_ns, "clock");
   if (ctx->log_next_clock_sample) {
     mp_info(ctx->log,
             "Starfish clock sample raw=%.3f mapped=%.3f videoDelay=%.1fms query=%.1fms\n",
@@ -1509,12 +1524,7 @@ static bool pending_ready_matches_clock_locked(
     return false;
   }
 
-  ctx->clock_sample_valid = true;
-  ctx->clock_sample_pts = (double)clock_ns / 1e9;
-  ctx->clock_sample_host_ns = clock_host_ns;
-  note_video_clock_reached_locked(ctx, clock_ns, clock_host_ns, "clock");
-  if (clock_ns > ctx->current_pts_ns)
-    ctx->current_pts_ns = clock_ns;
+  clock_ns = accept_clock_sample_locked(ctx, clock_ns, clock_host_ns, "clock");
   if (clock_ns != *ready_ns) {
     mp_info(ctx->log,
             "Starfish using clock for pending %s ready packet=%.3f clock=%.3f\n",
@@ -1786,8 +1796,9 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
       break;
     if (ctx->min_ready_pts_ns != INT64_MIN &&
         mapped + STALE_READY_TOLERANCE_NS < ctx->min_ready_pts_ns) {
-      ctx->current_pts_ns = mapped;
-      ctx->started = false;
+      mp_info(ctx->log,
+              "Starfish dropping stale ready frame mapped=%.3f min=%.3f\n",
+              (double)mapped / 1e9, (double)ctx->min_ready_pts_ns / 1e9);
       break;
     }
     if (ctx->fed_video_pts_ns != INT64_MIN &&
@@ -2672,6 +2683,29 @@ bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx, double *pts,
     }
   }
   return false;
+}
+
+bool starfish_ctx_get_osd_pts(struct starfish_ctx *ctx, double *pts) {
+  if (!ctx || !pts)
+    return false;
+  std::lock_guard<std::mutex> lk(ctx->lock);
+
+  if (ctx->state == pipeline_state::PAUSED && ctx->started &&
+      ctx->current_pts_ns != INT64_MIN) {
+    *pts = (double)ctx->current_pts_ns / 1e9;
+    return true;
+  }
+
+  if (ctx->state != pipeline_state::PLAYING || !ctx->started ||
+      !ctx->clock_export_ready)
+    return false;
+
+  const int64_t projected = project_fresh_clock_locked(ctx, mp_time_ns());
+  if (projected == INT64_MIN)
+    return false;
+
+  *pts = (double)projected / 1e9;
+  return *pts != MP_NOPTS_VALUE && std::isfinite(*pts);
 }
 
 } // extern "C"

@@ -136,6 +136,11 @@ STARFISH_CTX_API double starfish_ctx_get_video_fps(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_current_pts(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx);
 
+// Stable presentation PTS for subtitle/OSD rendering. Returns false while the
+// Starfish clock is not trustworthy enough to choose a subtitle event.
+STARFISH_CTX_API bool starfish_ctx_get_osd_pts(struct starfish_ctx *ctx,
+                                               double *pts);
+
 // Real Starfish video-master clock. The session worker samples
 // StarfishMediaAPIs::getCurrentPlaytime() periodically; this returns the most
 // recent valid sample without blocking on the SDK. Returns false during
