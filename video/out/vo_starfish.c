@@ -53,8 +53,6 @@ struct priv {
     size_t callback_size;
     int callback_stride;
     struct mp_image_params target_params;
-    double last_osd_pts;
-    bool have_osd_pts;
     int logged_osd_pixels;
     bool have_osd_alpha_state;
     bool last_osd_has_pixels;
@@ -408,6 +406,16 @@ static bool apply_video_geometry(struct vo *vo, const char *reason)
     return true;
 }
 
+static double get_osd_pts(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    double pts = MP_NOPTS_VALUE;
+
+    if (!starfish_ctx_get_osd_pts(p->ctx, &pts) || !isfinite(pts))
+        return MP_NOPTS_VALUE;
+    return pts;
+}
+
 static void render_osd_surface(struct vo *vo, double pts)
 {
     struct priv *p = vo->priv;
@@ -647,32 +655,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         p->next_image = mp_image_new_ref(frame->current);
     apply_video_geometry(vo, "draw");
     map_video_surface(vo);
-    double osd_pts = starfish_ctx_get_current_pts(p->ctx);
-    if (osd_pts == MP_NOPTS_VALUE || !isfinite(osd_pts))
-        osd_pts = p->have_osd_pts ? p->last_osd_pts : 0;
-    else {
-        p->last_osd_pts = osd_pts;
-        p->have_osd_pts = true;
-    }
-    render_osd_surface(vo, osd_pts);
+    render_osd_surface(vo, get_osd_pts(vo));
     return VO_TRUE;
 }
 
 static void redraw_osd(struct vo *vo)
 {
-    struct priv *p = vo->priv;
-    double osd_pts = starfish_ctx_get_current_pts(p->ctx);
-
-    if (osd_pts == MP_NOPTS_VALUE || !isfinite(osd_pts))
-        osd_pts = p->have_osd_pts ? p->last_osd_pts : 0;
-    else {
-        p->last_osd_pts = osd_pts;
-        p->have_osd_pts = true;
-    }
-
     apply_video_geometry(vo, "redraw");
     map_video_surface(vo);
-    render_osd_surface(vo, osd_pts);
+    render_osd_surface(vo, get_osd_pts(vo));
     flip_page(vo);
 }
 
