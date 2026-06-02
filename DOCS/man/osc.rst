@@ -368,6 +368,16 @@ Configurable Options
     The list of visibility modes to cycle through when calling the
     osc-visibility cycle script message. Modes are separated by ``_``.
 
+``boxwidth``
+    Default: 550
+
+    Width of the ``box`` layout.
+
+``slimboxwidth``
+    Default: 660
+
+    Width of the ``slimbox`` layout.
+
 ``boxmaxchars``
     Default: 80
 
@@ -767,9 +777,7 @@ script via the following ``user-data`` properties:
 
 ``user-data/osc/draw-preview``
     Set by the OSC to request a thumbnail within the currently playing file.
-    The requested thumbnail timestamp in seconds is set in
-    ``user-data/osc/hover-sec``. The ``draw-preview`` property is a table with
-    the following fields:
+    The ``draw-preview`` property is a table with the following fields:
 
     ``x``, ``y``
         Top-left coordinates (positive integers) to draw the thumbnail at.
@@ -778,6 +786,9 @@ script via the following ``user-data`` properties:
         Width and height (positive non-zero integers) of the area to draw the
         thumbnail in. Note that this only specifies the drawing width and
         height, the actual backing thumbnail size may differ.
+
+    ``hover-sec``
+        Requested thumbnail timestamp in seconds.
 
     ``ass``
         Optional ASS string to render alongside the thumbnail, using OSD

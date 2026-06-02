@@ -40,6 +40,7 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 500M
+      DOWNLOAD_CACHE: ${{ github.workspace }}/.ccache/downloads
       TARGET: ${{ matrix.arch }}-w64-mingw32
       RUST_TARGET: ${{ matrix.arch }}-pc-windows-gnu
     strategy:
@@ -310,7 +311,7 @@ jobs:
             brew update
           fi
           if brew list ffmpeg &> /dev/null; then brew unlink ffmpeg; fi
-          brew install -q autoconf automake pkgconf libtool python freetype fribidi little-cms2 \
+          brew install -q autoconf automake curl pkgconf libtool python freetype fribidi little-cms2 \
             luajit libass ffmpeg-full meson rust uchardet mujs libplacebo molten-vk vulkan-loader vulkan-headers \
             libarchive libbluray libcaca libcdio-paranoia libdvdnav rubberband zimg
           brew link ffmpeg-full
@@ -439,6 +440,7 @@ jobs:
           apk update
           apk add \
               binutils \
+              curl-dev \
               ffmpeg-dev \
               gcc \
               git \
@@ -486,13 +488,14 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Test in OpenBSD VM
-      uses: cross-platform-actions/action@v1.0.0
+      uses: cross-platform-actions/action@v1.1.0
       with:
         operating_system: openbsd
         version: '7.8'
         run: |
             sudo pkg_add -U \
                 cmake \
+                curl \
                 ffmpeg \
                 git \
                 libarchive \
@@ -532,7 +535,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Test in FreeBSD VM
-      uses: cross-platform-actions/action@v1.0.0
+      uses: cross-platform-actions/action@v1.1.0
       with:
         operating_system: freebsd
         version: '15.0'
@@ -541,6 +544,7 @@ jobs:
             sudo pkg install -y \
                 alsa-lib \
                 cmake \
+                curl \
                 evdev-proto \
                 ffmpeg \
                 git \
@@ -625,6 +629,7 @@ jobs:
             ca-certificates:p
             cc:p
             cppwinrt:p
+            curl:p
             ffmpeg:p
             lcms2:p
             libarchive:p
@@ -665,6 +670,8 @@ jobs:
         id: tests
         run: |
           meson test -C build
+        env:
+          GGML_NO_BACKTRACE: 1
 
       - name: Print meson test log
         if: ${{ failure() && steps.tests.outcome == 'failure' }}

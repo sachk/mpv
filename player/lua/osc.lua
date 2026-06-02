@@ -46,6 +46,8 @@ local user_opts = {
     tcspace = 100,              -- timecode spacing (compensate font size estimation)
     visibility = "auto",        -- only used at init to set visibility_mode(...)
     visibility_modes = "never_auto_always", -- visibility modes to cycle through
+    boxwidth = 550,             -- width of the box layout
+    slimboxwidth = 660,         -- width of the slimbox layout
     boxmaxchars = 80,           -- title crop threshold for box layout
     boxvideo = false,           -- apply osc_param.video_margins to video
     dynamic_margins = false,    -- update margins dynamically with OSC visibility
@@ -1257,6 +1259,7 @@ local function render_elements(master_ass)
                         local thumb_req = {
                             x = math.floor(thumb_x + 0.5), y = math.floor(thumb_y + 0.5),
                             w = math.floor(thumb_w + 0.5), h = math.floor(thumb_h + 0.5),
+                            ["hover-sec"] = hover_sec,
                         }
 
                         local thumb_ass = assdraw.ass_new()
@@ -1575,10 +1578,10 @@ end
 layouts["box"] = function ()
 
     local osc_geo = {
-        w = 550,    -- width
-        h = 138,    -- height
-        r = 10,     -- corner-radius
-        p = 15,     -- padding
+        w = user_opts.boxwidth,    -- width
+        h = 138,                   -- height
+        r = 10,                    -- corner-radius
+        p = 15,                    -- padding
     }
 
     -- make sure the OSC actually fits into the video
@@ -1750,9 +1753,9 @@ end
 layouts["slimbox"] = function ()
 
     local osc_geo = {
-        w = 660,    -- width
-        h = 70,     -- height
-        r = 10,     -- corner-radius
+        w = user_opts.slimboxwidth,    -- width
+        h = 70,                        -- height
+        r = 10,                        -- corner-radius
     }
 
     -- make sure the OSC actually fits into the video
@@ -2616,7 +2619,7 @@ local function osc_init()
     -- tc_right (total/remaining time)
     ne = new_element("tc_right", "button")
 
-    ne.visible = state.duration ~= nil
+    ne.visible = state.duration and state.duration > 0
     ne.content = function ()
         if state.rightTC_trem then
             local minus = user_opts.unicodeminus and UNICODE_MINUS or "-"
