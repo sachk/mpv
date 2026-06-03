@@ -107,15 +107,43 @@ struct mpv_render_context {
     // --- All of these can only be accessed from mpv_render_*() API, for
     //     which the user makes sure they're called synchronized.
     struct render_backend *renderer;
+    char *render_api_type;
     struct m_config_cache *vo_opts_cache;
     struct mp_vo_opts *vo_opts;
 };
 
-const struct render_backend_fns *render_backends[] = {
+static const struct render_backend_fns *render_backends[] = {
     &render_backend_gpu,
     &render_backend_sw,
     NULL
 };
+
+static const struct render_backend_fns *render_backends_gpu[] = {
+    &render_backend_gpu,
+    NULL
+};
+
+static const struct render_backend_fns *render_backends_gpu_next[] = {
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    &render_backend_gpu_next,
+#endif
+    NULL
+};
+
+static const struct render_backend_fns **select_render_backends(
+    struct mpv_render_context *ctx, mpv_render_param *params)
+{
+    char *backend = get_mpv_render_param(params, MPV_RENDER_PARAM_BACKEND, NULL);
+    if (!backend || !backend[0])
+        return render_backends;
+    if (strcmp(backend, "gpu") == 0)
+        return render_backends_gpu;
+    if (strcmp(backend, "gpu-next") == 0)
+        return render_backends_gpu_next;
+
+    MP_ERR(ctx, "Unknown render backend '%s'.\n", backend);
+    return NULL;
+}
 
 static void update(struct mpv_render_context *ctx)
 {
@@ -184,13 +212,19 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_ADVANCED_CONTROL, int, 0))
         ctx->advanced_control = true;
 
-    int err = MPV_ERROR_NOT_IMPLEMENTED;
-    for (int n = 0; render_backends[n]; n++) {
+    char *api_type = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
+    if (api_type && api_type[0])
+        ctx->render_api_type = talloc_strdup(ctx, api_type);
+
+    const struct render_backend_fns **selected_backends =
+        select_render_backends(ctx, params);
+    int err = selected_backends ? MPV_ERROR_NOT_IMPLEMENTED : MPV_ERROR_INVALID_PARAMETER;
+    for (int n = 0; selected_backends && selected_backends[n]; n++) {
         ctx->renderer = talloc_zero(NULL, struct render_backend);
         *ctx->renderer = (struct render_backend){
             .global = ctx->global,
             .log = ctx->log,
-            .fns = render_backends[n],
+            .fns = selected_backends[n],
         };
         err = ctx->renderer->fns->init(ctx->renderer, params);
         if (err >= 0)
@@ -728,6 +762,9 @@ static int preinit(struct vo *vo)
             MP_FATAL(vo, "No render context set.\n");
         return -1;
     }
+
+    vo->render_backend_name = ctx->renderer->fns->name;
+    vo->render_api_name = ctx->render_api_type;
 
     mp_mutex_lock(&ctx->lock);
     ctx->vo = vo;

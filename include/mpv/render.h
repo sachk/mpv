@@ -52,6 +52,10 @@ extern "C" {
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
+ * MPV_RENDER_PARAM_BACKEND can be used to request a renderer backend for the
+ * selected GPU API. For OpenGL, the default renderer backend is "gpu"; API
+ * users can request "gpu-next". This is separate from MPV_RENDER_PARAM_API_TYPE.
+ *
  * Threading
  * ---------
  *
@@ -422,6 +426,24 @@ typedef enum mpv_render_param_type {
      * See MPV_RENDER_PARAM_SW_STRIDE for alignment requirements.
      */
     MPV_RENDER_PARAM_SW_POINTER = 20,
+    /**
+     * Name of the renderer backend to use. Valid for
+     * mpv_render_context_create().
+     *
+     * This selects the renderer implementation for the API selected by
+     * MPV_RENDER_PARAM_API_TYPE. It does not select the GPU API itself.
+     *
+     * Type: char*
+     *
+     * OpenGL renderer backends:
+     *  "gpu"      legacy renderer
+     *  "gpu-next" libplacebo renderer
+     *
+     * If omitted, the default backend for the selected API type is used. The
+     * software renderer is selected with MPV_RENDER_API_TYPE_SW, not with this
+     * parameter.
+     */
+    MPV_RENDER_PARAM_BACKEND = 21,
 } mpv_render_param_type;
 
 /**
@@ -553,6 +575,7 @@ typedef struct mpv_render_frame_info {
  *
  * You should pass the following parameters:
  *  - MPV_RENDER_PARAM_API_TYPE to select the underlying backend/GPU API.
+ *  - Optionally MPV_RENDER_PARAM_BACKEND to select a renderer for that API.
  *  - Backend-specific init parameter, like MPV_RENDER_PARAM_OPENGL_INIT_PARAMS.
  *  - Setting MPV_RENDER_PARAM_ADVANCED_CONTROL and following its rules is
  *    strongly recommended.

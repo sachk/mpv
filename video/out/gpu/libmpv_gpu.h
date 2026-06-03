@@ -20,7 +20,7 @@ struct libmpv_gpu_context_fns {
     const char *api_name;
     // Pretty much works like render_backend_fns.init, except that the
     // API type is already checked by the caller.
-    // Successful init must set ctx->ra.
+    // Successful init must set ctx->ra_ctx.
     int (*init)(struct libmpv_gpu_context *ctx, mpv_render_param *params);
     // Wrap the surface passed to mpv_render_context_render() (via the params
     // array) into a ra_tex and return it. Returns a libmpv error code, and sets
@@ -29,6 +29,10 @@ struct libmpv_gpu_context_fns {
     // This does not need to care about generic attributes, like flipping.
     int (*wrap_fbo)(struct libmpv_gpu_context *ctx, mpv_render_param *params,
                     struct ra_tex **out);
+    // Start rendering to the surface passed to mpv_render_context_render().
+    // This is for users which need backend-specific frame setup, but do not
+    // render through the returned ra_tex from wrap_fbo().
+    int (*start_frame)(struct libmpv_gpu_context *ctx, mpv_render_param *params);
     // Signal that the ra_tex object obtained with wrap_fbo is no longer used.
     // For certain backends, this might also be used to signal the end of
     // rendering (like OpenGL doing weird crap).

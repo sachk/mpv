@@ -3129,6 +3129,22 @@ static int mp_property_gpu_context(void *ctx, struct m_property *p, int action, 
                                 mpctx->video_out->context_name : NULL);
 }
 
+static int mp_property_render_backend(void *ctx, struct m_property *p,
+                                      int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    return m_property_strdup_ro(action, arg, mpctx->video_out ?
+                                mpctx->video_out->render_backend_name : NULL);
+}
+
+static int mp_property_render_api(void *ctx, struct m_property *p,
+                                  int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    return m_property_strdup_ro(action, arg, mpctx->video_out ?
+                                mpctx->video_out->render_api_name : NULL);
+}
+
 static int mp_property_osd_dim(void *ctx, struct m_property *prop,
                                int action, void *arg)
 {
@@ -4757,6 +4773,8 @@ static const struct m_property mp_properties_base[] = {
     {"perf-info", mp_property_perf_info},
     {"current-vo", mp_property_vo},
     {"current-gpu-context", mp_property_gpu_context},
+    {"current-render-backend", mp_property_render_backend},
+    {"current-render-api", mp_property_render_api},
     {"container-fps", mp_property_fps},
     {"estimated-vf-fps", mp_property_vf_fps},
     {"video-aspect-override", mp_property_video_aspect_override},
@@ -4901,6 +4919,7 @@ static const char *const *const mp_event_property_change[] = {
     E(MPV_EVENT_VIDEO_RECONFIG, "video-out-params", "video-params",
       "video-format", "video-codec", "video-bitrate", "dwidth", "dheight",
       "width", "height", "container-fps", "aspect", "aspect-name", "vo-configured", "current-vo",
+      "current-gpu-context", "current-render-backend", "current-render-api",
       "video-dec-params", "osd-dimensions", "hwdec", "hwdec-current", "hwdec-interop",
       "window-id", "track-list", "current-tracks"),
     E(MPV_EVENT_AUDIO_RECONFIG, "audio-format", "audio-codec", "audio-bitrate",

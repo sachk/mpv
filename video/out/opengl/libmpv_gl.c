@@ -61,8 +61,9 @@ static int init(struct libmpv_gpu_context *ctx, mpv_render_param *params)
     return 0;
 }
 
-static int wrap_fbo(struct libmpv_gpu_context *ctx, mpv_render_param *params,
-                    struct ra_tex **out)
+static int start_frame_internal(struct libmpv_gpu_context *ctx,
+                                mpv_render_param *params,
+                                struct ra_fbo *target)
 {
     struct priv *p = ctx->priv;
 
@@ -77,11 +78,27 @@ static int wrap_fbo(struct libmpv_gpu_context *ctx, mpv_render_param *params,
     }
 
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
-    struct ra_fbo target;
     ra_gl_ctx_resize(sw, fbo->w, fbo->h, fbo->fbo);
-    ra_gl_ctx_start_frame(sw, &target);
+    ra_gl_ctx_start_frame(sw, target);
+    return 0;
+}
+
+static int wrap_fbo(struct libmpv_gpu_context *ctx, mpv_render_param *params,
+                    struct ra_tex **out)
+{
+    struct ra_fbo target;
+    int err = start_frame_internal(ctx, params, &target);
+    if (err < 0)
+        return err;
+
     *out = target.tex;
     return 0;
+}
+
+static int start_frame(struct libmpv_gpu_context *ctx, mpv_render_param *params)
+{
+    struct ra_fbo target;
+    return start_frame_internal(ctx, params, &target);
 }
 
 static void done_frame(struct libmpv_gpu_context *ctx, bool ds)
@@ -105,6 +122,7 @@ const struct libmpv_gpu_context_fns libmpv_gpu_context_gl = {
     .api_name = MPV_RENDER_API_TYPE_OPENGL,
     .init = init,
     .wrap_fbo = wrap_fbo,
+    .start_frame = start_frame,
     .done_frame = done_frame,
     .destroy = destroy,
 };
