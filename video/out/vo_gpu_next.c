@@ -40,20 +40,26 @@
 #include "stream/stream.h"
 #include "sub/draw_bmp.h"
 #include "video/fmt-conversion.h"
+#include "mpv/render_gl.h"
 #include "video/mp_image.h"
 #include "video/out/placebo/ra_pl.h"
 #include "placebo/utils.h"
 #include "gpu/context.h"
 #include "gpu/hwdec.h"
+#include "gpu/libmpv_gpu.h"
 #include "gpu/utils.h"
 #include "gpu/video.h"
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
 #include "gpu_next/context.h"
+#include "libmpv.h"
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
 #include <libplacebo/opengl.h>
 #include "video/out/opengl/ra_gl.h"
+#if HAVE_EGL
+#include <EGL/egl.h>
+#endif
 #endif
 
 #if HAVE_D3D11 && defined(PL_HAVE_D3D11)
@@ -110,6 +116,12 @@ struct priv {
     struct stats_ctx *stats;
     struct ra_ctx *ra_ctx;
     struct gpu_ctx *context;
+    struct libmpv_gpu_context *libmpv_context;
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    pl_opengl libmpv_opengl;
+#endif
+    struct vo *libmpv_vo;
+    struct mp_hwdec_devices *hwdec_devs;
     struct ra_hwdec_ctx hwdec_ctx;
     struct ra_hwdec_mapper *hwdec_mapper;
     struct timer_pool *hwdec_timer;
@@ -143,6 +155,7 @@ struct priv {
     bool flush_cache;
     bool frame_pending;
     bool paused;
+    bool renderer_initialized;
 
     pl_options pars;
     struct m_config_cache *opts_cache;
@@ -169,7 +182,7 @@ struct priv {
     struct mp_image_params target_params;
 };
 
-static void update_render_options(struct vo *vo);
+static void update_render_options(struct vo *vo, struct priv *p);
 static void update_lut(struct priv *p, struct user_lut *lut);
 
 struct gl_next_opts {
@@ -271,10 +284,9 @@ static void free_dr_buf(void *opaque, uint8_t *data)
     MP_ASSERT_UNREACHABLE();
 }
 
-static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
-                                  int stride_align, int flags)
+static struct mp_image *get_image_priv(struct priv *p, int imgfmt, int w, int h,
+                                       int stride_align, int flags)
 {
-    struct priv *p = vo->priv;
     pl_gpu gpu = p->gpu;
     if (!gpu->limits.thread_safe || !gpu->limits.max_mapped_size)
         return NULL;
@@ -312,12 +324,17 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
     return mpi;
 }
 
-static void update_overlays(struct vo *vo, struct mp_osd_res res,
+static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
+                                  int stride_align, int flags)
+{
+    return get_image_priv(vo->priv, imgfmt, w, h, stride_align, flags);
+}
+
+static void update_overlays(struct priv *p, struct vo *vo, struct mp_osd_res res,
                             int flags, enum pl_overlay_coords coords,
                             struct osd_state *state, struct pl_frame *frame,
                             struct mp_image *src, int stereo_mode)
 {
-    struct priv *p = vo->priv;
     double pts = src ? src->pts : 0;
     int div[2];
     mp_get_3d_side_by_side(stereo_mode, div);
@@ -463,6 +480,7 @@ static void update_overlays(struct vo *vo, struct mp_osd_res res,
 
 struct frame_priv {
     struct vo *vo;
+    struct priv *priv;
     struct osd_state subs;
     uint64_t osd_sync;
     struct ra_hwdec *hwdec;
@@ -634,7 +652,7 @@ static bool hwdec_acquire(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
-    struct priv *p = fp->vo->priv;
+    struct priv *p = fp->priv;
     if (!hwdec_reconfig(p, fp->hwdec, &mpi->params))
         return false;
 
@@ -666,7 +684,7 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
 {
     struct mp_image *mpi = frame->user_data;
     struct frame_priv *fp = mpi->priv;
-    struct priv *p = fp->vo->priv;
+    struct priv *p = fp->priv;
     if (!ra_pl_get(p->hwdec_mapper->ra)) {
         for (int n = 0; n < frame->num_planes; n++)
             pl_tex_destroy(p->gpu, &frame->planes[n].texture);
@@ -675,9 +693,8 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     ra_hwdec_mapper_unmap(p->hwdec_mapper);
 }
 
-static bool format_supported(struct vo *vo, int format, bool use_uint)
+static bool format_supported(struct priv *p, int format, bool use_uint)
 {
-    struct priv *p = vo->priv;
     struct pl_bit_encoding bits;
     struct pl_plane_data data[4] = {0};
     int planes = plane_data_from_imgfmt(data, &bits, format, use_uint);
@@ -699,7 +716,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
     struct mp_image_params par = mpi->params;
     struct frame_priv *fp = mpi->priv;
     struct vo *vo = fp->vo;
-    struct priv *p = vo->priv;
+    struct priv *p = fp->priv;
 
     fp->hwdec = ra_hwdec_get(&p->hwdec_ctx, mpi->imgfmt);
     if (fp->hwdec) {
@@ -775,7 +792,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
 
         // At this point, we know that the format is supported, query_format()
         // makes sure of that. Just check if we should use UINT as a fallback.
-        if (!format_supported(vo, mpi->imgfmt, false))
+        if (!format_supported(p, mpi->imgfmt, false))
             use_uint = true;
 
         frame->num_planes = plane_data_from_imgfmt(data, &frame->repr.bits, mpi->imgfmt, use_uint);
@@ -851,7 +868,7 @@ static void unmap_frame(pl_gpu gpu, struct pl_frame *frame,
 {
     struct mp_image *mpi = src->frame_data;
     struct frame_priv *fp = mpi->priv;
-    struct priv *p = fp->vo->priv;
+    struct priv *p = fp->priv;
     for (int i = 0; i < MP_ARRAY_SIZE(fp->subs.entries); i++) {
         pl_tex tex = fp->subs.entries[i].tex;
         if (tex)
@@ -868,8 +885,7 @@ static void discard_frame(const struct pl_source_frame *src)
 
 static void info_callback(void *priv, const struct pl_render_info *info)
 {
-    struct vo *vo = priv;
-    struct priv *p = vo->priv;
+    struct priv *p = priv;
     if (info->index >= VO_PASS_PERF_MAX)
         return; // silently ignore clipped passes, whatever
 
@@ -884,14 +900,13 @@ static void info_callback(void *priv, const struct pl_render_info *info)
     pl_dispatch_info_move(&frame->info[info->index], info->pass);
 }
 
-static void update_options(struct vo *vo)
+static void update_options(struct vo *vo, struct priv *p)
 {
-    struct priv *p = vo->priv;
     pl_options pars = p->pars;
     bool changed = m_config_cache_update(p->opts_cache);
     changed = m_config_cache_update(p->next_opts_cache) || changed;
     if (changed)
-        update_render_options(vo);
+        update_render_options(vo, p);
 
     update_lut(p, &p->next_opts->lut);
     pars->params.lut = p->next_opts->lut.lut;
@@ -1068,12 +1083,11 @@ static void update_tm_viz(struct pl_color_map_params *params,
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
-static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+static bool render_frame(struct priv *p, struct vo *vo, struct vo_frame *frame)
 {
-    struct priv *p = vo->priv;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
-    update_options(vo);
+    update_options(vo, p);
 
     struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;
@@ -1083,7 +1097,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                            !frame->still && frame->num_frames > 1 && !p->paused;
     double pts_offset = can_interpolate ? frame->ideal_frame_vsync : 0;
     params.info_callback = info_callback;
-    params.info_priv = vo;
+    params.info_priv = p;
     params.skip_caching_single_frame = !cache_frame;
     params.preserve_mixing_cache = p->next_opts->inter_preserve && !frame->still;
     if (frame->still || p->paused)
@@ -1142,6 +1156,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
         mpi->priv = fp;
         fp->vo = vo;
+        fp->priv = p;
 
         pl_queue_push(p->queue, &(struct pl_source_frame) {
             .pts = mpi->pts,
@@ -1361,7 +1376,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 #endif
     }
     stats_time_start(p->stats, "osd-update");
-    update_overlays(vo, p->osd_res,
+    update_overlays(p, vo, p->osd_res,
                     (frame->current && opts->blend_subs) ? OSD_DRAW_OSD_ONLY : 0,
                     PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &target, frame->current,
                     frame->current ? frame->current->params.stereo3d : 0);
@@ -1438,7 +1453,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
                     enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
                         ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
                     stats_time_start(p->stats, "osd-blend-update");
-                    update_overlays(vo, res, OSD_DRAW_SUB_ONLY,
+                    update_overlays(p, vo, res, OSD_DRAW_SUB_ONLY,
                                     rel, &fp->subs, image, mpi,
                                     mpi->params.stereo3d);
                     stats_time_end(p->stats, "osd-blend-update");
@@ -1508,6 +1523,11 @@ done:
     return VO_TRUE;
 }
 
+static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+{
+    return render_frame(vo->priv, vo, frame);
+}
+
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
@@ -1536,9 +1556,9 @@ static int query_format(struct vo *vo, int format)
     if (ra_hwdec_get(&p->hwdec_ctx, format))
         return true;
 
-    bool supported = format_supported(vo, format, false);
+    bool supported = format_supported(p, format, false);
     if (!supported)
-        supported = format_supported(vo, format, true);
+        supported = format_supported(p, format, true);
 
     return supported;
 }
@@ -1626,7 +1646,7 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
     pl_tex fbo = NULL;
     args->res = NULL;
 
-    update_options(vo);
+    update_options(vo, p);
     struct pl_render_params params = pars->params;
     params.info_callback = NULL;
     params.skip_caching_single_frame = true;
@@ -1781,12 +1801,12 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         };
         enum pl_overlay_coords rel = opts->blend_subs == BLEND_SUBS_VIDEO
             ? PL_OVERLAY_COORDS_SRC_CROP : PL_OVERLAY_COORDS_DST_CROP;
-        update_overlays(vo, res, osd_flags,
+        update_overlays(p, vo, res, osd_flags,
                         rel, &fp->subs, &image, mpi,
                         mpi->params.stereo3d);
     } else {
         // Disable overlays when blend_subs is disabled
-        update_overlays(vo, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
+        update_overlays(p, vo, osd, osd_flags, PL_OVERLAY_COORDS_DST_FRAME,
                         &p->osd_state, &target, mpi,
                         mpi->params.stereo3d);
         image.num_overlays = 0;
@@ -1905,7 +1925,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
 
         // Special case for --image-lut which requires a full reset.
         int old_type = p->next_opts->image_lut.type;
-        update_options(vo);
+        update_options(vo, p);
         struct user_lut image_lut = p->next_opts->image_lut;
         p->want_reset |= image_lut.opt && ((!image_lut.path && image_lut.opt) ||
                          (image_lut.path && strcmp(image_lut.path, image_lut.opt)) ||
@@ -2167,9 +2187,11 @@ done:
     pl_cache_destroy(&cache->cache);
 }
 
-static void uninit(struct vo *vo)
+static void uninit_renderer(struct priv *p)
 {
-    struct priv *p = vo->priv;
+    if (!p->renderer_initialized)
+        return;
+    p->renderer_initialized = false;
 
     // Drain any in-flight uploads.
     if (p->gpu)
@@ -2185,12 +2207,13 @@ static void uninit(struct vo *vo)
 
     timer_pool_destroy(p->sw_upload_timer);
 
-    if (vo->hwdec_devs) {
+    if (p->hwdec_devs) {
         ra_hwdec_mapper_free(&p->hwdec_mapper);
         timer_pool_destroy(p->hwdec_timer);
         ra_hwdec_ctx_uninit(&p->hwdec_ctx);
-        hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
-        hwdec_devices_destroy(vo->hwdec_devs);
+        hwdec_devices_set_loader(p->hwdec_devs, NULL, NULL);
+        hwdec_devices_destroy(p->hwdec_devs);
+        p->hwdec_devs = NULL;
     }
 
     mp_assert(p->num_dr_buffers == 0);
@@ -2212,6 +2235,14 @@ static void uninit(struct vo *vo)
     }
 
     pl_options_free(&p->pars);
+}
+
+static void uninit(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    uninit_renderer(p);
+    vo->hwdec_devs = NULL;
 
     p->ra_ctx = NULL;
     p->pllog = NULL;
@@ -2225,6 +2256,45 @@ static void load_hwdec_api(void *ctx, struct hwdec_imgfmt_request *params)
     vo_control(ctx, VOCTRL_LOAD_HWDEC_API, params);
 }
 
+static int init_renderer(struct priv *p, struct vo *vo, bool load_all_hwdecs)
+{
+    struct gl_video_opts *gl_opts = p->opts_cache->opts;
+    p->hwdec_ctx = (struct ra_hwdec_ctx) {
+        .log = p->log,
+        .global = p->global,
+        .ra_ctx = p->ra_ctx,
+    };
+
+    if (!p->hwdec_devs)
+        p->hwdec_devs = hwdec_devices_create();
+    if (!p->hwdec_devs)
+        return -1;
+    if (vo) {
+        vo->hwdec_devs = p->hwdec_devs;
+        hwdec_devices_set_loader(vo->hwdec_devs, load_hwdec_api, vo);
+    }
+    ra_hwdec_ctx_init(&p->hwdec_ctx, p->hwdec_devs, gl_opts->hwdec_interop,
+                      load_all_hwdecs);
+    mp_mutex_init(&p->dr_lock);
+    p->renderer_initialized = true;
+
+    if (vo && gl_opts->shader_cache)
+        cache_init(vo, &p->shader_cache, 10 << 20, gl_opts->shader_cache_dir);
+    if (vo && gl_opts->icc_opts->cache)
+        cache_init(vo, &p->icc_cache, 20 << 20, gl_opts->icc_opts->cache_dir);
+
+    pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
+    p->rr = pl_renderer_create(p->pllog, p->gpu);
+    p->queue = pl_queue_create(p->gpu);
+    p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
+    p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
+    p->osd_sync = 1;
+
+    p->pars = pl_options_alloc(p->pllog);
+    update_render_options(vo, p);
+    return p->rr && p->queue && p->pars ? 0 : -1;
+}
+
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
@@ -2236,7 +2306,6 @@ static int preinit(struct vo *vo)
     p->log = vo->log;
     p->stats = stats_ctx_create(p, vo->global, "vo/gpu-next");
 
-    struct gl_video_opts *gl_opts = p->opts_cache->opts;
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
     update_ra_ctx_options(vo, ctx_opts);
     p->context = gpu_ctx_create(vo, ctx_opts);
@@ -2248,31 +2317,9 @@ static int preinit(struct vo *vo)
     p->pllog = p->context->pllog;
     p->gpu = p->context->gpu;
     p->sw = p->context->swapchain;
-    p->hwdec_ctx = (struct ra_hwdec_ctx) {
-        .log = p->log,
-        .global = p->global,
-        .ra_ctx = p->ra_ctx,
-    };
+    if (init_renderer(p, vo, false) < 0)
+        goto err_out;
 
-    vo->hwdec_devs = hwdec_devices_create();
-    hwdec_devices_set_loader(vo->hwdec_devs, load_hwdec_api, vo);
-    ra_hwdec_ctx_init(&p->hwdec_ctx, vo->hwdec_devs, gl_opts->hwdec_interop, false);
-    mp_mutex_init(&p->dr_lock);
-
-    if (gl_opts->shader_cache)
-        cache_init(vo, &p->shader_cache, 10 << 20, gl_opts->shader_cache_dir);
-    if (gl_opts->icc_opts->cache)
-        cache_init(vo, &p->icc_cache, 20 << 20, gl_opts->icc_opts->cache_dir);
-
-    pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
-    p->rr = pl_renderer_create(p->pllog, p->gpu);
-    p->queue = pl_queue_create(p->gpu);
-    p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
-    p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
-    p->osd_sync = 1;
-
-    p->pars = pl_options_alloc(p->pllog);
-    update_render_options(vo);
     return 0;
 
 err_out:
@@ -2554,9 +2601,8 @@ static void update_hook_opts(struct priv *p, char **opts, const char *shaderpath
     }
 }
 
-static void update_render_options(struct vo *vo)
+static void update_render_options(struct vo *vo, struct priv *p)
 {
-    struct priv *p = vo->priv;
     pl_options pars = p->pars;
     const struct gl_video_opts *opts = p->opts_cache->opts;
     pars->params.background_color[0] = opts->background_color.r / 255.0;
@@ -2600,7 +2646,8 @@ static void update_render_options(struct vo *vo)
         req_frames += ceilf(pars->params.frame_mixer->kernel->radius) *
                       (pars->params.skip_anti_aliasing ? 1 : 2);
     }
-    vo_set_queue_params(vo, 0, MPMIN(VO_MAX_REQ_FRAMES, req_frames));
+    if (vo)
+        vo_set_queue_params(vo, 0, MPMIN(VO_MAX_REQ_FRAMES, req_frames));
 
     pars->params.deband_params = opts->deband ? &pars->deband_params : NULL;
     pars->deband_params.iterations = opts->deband_opts->iterations;
@@ -2702,6 +2749,320 @@ AV_NOWARN_DEPRECATED(
     MP_DBG(p, "Render options updated, flushing renderer cache.\n");
     p->flush_cache = p->paused || !p->next_opts->inter_preserve;
 }
+
+struct native_resource_entry {
+    const char *name;
+    size_t size;
+};
+
+static const struct native_resource_entry native_resource_map[] = {
+    [MPV_RENDER_PARAM_X11_DISPLAY] = {
+        .name = "x11",
+    },
+    [MPV_RENDER_PARAM_WL_DISPLAY] = {
+        .name = "wl",
+    },
+    [MPV_RENDER_PARAM_DRM_DRAW_SURFACE_SIZE] = {
+        .name = "drm_draw_surface_size",
+        .size = sizeof(mpv_opengl_drm_draw_surface_size),
+    },
+    [MPV_RENDER_PARAM_DRM_DISPLAY_V2] = {
+        .name = "drm_params_v2",
+        .size = sizeof(mpv_opengl_drm_params_v2),
+    },
+};
+
+static void libmpv_add_native_resources(struct priv *p, mpv_render_param *params)
+{
+    for (int n = 0; params && params[n].type; n++) {
+        if (params[n].type <= 0 ||
+            params[n].type >= MP_ARRAY_SIZE(native_resource_map) ||
+            !native_resource_map[params[n].type].name)
+            continue;
+
+        const struct native_resource_entry *entry =
+            &native_resource_map[params[n].type];
+        void *data = params[n].data;
+        if (entry->size)
+            data = talloc_memdup(p, data, entry->size);
+        ra_add_native_resource(p->ra_ctx->ra, entry->name, data);
+    }
+}
+
+static void libmpv_destroy(struct render_backend *ctx);
+
+static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
+{
+#if !(HAVE_GL && defined(PL_HAVE_OPENGL))
+    return MPV_ERROR_NOT_IMPLEMENTED;
+#else
+    char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
+    if (!api)
+        return MPV_ERROR_INVALID_PARAMETER;
+    if (strcmp(api, MPV_RENDER_API_TYPE_OPENGL) != 0)
+        return MPV_ERROR_NOT_IMPLEMENTED;
+
+    int err = MPV_ERROR_UNSUPPORTED;
+    ctx->priv = talloc_zero(NULL, struct priv);
+    struct priv *p = ctx->priv;
+    p->opts_cache = m_config_cache_alloc(p, ctx->global, &gl_video_conf);
+    p->next_opts_cache = m_config_cache_alloc(p, ctx->global, &gl_next_conf);
+    p->next_opts = p->next_opts_cache->opts;
+    p->video_eq = mp_csp_equalizer_create(p, ctx->global);
+    p->global = ctx->global;
+    p->log = ctx->log;
+    p->stats = stats_ctx_create(p, ctx->global, "libmpv/gpu-next");
+
+    p->libmpv_context = talloc_zero(p, struct libmpv_gpu_context);
+    *p->libmpv_context = (struct libmpv_gpu_context) {
+        .global = ctx->global,
+        .log = ctx->log,
+        .fns = &libmpv_gpu_context_gl,
+    };
+
+    err = p->libmpv_context->fns->init(p->libmpv_context, params);
+    if (err < 0)
+        goto error;
+
+    p->ra_ctx = p->libmpv_context->ra_ctx;
+    libmpv_add_native_resources(p, params);
+
+    struct ra_ctx_opts *ctx_opts = mp_get_config_group(p, ctx->global, &ra_ctx_conf);
+    struct GL *gl = ra_gl_get(p->ra_ctx->ra);
+    p->pllog = mppl_log_create(p, p->log);
+    if (!p->pllog)
+        goto error;
+
+    struct pl_opengl_params pl_params = *pl_opengl_params(
+        .debug = ctx_opts->debug,
+        .allow_software = ctx_opts->allow_sw,
+        .get_proc_addr_ex = (void *)gl->get_fn,
+        .proc_ctx = gl->fn_ctx,
+    );
+#if HAVE_EGL
+    pl_params.egl_display = eglGetCurrentDisplay();
+    pl_params.egl_context = eglGetCurrentContext();
+#endif
+    p->libmpv_opengl = pl_opengl_create(p->pllog, &pl_params);
+    talloc_free(ctx_opts);
+    if (!p->libmpv_opengl)
+        goto error;
+
+    p->gpu = p->libmpv_opengl->gpu;
+    mppl_log_set_probing(p->pllog, false);
+    p->sw = pl_opengl_create_swapchain(p->libmpv_opengl,
+        pl_opengl_swapchain_params(
+            .max_swapchain_depth = 1,
+        ));
+    if (!p->sw)
+        goto error;
+
+    p->hwdec_devs = hwdec_devices_create();
+    if (!p->hwdec_devs)
+        goto error;
+    ctx->hwdec_devs = p->hwdec_devs;
+    ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_FILM_GRAIN | VO_CAP_VFLIP;
+
+    if (init_renderer(p, NULL, true) < 0)
+        goto error;
+
+    return 0;
+
+error:
+    libmpv_destroy(ctx);
+    talloc_free(ctx->priv);
+    ctx->priv = NULL;
+    return err;
+#endif
+}
+
+static bool libmpv_check_format(struct render_backend *ctx, int imgfmt)
+{
+    struct priv *p = ctx->priv;
+    if (ra_hwdec_get(&p->hwdec_ctx, imgfmt))
+        return true;
+
+    return format_supported(p, imgfmt, false) ||
+           format_supported(p, imgfmt, true);
+}
+
+static int libmpv_set_parameter(struct render_backend *ctx, mpv_render_param param)
+{
+    struct priv *p = ctx->priv;
+
+    switch (param.type) {
+    case MPV_RENDER_PARAM_ICC_PROFILE: {
+        mpv_byte_array *data = param.data;
+        update_icc(p, bstrdup(NULL, (bstr){data->data, data->size}));
+        return 0;
+    }
+    default:
+        return MPV_ERROR_NOT_IMPLEMENTED;
+    }
+}
+
+static void libmpv_reconfig(struct render_backend *ctx, struct mp_image_params *params)
+{
+    struct priv *p = ctx->priv;
+
+    if (!p->libmpv_vo)
+        return;
+
+    mp_mutex_lock(&p->libmpv_vo->params_mutex);
+    p->libmpv_vo->target_params = NULL;
+    mp_mutex_unlock(&p->libmpv_vo->params_mutex);
+}
+
+static void libmpv_reset(struct render_backend *ctx)
+{
+    struct priv *p = ctx->priv;
+    p->want_reset = true;
+}
+
+static void libmpv_update_external(struct render_backend *ctx, struct vo *vo)
+{
+    struct priv *p = ctx->priv;
+    p->libmpv_vo = vo;
+    if (vo)
+        update_render_options(vo, p);
+}
+
+static void libmpv_resize(struct render_backend *ctx, struct mp_rect *src,
+                          struct mp_rect *dst, struct mp_osd_res *osd)
+{
+    struct priv *p = ctx->priv;
+
+    if (mp_rect_equals(&p->src, src) &&
+        mp_rect_equals(&p->dst, dst) &&
+        osd_res_equals(p->osd_res, *osd))
+        return;
+
+    p->osd_sync++;
+    p->src = *src;
+    p->dst = *dst;
+    p->osd_res = *osd;
+}
+
+static int libmpv_get_target_size(struct render_backend *ctx,
+                                  mpv_render_param *params,
+                                  int *out_w, int *out_h)
+{
+    mpv_opengl_fbo *fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
+    if (!fbo || fbo->w < 1 || fbo->h < 1)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    *out_w = fbo->w;
+    *out_h = fbo->h;
+    return 0;
+}
+
+static int libmpv_start_frame(struct priv *p, mpv_render_param *params)
+{
+    mpv_opengl_fbo *fbo =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
+    if (!fbo || fbo->w < 1 || fbo->h < 1)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    int err = p->libmpv_context->fns->start_frame(p->libmpv_context, params);
+    if (err < 0)
+        return err;
+
+    bool flip = GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_FLIP_Y, int, 0);
+    // The render API flag requests compensation for bottom-left GL targets;
+    // libplacebo wants the target origin instead.
+    pl_opengl_swapchain_update_fb(p->sw, &(struct pl_opengl_framebuffer) {
+        .id = fbo->fbo,
+        .flipped = !flip,
+    });
+
+    int w = fbo->w;
+    int h = fbo->h;
+    if (!pl_swapchain_resize(p->sw, &w, &h))
+        return MPV_ERROR_GENERIC;
+
+    return 0;
+}
+
+static int libmpv_render(struct render_backend *ctx, mpv_render_param *params,
+                         struct vo_frame *frame)
+{
+    struct priv *p = ctx->priv;
+    if (!p->libmpv_vo)
+        return MPV_ERROR_UNINITIALIZED;
+
+    int err = libmpv_start_frame(p, params);
+    if (err < 0)
+        return err;
+
+    bool ok = render_frame(p, p->libmpv_vo, frame);
+    if (ok && p->frame_pending) {
+        ok = pl_swapchain_submit_frame(p->sw);
+        if (!ok)
+            MP_ERR(ctx, "Failed presenting frame!\n");
+        p->frame_pending = false;
+    }
+
+    p->libmpv_context->fns->done_frame(p->libmpv_context, frame->display_synced);
+    return ok ? 0 : MPV_ERROR_GENERIC;
+}
+
+static struct mp_image *libmpv_get_image(struct render_backend *ctx, int imgfmt,
+                                         int w, int h, int stride_align, int flags)
+{
+    return get_image_priv(ctx->priv, imgfmt, w, h, stride_align, flags);
+}
+
+static void libmpv_perfdata(struct render_backend *ctx,
+                            struct voctrl_performance_data *out)
+{
+    struct priv *p = ctx->priv;
+    copy_frame_info_to_mp(&p->perf_fresh, &out->fresh,
+                          &p->hwdec_perf, &p->sw_upload_perf);
+    copy_frame_info_to_mp(&p->perf_redraw, &out->redraw, NULL, NULL);
+}
+
+static void libmpv_destroy(struct render_backend *ctx)
+{
+    struct priv *p = ctx->priv;
+    if (!p)
+        return;
+
+    uninit_renderer(p);
+    ctx->hwdec_devs = NULL;
+
+    if (p->sw)
+        pl_swapchain_destroy(&p->sw);
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    if (p->libmpv_opengl)
+        pl_opengl_destroy(&p->libmpv_opengl);
+#endif
+    if (p->pllog)
+        pl_log_destroy(&p->pllog);
+
+    if (p->libmpv_context) {
+        p->libmpv_context->fns->destroy(p->libmpv_context);
+        talloc_free(p->libmpv_context->priv);
+        talloc_free(p->libmpv_context);
+        p->libmpv_context = NULL;
+    }
+}
+
+const struct render_backend_fns render_backend_gpu_next = {
+    .name = "gpu-next",
+    .init = libmpv_init,
+    .check_format = libmpv_check_format,
+    .set_parameter = libmpv_set_parameter,
+    .reconfig = libmpv_reconfig,
+    .reset = libmpv_reset,
+    .update_external = libmpv_update_external,
+    .resize = libmpv_resize,
+    .get_target_size = libmpv_get_target_size,
+    .render = libmpv_render,
+    .get_image = libmpv_get_image,
+    .perfdata = libmpv_perfdata,
+    .destroy = libmpv_destroy,
+};
 
 const struct vo_driver video_out_gpu_next = {
     .description = "Video output based on libplacebo",

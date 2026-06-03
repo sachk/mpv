@@ -234,6 +234,7 @@ static void destroy(struct render_backend *ctx)
 }
 
 const struct render_backend_fns render_backend_gpu = {
+    .name = "gpu",
     .init = init,
     .check_format = check_format,
     .set_parameter = set_parameter,

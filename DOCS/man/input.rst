@@ -3960,6 +3960,16 @@ Property list
     Current GPU context of video output driver (name as used with ``--gpu-context``).
     Valid for ``--vo=gpu`` and ``--vo=gpu-next``.
 
+``current-render-backend``
+    Current renderer backend when it is separate from the video output driver.
+    For ``vo=libmpv``, this is the backend selected with
+    ``MPV_RENDER_PARAM_BACKEND``.
+
+``current-render-api``
+    Current render API type when exposed by the video output driver. For
+    ``vo=libmpv``, this is the API type selected with
+    ``MPV_RENDER_PARAM_API_TYPE``.
+
 ``current-ao``
     Current audio output driver (name as used with ``--ao``).
 

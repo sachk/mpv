@@ -518,6 +518,12 @@ struct vo {
     // current GPU context (--vo=gpu and --vo=gpu-next only)
     const char *context_name;
 
+    // renderer backend, if separate from the video output driver
+    const char *render_backend_name;
+
+    // render API type, if exposed by the video output driver
+    const char *render_api_name;
+
     // composition swapchain (--d3d11-output-mode=composition only)
     void *display_swapchain;
 };

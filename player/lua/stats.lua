@@ -947,8 +947,25 @@ local function add_video_out(s)
 
     append_property(s, "display-names", {prefix_sep="", prefix="(", suffix=")",
                     no_prefix_markup=true, nl="", indent=" "}, nil, true)
-    append(s, mp.get_property_native("current-gpu-context"),
-           {prefix="Context:", nl="", indent=o.prefix_sep .. o.prefix_sep})
+
+    local backend = mp.get_property_native("current-render-backend")
+    if backend and backend ~= vo then
+        append(s, backend, {prefix="Renderer:", nl="",
+                            indent=o.prefix_sep .. o.prefix_sep})
+    end
+
+    local api = mp.get_property_native("current-render-api")
+    if api then
+        append(s, api, {prefix="API:", nl="",
+                        indent=o.prefix_sep .. o.prefix_sep})
+    end
+
+    local context = mp.get_property_native("current-gpu-context")
+    if context then
+        append(s, context, {prefix="Context:", nl="",
+                            indent=o.prefix_sep .. o.prefix_sep})
+    end
+
     append_property(s, "avsync", {prefix="A-V:"})
     append_fps(s, "display-fps", "estimated-display-fps")
     if append_property(s, "decoder-frame-drop-count",
