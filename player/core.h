@@ -357,6 +357,8 @@ typedef struct MPContext {
     int64_t starfish_audio_sync_last_log_ns;
     int64_t starfish_audio_sync_start_ns;
     int64_t starfish_audio_sync_last_realign_ns;
+    int64_t starfish_audio_sync_hard_since_ns;
+    int starfish_audio_sync_hard_direction;
     int64_t starfish_audio_clock_wait_start_ns;
     bool starfish_audio_clock_wait_logged;
     bool starfish_audio_sync_resync_pending;
