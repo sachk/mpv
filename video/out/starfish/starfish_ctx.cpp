@@ -129,6 +129,26 @@ bool env_wants_pcm_audio() {
   return codec && (strcmp(codec, "pcm") == 0 || strcmp(codec, "PCM") == 0);
 }
 
+// A/B hook for the ao_starfish lag investigation: cap how far ahead of the
+// sampled pipeline clock audio ES may be fed into the SDK. If the SDK's audio
+// sink paces loosely (FIFO-ish) instead of scheduling strictly by PTS, the
+// audible audio lag equals the SDK-side feed lead, and shrinking this cap
+// shrinks the lag. Unset keeps the historical behavior (shared 1.6s video
+// cap). Worker-thread only.
+int64_t audio_feed_ahead_ns() {
+  static int64_t cached = -1;
+  if (cached < 0) {
+    cached = MAX_FEED_AHEAD_NS;
+    const char *v = getenv("STARFISH_AUDIO_FEED_AHEAD_MS");
+    if (v && v[0]) {
+      long long ms = strtoll(v, nullptr, 10);
+      if (ms > 0)
+        cached = ms * 1000000LL;
+    }
+  }
+  return cached;
+}
+
 dovi_policy get_dovi_policy() {
   const char *value = getenv("STARFISH_DOVI_POLICY");
   if (!value || !value[0] || strcmp(value, "auto") == 0)
@@ -1019,8 +1039,16 @@ static feed_result try_drain(starfish_ctx *ctx,
     return feed_result::NO_PACKET;
 
   queued_packet packet = queue->front();
+  int64_t max_ahead_ns = MAX_FEED_AHEAD_NS;
+  // Only throttle audio once the clock is actually running: during segment
+  // preroll current_pts_ns sits at the segment start, and capping audio
+  // against a non-advancing clock would starve the preroll and deadlock the
+  // pipeline start.
+  if (stream == STARFISH_STREAM_AUDIO && ctx->started &&
+      ctx->clock_sample_valid)
+    max_ahead_ns = audio_feed_ahead_ns();
   if (ctx->current_pts_ns != INT64_MIN &&
-      packet.pts_ns - ctx->current_pts_ns > MAX_FEED_AHEAD_NS)
+      packet.pts_ns - ctx->current_pts_ns > max_ahead_ns)
     return feed_result::BLOCKED;
 
   const bool audio_only = ctx->video_codec.empty();
@@ -1503,6 +1531,12 @@ static void worker_loop(starfish_ctx *ctx) {
       continue;
 
     if (is_loaded_state(ctx->state)) {
+      // Steady-state diagnostic heartbeat (1/s): fed_v/fed_a vs the sampled
+      // clock is the primary measurement for the audio-lag investigation --
+      // audible ao_starfish lag ~= fed_a minus clock at steady state.
+      if (ctx->state == pipeline_state::PLAYING && ctx->started)
+        maybe_log_worker_status_locked(ctx, "periodic");
+
       /* Play/Pause transitions */
       if (maybe_start_delayed_play_locked(ctx, lk))
         continue;
