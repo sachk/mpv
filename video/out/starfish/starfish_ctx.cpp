@@ -306,7 +306,13 @@ struct starfish_ctx {
   /* sampled Starfish clock (for VOCTRL_GET_EXTERNAL_VIDEO_CLOCK) */
   bool clock_sample_valid = false;
   double clock_sample_pts = 0.0;
+  /* Host-time anchor for clock_sample_pts: estimate of when the frame that
+   * getCurrentPlaytime currently reports actually flipped, NOT the time of the
+   * latest poll. Consumers project pts + (now - anchor). */
   int64_t clock_sample_host_ns = 0;
+  /* Host time of the most recent accepted poll, used to bracket the flip
+   * instant when the reported pts advances. */
+  int64_t clock_last_poll_host_ns = 0;
   bool clock_export_ready = false;
   int64_t clock_stability_probe_pts_ns = INT64_MIN;
   int64_t clock_stability_probe_host_ns = 0;
@@ -1201,17 +1207,47 @@ static bool clock_sample_plausible_locked(starfish_ctx *ctx, int64_t pts_ns) {
   return true;
 }
 
+// quantized_sample: pts_ns came straight from getCurrentPlaytime, which is
+// frame-quantized (it reports the pts of the frame currently on screen and
+// holds it for the whole frame duration). Non-quantized callers pass a
+// projected/derived pts where the flip-bracketing below does not apply.
 static int64_t accept_clock_sample_locked(starfish_ctx *ctx, int64_t pts_ns,
-                                          int64_t host_time_ns) {
+                                          int64_t host_time_ns,
+                                          bool quantized_sample) {
+  const int64_t prev_poll_ns = ctx->clock_last_poll_host_ns;
+  int64_t anchor_ns = host_time_ns;
+
   if (ctx->clock_sample_valid) {
     const int64_t old_ns = (int64_t)llround(ctx->clock_sample_pts * 1e9);
     if (pts_ns < old_ns)
       pts_ns = old_ns;
+    if (quantized_sample && pts_ns == old_ns) {
+      // Same frame still on screen. Keep the anchor from the poll that first
+      // reported this pts (~ the flip time). Moving it forward on every poll
+      // made pts+age projections reset toward the frame-start pts each poll,
+      // under-reporting the video position by up to a frame duration (mean
+      // ~half a frame) -- audio slaved to the clock then ran early by the
+      // same amount.
+      ctx->clock_last_poll_host_ns = host_time_ns;
+      if (pts_ns > ctx->current_pts_ns)
+        ctx->current_pts_ns = pts_ns;
+      return pts_ns;
+    }
+    if (quantized_sample && prev_poll_ns > 0 && host_time_ns > prev_poll_ns &&
+        host_time_ns - prev_poll_ns <= 2 * CLOCK_SAMPLE_PERIOD_NS) {
+      // pts advanced: the flip happened between the previous poll and this
+      // one. The midpoint halves the worst-case anchor error vs. taking the
+      // poll time itself. After long poll gaps (stall, slow SDK call) the
+      // bracket is too wide to be useful; keep the poll time then.
+      anchor_ns = prev_poll_ns + (host_time_ns - prev_poll_ns) / 2;
+    }
   }
 
   ctx->clock_sample_valid = true;
   ctx->clock_sample_pts = (double)pts_ns / 1e9;
-  ctx->clock_sample_host_ns = host_time_ns;
+  ctx->clock_sample_host_ns = anchor_ns;
+  if (quantized_sample)
+    ctx->clock_last_poll_host_ns = host_time_ns;
   if (pts_ns > ctx->current_pts_ns)
     ctx->current_pts_ns = pts_ns;
   return pts_ns;
@@ -1312,7 +1348,7 @@ static void sample_clock_if_due(starfish_ctx *ctx,
     ctx->clock_stability_probe_pts_ns = new_ns;
     ctx->clock_stability_probe_host_ns = sample.host_time_ns;
   }
-  new_ns = accept_clock_sample_locked(ctx, new_ns, sample.host_time_ns);
+  new_ns = accept_clock_sample_locked(ctx, new_ns, sample.host_time_ns, true);
   if (ctx->log_next_clock_sample) {
     mp_info(ctx->log, "Starfish clock sample pts=%.3f query=%.1fms\n",
             (double)new_ns / 1e9, sample.query_duration_ns / 1e6);
@@ -1382,7 +1418,8 @@ static bool pending_ready_matches_clock_locked(
     return false;
   }
 
-  clock_ns = accept_clock_sample_locked(ctx, clock_ns, clock_host_ns);
+  clock_ns = accept_clock_sample_locked(ctx, clock_ns, clock_host_ns,
+                                        allow_sdk_query);
   if (clock_ns != *ready_ns) {
     mp_info(ctx->log,
             "Starfish using clock for pending %s ready packet=%.3f clock=%.3f\n",
