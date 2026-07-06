@@ -66,6 +66,15 @@ struct priv {
     struct encoded_packet *pending_tail;
     int pending_samples;
     bool feed_blocked;
+    /* Single-flight guard for feed_pending_packets: the drain loop is entered
+     * from the AO thread (write/get_state/start/set_pause) and from the ctx
+     * worker thread (audio_prime_cb). Two concurrent drains would interleave
+     * pop->feed sequences and hand Starfish audio ES packets out of PTS
+     * order. */
+    bool feeding;
+    /* Bumped by free_pending_packets_locked. A packet popped for feeding
+     * before a flush must not be re-queued (or accounted) after it. */
+    uint64_t pending_generation;
     /* PCM mode: feed raw interleaved PCM instead of AAC. When set, the
      * encoder/fifo above are unused (NULL). bytes_per_frame is the size of one
      * interleaved sample-frame (channels * bytes-per-sample). */
@@ -319,6 +328,7 @@ static void free_pending_packets_locked(struct priv *p)
     p->pending_tail = NULL;
     p->pending_samples = 0;
     p->feed_blocked = false;
+    p->pending_generation++;
 }
 
 static bool queue_encoded_packet_locked(struct ao *ao, const uint8_t *data,
@@ -355,6 +365,16 @@ static bool feed_pending_packets(struct ao *ao)
     struct priv *p = ao->priv;
     bool ok = true;
 
+    pthread_mutex_lock(&p->lock);
+    if (p->feeding) {
+        // Another thread is mid-drain; a second drain would reorder packets.
+        // The active drain will pick up anything we queued.
+        pthread_mutex_unlock(&p->lock);
+        return true;
+    }
+    p->feeding = true;
+    pthread_mutex_unlock(&p->lock);
+
     for (;;) {
         pthread_mutex_lock(&p->lock);
         struct encoded_packet *pkt = p->pending_head;
@@ -368,6 +388,7 @@ static bool feed_pending_packets(struct ao *ao)
             p->pending_tail = NULL;
         pkt->next = NULL;
         p->pending_samples = MPMAX(p->pending_samples - pkt->samples, 0);
+        const uint64_t gen = p->pending_generation;
         struct starfish_ctx *ctx = starfish_ctx_retain(p->ctx);
         pthread_mutex_unlock(&p->lock);
 
@@ -375,13 +396,18 @@ static bool feed_pending_packets(struct ao *ao)
         starfish_ctx_unref(ctx);
         if (r == STARFISH_FEED_AGAIN) {
             pthread_mutex_lock(&p->lock);
-            pkt->next = p->pending_head;
-            p->pending_head = pkt;
-            if (!p->pending_tail)
-                p->pending_tail = pkt;
-            p->pending_samples += pkt->samples;
-            p->feed_blocked = true;
+            bool flushed = p->pending_generation != gen;
+            if (!flushed) {
+                pkt->next = p->pending_head;
+                p->pending_head = pkt;
+                if (!p->pending_tail)
+                    p->pending_tail = pkt;
+                p->pending_samples += pkt->samples;
+                p->feed_blocked = true;
+            }
             pthread_mutex_unlock(&p->lock);
+            if (flushed)
+                free_encoded_packet(pkt);
             break;
         }
         if (r == STARFISH_FEED_ERROR) {
@@ -394,7 +420,8 @@ static bool feed_pending_packets(struct ao *ao)
                  " result=%d\n", pkt->size, pkt->pts_ns, r);
 
         pthread_mutex_lock(&p->lock);
-        if (r == STARFISH_FEED_OK) {
+        // Don't credit a pre-flush packet against the post-flush model.
+        if (r == STARFISH_FEED_OK && p->pending_generation == gen) {
             drain(ao);
             p->buffered_samples += pkt->samples;
             p->underrun_grace_until_ns =
@@ -407,6 +434,9 @@ static bool feed_pending_packets(struct ao *ao)
             break;
     }
 
+    pthread_mutex_lock(&p->lock);
+    p->feeding = false;
+    pthread_mutex_unlock(&p->lock);
     return ok;
 }
 
