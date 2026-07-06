@@ -49,17 +49,23 @@ enum {
 };
 
 #define STARFISH_AUDIO_SYNC_PERIOD_NS (50LL * 1000 * 1000)
-#define STARFISH_AUDIO_SYNC_FILTER_TIME 5.00
-#define STARFISH_AUDIO_SYNC_RECOVERY_TIME 12.00
+// Controller tuning. The old values (FILTER_TIME 5s, RECOVERY 12s, DEADBAND
+// 50ms, HARD_REALIGN 350ms) meant a 24fps frame (41.7ms) of A/V error sat
+// inside the deadband forever, and errors in the 50-350ms band took tens of
+// seconds to grind out. With the clock-anchor fix in starfish_ctx.cpp the
+// filtered measurement is clean enough for a 10ms deadband; corrections stay
+// <=1% so they remain inaudible.
+#define STARFISH_AUDIO_SYNC_FILTER_TIME 1.00
+#define STARFISH_AUDIO_SYNC_RECOVERY_TIME 4.00
 #define STARFISH_AUDIO_SYNC_LOG_PERIOD_NS (1000LL * 1000 * 1000)
 #define STARFISH_AUDIO_SYNC_SETTLE_NS (500LL * 1000 * 1000)
-#define STARFISH_AUDIO_SYNC_DEADBAND 0.050
-#define STARFISH_AUDIO_SYNC_STEADY_MAX 0.0015
+#define STARFISH_AUDIO_SYNC_DEADBAND 0.010
+#define STARFISH_AUDIO_SYNC_STEADY_MAX 0.002
 #define STARFISH_AUDIO_SYNC_TRANSIENT_MAX 0.005
-#define STARFISH_AUDIO_SYNC_TRANSIENT_THRESHOLD 0.060
+#define STARFISH_AUDIO_SYNC_TRANSIENT_THRESHOLD 0.040
 #define STARFISH_AUDIO_SYNC_LARGE_TRANSIENT_MAX 0.010
-#define STARFISH_AUDIO_SYNC_LARGE_TRANSIENT_THRESHOLD 0.200
-#define STARFISH_AUDIO_SYNC_HARD_REALIGN_THRESHOLD 0.350
+#define STARFISH_AUDIO_SYNC_LARGE_TRANSIENT_THRESHOLD 0.100
+#define STARFISH_AUDIO_SYNC_HARD_REALIGN_THRESHOLD 0.150
 #define STARFISH_AUDIO_SYNC_HARD_REALIGN_CONFIRM_NS (500LL * 1000 * 1000)
 #define STARFISH_AUDIO_SYNC_HARD_REALIGN_COOLDOWN_NS (2000LL * 1000 * 1000)
 #define STARFISH_AUDIO_START_REALIGN_THRESHOLD 0.080
@@ -1030,7 +1036,10 @@ static void sync_alsa_to_starfish_clock(struct MPContext *mpctx)
                                    -max_correct, max_correct);
         target = 1.0 + correction;
     } else {
-        mpctx->starfish_audio_sync_avd_filtered = 0;
+        // Inside the deadband: don't correct, but keep the filtered estimate.
+        // Zeroing it here threw away the accumulated evidence, so borderline
+        // errors re-warmed the filter from scratch each time they crossed the
+        // threshold and the speed dithered around the deadband edge.
         max_correct = STARFISH_AUDIO_SYNC_STEADY_MAX;
     }
     double step = MPMAX(max_correct / 2.0,
