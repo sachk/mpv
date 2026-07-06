@@ -159,9 +159,11 @@ static void release_starfish_video_for_audio_clock(struct MPContext *mpctx)
 {
     if (!mpctx->starfish_video_held_for_audio)
         return;
+    mpctx->starfish_video_held_for_audio = false;
+    if (!mpctx->video_out)
+        return;
     if (vo_control(mpctx->video_out, VOCTRL_RESUME, NULL) != VO_TRUE)
         MP_WARN(mpctx, "Starfish video resume while waiting for audio clock failed\n");
-    mpctx->starfish_video_held_for_audio = false;
     MP_VERBOSE(mpctx, "Starfish video released for live audio clock\n");
 }
 
@@ -339,7 +341,13 @@ void reset_playback_state(struct MPContext *mpctx)
     mpctx->cache_update_pts = MP_NOPTS_VALUE;
     mpctx->starfish_osd_last_redraw_ns = 0;
     mpctx->starfish_osd_last_log_ns = 0;
-    mpctx->starfish_video_held_for_audio = false;
+    // The hold sends a raw VOCTRL_PAUSE that bypasses vo_set_paused
+    // bookkeeping, so nothing else will ever resume the pipeline. Clearing
+    // the flag without resuming (as this used to do) wedged playback when a
+    // seek arrived while video was held: the ctx stayed paused, no frame was
+    // ever produced, video never reached READY, and only a manual
+    // pause/unpause toggle recovered.
+    release_starfish_video_for_audio_clock(mpctx);
 
     encode_lavc_discontinuity(mpctx->encode_lavc_ctx);
 
