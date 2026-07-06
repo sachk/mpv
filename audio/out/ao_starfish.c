@@ -1137,7 +1137,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
         // instead of treating the deliberate audio gap as a device underrun.
         state->queued_samples = MPMAX(p->latency_samples, p->frame_samples);
         state->free_samples = 0;
-        state->delay = state->queued_samples / ao->samplerate;
+        state->delay = state->queued_samples / (double)ao->samplerate;
         state->playing = p->playing && !p->paused;
         pthread_mutex_unlock(&p->lock);
         return;
@@ -1159,7 +1159,7 @@ static void get_state(struct ao *ao, struct mp_pcm_state *state)
         state->free_samples = 0;
     if (p->audio_delay_pending)
         state->free_samples = 0;
-    state->delay = state->queued_samples / ao->samplerate;
+    state->delay = state->queued_samples / (double)ao->samplerate;
     // Runtime audio-delay changes intentionally stop feeding until the old
     // Starfish queue drains. Give mpv a short virtual playing window after the
     // latch so it refills with the new PTS instead of restarting the AO as an
