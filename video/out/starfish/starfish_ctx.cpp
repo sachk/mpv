@@ -335,27 +335,25 @@ static starfish_ctx *g_current_ctx;
 
 /* ----- wakeup / prime client helpers -------------------------------- */
 
+/* The client lock is held ACROSS the callback invocation, not just while
+ * copying the pointers. This makes set_wakeup(nullptr)/set_audio_prime(nullptr)
+ * during AO/VD teardown a synchronization point: once the unset returns, no
+ * callback can still be running against the freed opaque. Copy-then-invoke had
+ * a use-after-free window between the copy and the call.
+ *
+ * Lock order: never invoked with ctx->lock held (all call sites drop it
+ * first), and the callbacks themselves (ao_wakeup, mp_filter_wakeup, the AO
+ * prime handler) never re-enter set_wakeup/set_audio_prime, so holding the
+ * client lock here cannot deadlock. */
 static void call_wakeup(wakeup_client *c) {
-  starfish_wakeup_cb cb = nullptr;
-  void *opaque = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(c->lock);
-    cb = c->cb;
-    opaque = c->opaque;
-  }
-  if (cb)
-    cb(opaque);
+  std::lock_guard<std::mutex> lk(c->lock);
+  if (c->cb)
+    c->cb(c->opaque);
 }
 
 static bool call_audio_prime(audio_prime_client *c, int64_t pts_ns) {
-  starfish_audio_prime_cb cb = nullptr;
-  void *opaque = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(c->lock);
-    cb = c->cb;
-    opaque = c->opaque;
-  }
-  return cb ? cb(opaque, pts_ns) : false;
+  std::lock_guard<std::mutex> lk(c->lock);
+  return c->cb ? c->cb(c->opaque, pts_ns) : false;
 }
 
 static void set_wakeup(wakeup_client *c, starfish_wakeup_cb cb, void *opaque) {
