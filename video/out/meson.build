@@ -62,7 +62,7 @@ lib_client_protocols = static_library('protocols',
                                       wl_protocols_source + wl_protocols_headers,
                                       dependencies: wayland['deps'][0])
 
-client_protocols = declare_dependency(link_with: lib_client_protocols,
+client_protocols = declare_dependency(link_whole: lib_client_protocols,
                                       sources: wl_protocols_headers)
 
 dependencies += [client_protocols, wayland['deps']]
