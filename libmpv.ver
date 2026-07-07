@@ -1,0 +1,18 @@
+/*
+ * Dynamic-export filter for libmpv.so (anonymous version node: filters the
+ * export table without introducing symbol versioning).
+ *
+ * meson's gnu_symbol_visibility=hidden only applies to objects compiled in
+ * this tree; static archives linked into libmpv (libass, harfbuzz, fribidi,
+ * the Rust libdovi + Rust stdlib, ...) re-export thousands of their global
+ * symbols through the shared library. That bloats .dynsym/.dynstr and slows
+ * every load/dlopen of the library. Only the mpv client API and the
+ * jellyfin-webos starfish integration hooks are part of the ABI.
+ */
+{
+global:
+    mpv_*;
+    starfish_*;
+local:
+    *;
+};

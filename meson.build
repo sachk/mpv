@@ -1868,9 +1868,20 @@ major = client_h_define.split('|')[0].split('<<')[0].strip('() ')
 minor = client_h_define.split('|')[1].strip('() ')
 client_api_version = major + '.' + minor + '.0'
 
+libmpv_link_args = cc.get_supported_link_arguments(['-Wl,-Bsymbolic'])
+libmpv_link_depends = []
+# gnu_symbol_visibility only covers objects built in this tree; static
+# archives linked into libmpv (libass, harfbuzz, Rust libdovi + stdlib, ...)
+# re-export thousands of their globals. Restrict the dynamic export table to
+# the actual ABI: the mpv client API and the starfish integration hooks.
+if host_machine.system() not in ['windows', 'cygwin', 'darwin']
+    libmpv_link_args += '-Wl,--version-script,' + meson.current_source_dir() / 'libmpv.ver'
+    libmpv_link_depends += files('libmpv.ver')
+endif
 libmpv = library('mpv', sources, dependencies: dependencies, gnu_symbol_visibility: 'hidden',
                  include_directories: incdir_public,
-                 link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']),
+                 link_args: libmpv_link_args,
+                 link_depends: libmpv_link_depends,
                  version: client_api_version, install: get_option('libmpv'),
                  build_by_default: get_option('libmpv'))
 
