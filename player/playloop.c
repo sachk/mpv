@@ -126,11 +126,13 @@ static bool is_alsa_audio_out(struct MPContext *mpctx)
     return name && strcmp(name, "alsa") == 0;
 }
 
+#if HAVE_STARFISH
 static bool is_starfish_audio_out(struct MPContext *mpctx)
 {
     const char *name = mpctx->ao ? ao_get_name(mpctx->ao) : NULL;
     return name && strcmp(name, "starfish") == 0;
 }
+#endif
 
 static bool starfish_split_clock(struct MPContext *mpctx)
 {
