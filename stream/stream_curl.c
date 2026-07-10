@@ -203,6 +203,7 @@ struct priv {
     uint64_t request_end;      // exclusive byte cap (0 = unbounded)
     int retry_count;           // consecutive failed attempts at request_start
     bool active;               // handle is currently active in the multi
+    bool response_ok;          // current response matches the requested bytes
     bool finished;             // current request has reached EOF
 
     // Parallel ranged prefetch. Requests fill private segment buffers and are
@@ -433,9 +434,8 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     struct priv *p = userdata;
     size_t bytes = size * nmemb;
 
-    // header_callback validated the response and logged any error status,
-    // we don't care about error body.
-    if (!p->stream_ok)
+    // Reject error bodies and servers that returned the wrong byte range.
+    if (!p->response_ok)
         return CURL_WRITEFUNC_ERROR;
 
     if (atomic_load_explicit(&p->aborted, memory_order_relaxed))
@@ -646,6 +646,7 @@ static void probe_http(struct priv *p, struct bstr line)
         }
     }
     p->stream_ok = true;
+    p->response_ok = true;
     schedule_dynamic = exact_range && range_start == p->request_start &&
                        p->opts->parallel_requests > 1 &&
                        p->opts->max_request_size > 0;
@@ -674,7 +675,37 @@ static void probe_ftp(struct priv *p, struct bstr line)
 
     p->seekable = p->content_size > 0;
     p->stream_ok = true;
+    p->response_ok = true;
     finalize_probe(p);
+}
+
+static void validate_http_response(struct priv *p, struct bstr line)
+{
+    if (line.len > 0)
+        return;
+
+    long resp = 0;
+    curl_easy_getinfo(p->curl, CURLINFO_RESPONSE_CODE, &resp);
+    if (resp < 200 || (resp >= 300 && resp < 400))
+        return;
+
+    uint64_t start = 0;
+    uint64_t end = 0;
+    int64_t total = -1;
+    bool valid =
+        is_http_success(resp) &&
+        (!p->seekable ||
+         (resp == 206 && p->primary_end > p->request_start &&
+          parse_content_range(header_value(p->curl, "Content-Range"),
+                              &start, &end, &total) &&
+          start == p->request_start && end == p->primary_end &&
+          total == p->content_size));
+    if (!valid) {
+        MP_WARN(p, "range %" PRIu64 "-%" PRIu64
+                   " rejected (HTTP %ld)\n",
+                p->request_start, p->primary_end - 1, resp);
+    }
+    p->response_ok = valid;
 }
 
 // Called per header line.
@@ -682,11 +713,14 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 {
     struct priv *p = userdata;
     size_t bytes = size * nitems;
-
-    if (p->probed)
-        return bytes;
-
     struct bstr line = bstr_strip_linebreaks((bstr){buffer, bytes});
+
+    if (p->probed) {
+        if (p->scheme->proto == MP_CURL_PROTO_HTTP)
+            validate_http_response(p, line);
+        return bytes;
+    }
+
     switch (p->scheme->proto) {
     case MP_CURL_PROTO_HTTP:
         probe_http(p, line);
@@ -731,6 +765,7 @@ static bool is_recoverable_error(CURLcode code)
     case CURLE_COULDNT_RESOLVE_HOST:
     case CURLE_HTTP2:
     case CURLE_HTTP2_STREAM:
+    case CURLE_WRITE_ERROR:
         return true;
     default:
         return false;
@@ -788,6 +823,7 @@ static void start_request(struct priv *p)
         curl_easy_setopt(p->curl, CURLOPT_RANGE, NULL);
     }
     p->primary_done = false;
+    p->response_ok = false;
 
     p->request_received = 0;
     p->active = true;
@@ -1020,15 +1056,20 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
         return;
     }
 
-    bool recoverable = !aborted && is_recoverable_error(code) &&
-                       request->retry_count < p->opts->max_retries;
+    bool response_rejected = !request->response_ok &&
+                             (code == CURLE_OK || code == CURLE_WRITE_ERROR);
+    bool recoverable =
+        !aborted && (response_rejected || is_recoverable_error(code)) &&
+        request->retry_count < p->opts->max_retries;
     if (recoverable) {
         request->retry_count++;
         request->size = 0;
         request->consumed = 0;
         request->response_ok = false;
+        const char *reason = response_rejected
+            ? "HTTP range rejected" : curl_easy_strerror(code);
         MP_WARN(p, "%s, retrying parallel range (#%d)\n",
-                curl_easy_strerror(code), request->retry_count);
+                reason, request->retry_count);
         CURLMcode result =
             curl_multi_add_handle(p->ctx->multi, request->curl);
         if (result == CURLM_OK) {
@@ -1077,7 +1118,7 @@ static void on_done(struct priv *p, CURLcode code)
     p->request_start += p->request_received;
     p->request_received = 0;
 
-    if (code == CURLE_OK && !aborted) {
+    if (code == CURLE_OK && p->response_ok && !aborted) {
         p->retry_count = 0;
         if (p->dynamic_supported) {
             p->primary_done = true;
@@ -1115,23 +1156,30 @@ static void on_done(struct priv *p, CURLcode code)
         return;
     }
 
-    // Try to recover if the stream is seekable and the failure looks
-    // recoverable.
-    bool recoverable = !aborted && p->seekable &&
-                       is_recoverable_error(code) &&
-                       p->retry_count < p->opts->max_retries;
+    // Retry transport failures and invalid HTTP responses from the next
+    // missing byte. Never append an error body to the media stream.
+    bool response_rejected = !p->response_ok &&
+                             (code == CURLE_OK || code == CURLE_WRITE_ERROR);
+    bool recoverable =
+        !aborted && p->seekable &&
+        (response_rejected || is_recoverable_error(code)) &&
+        p->retry_count < p->opts->max_retries;
     if (recoverable) {
         p->retry_count++;
+        const char *reason = response_rejected
+            ? "HTTP response rejected" : curl_easy_strerror(code);
         MP_WARN(p, "%s, retrying (#%d) from %" PRIu64 "\n",
-                curl_easy_strerror(code), p->retry_count, p->request_start);
+                reason, p->retry_count, p->request_start);
         start_request(p);
         return;
     }
 
-    if (p->dynamic_started)
-        cmd_async(p, CMD_FALLBACK_DYNAMIC);
-    if (!aborted)
-        log_curl_error(p, "transfer failed", code);
+    if (!aborted) {
+        if (response_rejected)
+            MP_ERR(p, "HTTP response rejected\n");
+        else
+            log_curl_error(p, "transfer failed", code);
+    }
 
     mp_mutex_lock(&p->mtx);
     p->stream_error = true;
