@@ -52,6 +52,12 @@ features = {
     'libplacebo': true,
 }
 
+starfish_deps = []
+starfish_opt = get_option('starfish')
+if not starfish_opt.disabled()
+    add_languages('cpp', required: starfish_opt)
+endif
+
 
 # generic sources
 sources = files(
@@ -487,6 +493,42 @@ if features['android']
                      'osdep/android/strnlen.c',
                      'video/out/android_common.c',
                      'video/out/vo_mediacodec_embed.c')
+endif
+
+if starfish_opt.disabled()
+    features += {'starfish': false}
+else
+    cpp = meson.get_compiler('cpp')
+    starfish_playerapis = dependency('libplayerAPIs', required: false)
+    if not starfish_playerapis.found() and cpp.has_header('starfish-media-pipeline/StarfishMediaAPIs.h')
+        starfish_playerapis = cc.find_library('playerAPIs', required: starfish_opt)
+    endif
+    starfish_playerfactory = dependency('libpf-1.0', required: false)
+    if not starfish_playerfactory.found() and cpp.has_header('player-factory/common.hpp')
+        starfish_playerfactory = cc.find_library('pf-1.0', required: starfish_opt)
+    endif
+    starfish_acb = dependency('libAcbAPI', required: false)
+    if not starfish_acb.found() and cc.has_header('appswitching-control-block/AcbAPI.h')
+        starfish_acb = cc.find_library('AcbAPI', required: starfish_opt)
+    endif
+    starfish_gobject = dependency('gobject-2.0', required: starfish_opt)
+    features += {'starfish': starfish_playerapis.found() and
+                              starfish_playerfactory.found() and
+                              starfish_acb.found() and
+                              starfish_gobject.found()}
+    if features['starfish']
+        starfish_deps = [starfish_playerapis, starfish_playerfactory,
+                         starfish_acb, starfish_gobject]
+        dependencies += starfish_deps
+        sources += files(
+            'audio/out/ao_starfish.c',
+            'video/decode/vd_starfish.c',
+            'video/out/starfish/starfish_backend.cpp',
+            'video/out/starfish/starfish_ctx.cpp',
+            'video/out/starfish/starfish_json.cpp',
+            'video/out/vo_starfish.c',
+        )
+    endif
 endif
 
 uwp_opt = get_option('uwp').require(
@@ -1049,16 +1091,31 @@ if features['d3d11']
                      'video/out/d3d11/ra_d3d11.c')
 endif
 
+webos_sdk_root = run_command('sh', '-c', 'printf %s "$WEBOS_SDK_ROOT"', check: false).stdout().strip()
+if webos_sdk_root == ''
+    webos_sdk_root = meson.project_source_root() / '..' / 'build' / 'webos-sdk' / 'arm-webos-linux-gnueabi_sdk-buildroot'
+endif
+
 wayland = {
-    'deps': [dependency('wayland-client', version: '>= 1.23.0', required: get_option('wayland')),
-             dependency('wayland-cursor', version: '>= 1.23.0', required: get_option('wayland')),
-             dependency('wayland-protocols', version: '>= 1.38', required: get_option('wayland')),
+    'deps': [dependency('wayland-client', version: '>= 1.11.0', required: get_option('wayland')),
+             dependency('wayland-cursor', version: '>= 1.11.0', required: get_option('wayland')),
              dependency('xkbcommon', version: '>= 0.3.0', required: get_option('wayland'))],
-    'header': cc.has_header('linux/input-event-codes.h', required: get_option('wayland'),
-                            # Pass CFLAGS from a related package as a hint for non-Linux
-                            dependencies: dependency('wayland-client', required: get_option('wayland'))),
-    'scanner': find_program('wayland-scanner', version: '>= 1.23.0', required: get_option('wayland')),
+    'scanner': find_program('wayland-scanner', required: get_option('wayland'),
+                            dirs: [webos_sdk_root / 'bin',
+                                   webos_sdk_root / 'arm-webos-linux-gnueabi/sysroot/usr/bin']),
 }
+wayland += {'header':
+    cc.has_header('linux/input-event-codes.h',
+                  dependencies: wayland['deps'][0], required: false) or
+    cc.has_header('linux/input.h',
+                  dependencies: wayland['deps'][0], required: get_option('wayland'))}
+pkgconf_native = find_program('pkg-config', native: true, required: get_option('wayland'))
+wayland_protocol_dir = run_command(pkgconf_native, '--variable=pkgdatadir',
+                                   'wayland-protocols', check: false).stdout().strip()
+if wayland_protocol_dir == ''
+    wayland_protocol_dir = run_command('sh', '-c', 'printf %s "$WAYLAND_PROTOCOLS_DIR"', check: false).stdout().strip()
+endif
+wayland += {'protocol_dir': wayland_protocol_dir}
 wayland_deps = true
 foreach dep: wayland['deps']
     if not dep.found()
@@ -1066,7 +1123,8 @@ foreach dep: wayland['deps']
         break
     endif
 endforeach
-features += {'wayland': wayland_deps and wayland['header'] and wayland['scanner'].found()}
+features += {'wayland': wayland_deps and wayland['header'] and
+                        wayland['scanner'].found() and wayland['protocol_dir'] != ''}
 
 if features['wayland']
     subdir(join_paths('video', 'out'))

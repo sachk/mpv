@@ -133,6 +133,12 @@ enum mp_voctrl {
     // Clipboard
     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
     VOCTRL_SET_CLIPBOARD,
+
+    // Starfish/webOS: video is presented by hardware, so mpv has no
+    // presentation feedback. The VO instead exports the hardware's playback
+    // clock so mpv audio sync (display-resample drift compensation) can slave
+    // to it.
+    VOCTRL_GET_EXTERNAL_VIDEO_CLOCK,     // struct voctrl_external_video_clock*
 };
 
 // Helper to expose what kind of content is currently playing to the VO.
@@ -140,6 +146,11 @@ enum mp_content_type {
     MP_CONTENT_NONE, // used for force-window
     MP_CONTENT_IMAGE,
     MP_CONTENT_VIDEO,
+};
+
+struct voctrl_external_video_clock {
+    double pts;
+    int64_t host_time_ns;
 };
 
 #define VO_TRUE         true

@@ -29,6 +29,7 @@ struct compositor_format;
 struct vo_wayland_seat;
 struct vo_wayland_tranche;
 struct vo_wayland_data_offer;
+struct wl_webos_foreign;
 
 struct drm_format {
     uint32_t format;
@@ -186,6 +187,7 @@ struct vo_wayland_state {
     struct wl_list seat_list;
     struct xkb_context *xkb_context;
     struct zwp_tablet_manager_v2 *wp_tablet_manager;
+    struct wl_webos_foreign *webos_foreign;
 
     /* Data offer */
     struct wl_data_device_manager *devman;

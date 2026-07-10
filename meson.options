@@ -55,6 +55,7 @@ option('pipewire', type: 'feature', value: 'auto', description: 'PipeWire audio 
 option('pulse', type: 'feature', value: 'auto', description: 'PulseAudio audio output')
 option('sdl2-audio', type: 'feature', value: 'disabled', description: 'SDL2 audio output')
 option('sndio', type: 'feature', value: 'auto', description: 'sndio audio output')
+option('starfish', type: 'feature', value: 'auto', description: 'LG webOS Starfish media pipeline')
 option('wasapi', type: 'feature', value: 'auto', description: 'WASAPI audio output')
 
 # video output features

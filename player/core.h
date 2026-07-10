@@ -353,6 +353,20 @@ typedef struct MPContext {
     bool display_sync_active;
     double audio_drift_compensation;
     double avd_filtered;
+    int64_t starfish_audio_sync_last_ns;
+    int64_t starfish_audio_sync_last_log_ns;
+    int64_t starfish_audio_sync_start_ns;
+    int64_t starfish_audio_sync_last_realign_ns;
+    int64_t starfish_audio_sync_hard_since_ns;
+    int starfish_audio_sync_hard_direction;
+    int64_t starfish_audio_clock_wait_start_ns;
+    bool starfish_audio_clock_wait_logged;
+    bool starfish_audio_sync_resync_pending;
+    double starfish_audio_sync_avd_filtered;
+    double starfish_audio_start_bias;
+    bool starfish_video_held_for_audio;
+    int64_t starfish_osd_last_redraw_ns;
+    int64_t starfish_osd_last_log_ns;
     // Timing error (in seconds) due to rounding on vsync boundaries
     double display_sync_error;
     // Number of mistimed frames.
@@ -504,6 +518,7 @@ struct mp_abort_entry {
 
 // audio.c
 void reset_audio_state(struct MPContext *mpctx);
+void mark_starfish_audio_sync_seek(struct MPContext *mpctx);
 void reinit_audio_chain(struct MPContext *mpctx);
 int init_audio_decoder(struct MPContext *mpctx, struct track *track);
 int reinit_audio_filters(struct MPContext *mpctx);

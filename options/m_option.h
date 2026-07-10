@@ -281,7 +281,11 @@ union m_option_value {
 // Keep fully zeroed instance of m_option_value to use as a default value, before
 // any specific union member is used. C standard says that `= {0}` activates and
 // initializes only the first member of the union, leaving padding bits undefined.
+#ifdef __cplusplus
+static const union m_option_value m_option_value_default = {};
+#else
 static const union m_option_value m_option_value_default;
+#endif
 
 ////////////////////////////////////////////////////////////////////////////
 

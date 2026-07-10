@@ -17,11 +17,20 @@
 
 #include <errno.h>
 #include <limits.h>
+#if defined(__has_include)
+#if __has_include(<linux/input-event-codes.h>)
 #include <linux/input-event-codes.h>
+#else
+#include <linux/input.h>
+#endif
+#else
+#include <linux/input.h>
+#endif
 #include <poll.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-cursor.h>
+#include <wayland-version.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include "common/msg.h"
@@ -56,6 +65,9 @@
 #include "tablet-unstable-v2.h"
 #include "cursor-shape-v1.h"
 #include "fifo-v1.h"
+#if HAVE_STARFISH
+#include "webos-foreign.h"
+#endif
 
 #if HAVE_WAYLAND_PROTOCOLS_1_41
 #include "color-management-v1.h"
@@ -65,12 +77,25 @@
 #include "color-representation-v1.h"
 #endif
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_WAYLAND_PROTOCOLS_1_48 && defined(__has_include)
+#if __has_include("xdg-session-management-v1.h")
 #include "xdg-session-management-v1.h"
+#define HAVE_XDG_SESSION_MANAGEMENT 1
+#endif
 #endif
 
 #ifndef CLOCK_MONOTONIC_RAW
 #define CLOCK_MONOTONIC_RAW 4
+#endif
+
+#define WAYLAND_VERSION_AT_LEAST(major, minor, micro) \
+    ((WAYLAND_VERSION_MAJOR > (major)) || \
+     (WAYLAND_VERSION_MAJOR == (major) && WAYLAND_VERSION_MINOR > (minor)) || \
+     (WAYLAND_VERSION_MAJOR == (major) && WAYLAND_VERSION_MINOR == (minor) && \
+      WAYLAND_VERSION_MICRO >= (micro)))
+
+#ifndef BTN_STYLUS3
+#define BTN_STYLUS3 0x14d
 #endif
 
 // From the fractional scale protocol
@@ -532,7 +557,9 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis_source = pointer_handle_axis_source,
     .axis_stop = pointer_handle_axis_stop,
     .axis_discrete = pointer_handle_axis_discrete,
+#if WAYLAND_VERSION_AT_LEAST(1, 19, 0)
     .axis_value120 = pointer_handle_axis_value120,
+#endif
 };
 
 static void touch_handle_down(void *data, struct wl_touch *wl_touch,
@@ -610,8 +637,10 @@ static const struct wl_touch_listener touch_listener = {
     .motion = touch_handle_motion,
     .frame = touch_handle_frame,
     .cancel = touch_handle_cancel,
+#if WAYLAND_VERSION_AT_LEAST(1, 12, 0)
     .shape = touch_handle_shape,
     .orientation = touch_handle_orientation,
+#endif
 };
 
 static void tablet_handle_name(void *data,
@@ -1658,8 +1687,10 @@ static const struct wl_output_listener output_listener = {
     .mode = output_handle_mode,
     .done = output_handle_done,
     .scale = output_handle_scale,
+#if WAYLAND_VERSION_AT_LEAST(1, 20, 0)
     .name = output_handle_name,
     .description = output_handle_description,
+#endif
 };
 
 static void surface_handle_enter(void *data, struct wl_surface *wl_surface,
@@ -1761,8 +1792,10 @@ static void surface_handle_preferred_buffer_transform(void *data,
 static const struct wl_surface_listener surface_listener = {
     .enter = surface_handle_enter,
     .leave = surface_handle_leave,
+#if WAYLAND_VERSION_AT_LEAST(1, 20, 0)
     .preferred_buffer_scale = surface_handle_preferred_buffer_scale,
     .preferred_buffer_transform = surface_handle_preferred_buffer_transform,
+#endif
 };
 
 static void xdg_wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial)
@@ -2724,7 +2757,7 @@ static const struct zwp_linux_dmabuf_feedback_v1_listener dmabuf_feedback_listen
     .tranche_flags = tranche_flags,
 };
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_XDG_SESSION_MANAGEMENT
 static void xdg_session_created(void *data, struct xdg_session_v1 *xdg_session_v1, const char *session_id)
 {
     struct vo_wayland_state *wl = data;
@@ -2755,7 +2788,7 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
     int found = 1;
     struct vo_wayland_state *wl = data;
 
-    if (!strcmp(interface, wl_compositor_interface.name) && (ver >= 4) && found++) {
+    if (!strcmp(interface, wl_compositor_interface.name) && (ver >= 1) && found++) {
         ver = MPMIN(ver, 6); /* Cap at 6 in case new events are added later. */
         wl->compositor = wl_registry_bind(reg, id, &wl_compositor_interface, ver);
         wl->surface = wl_compositor_create_surface(wl->compositor);
@@ -2927,7 +2960,14 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
         wl->wp_tablet_manager = wl_registry_bind(reg, id, &zwp_tablet_manager_v2_interface, ver);
     }
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_STARFISH
+    if (!strcmp(interface, wl_webos_foreign_interface.name) && found++) {
+        ver = 1;
+        wl->webos_foreign = wl_registry_bind(reg, id, &wl_webos_foreign_interface, ver);
+    }
+#endif
+
+#if HAVE_XDG_SESSION_MANAGEMENT
     if (wl->session_file &&
         !strcmp(interface, xdg_session_manager_v1_interface.name) &&
         found++)
@@ -3219,7 +3259,7 @@ static bool create_xdg_surface(struct vo_wayland_state *wl)
         return false;
     }
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_XDG_SESSION_MANAGEMENT
     if (wl->xdg_session) {
         wl->xdg_toplevel_session =
             xdg_session_v1_restore_toplevel(wl->xdg_session, wl->xdg_toplevel, "mpv");
@@ -3289,7 +3329,7 @@ static void get_compositor_preferred_description(struct vo_wayland_state *wl)
         wp_color_management_surface_feedback_v1_get_preferred(wl->color_surface_feedback);
     struct wp_image_description_info_v1 *description_info =
         wp_image_description_v1_get_information(image_description);
-    struct wl_event_queue *image_description_info_queue = wl_display_create_queue_with_name(wl->display, "image description info queue");
+    struct wl_event_queue *image_description_info_queue = wl_display_create_queue(wl->display);
     wl->image_description_info_done = false;
     wl_proxy_set_queue((struct wl_proxy *)description_info, image_description_info_queue);
     wp_image_description_info_v1_add_listener(description_info, &image_description_info_listener, wd);
@@ -4567,7 +4607,7 @@ bool vo_wayland_init(struct vo *vo)
     if (wl->color_manager) {
         wl->color_surface_feedback = wp_color_manager_v1_get_surface_feedback(wl->color_manager, wl->callback_surface);
         wp_color_management_surface_feedback_v1_add_listener(wl->color_surface_feedback, &surface_feedback_listener, wl);
-        wl->color_queue = wl_display_create_queue_with_name(wl->display, "image description creator queue");
+        wl->color_queue = wl_display_create_queue(wl->display);
     } else {
         MP_VERBOSE(wl, "Compositor doesn't support the %s protocol!\n",
                    wp_color_manager_v1_interface.name);
@@ -4883,6 +4923,11 @@ void vo_wayland_uninit(struct vo *vo)
     if (wl->video_subsurface)
         wl_subsurface_destroy(wl->video_subsurface);
 
+#if HAVE_STARFISH
+    if (wl->webos_foreign)
+        wl_webos_foreign_destroy(wl->webos_foreign);
+#endif
+
     if (wl->wm_base)
         xdg_wm_base_destroy(wl->wm_base);
 
@@ -4915,7 +4960,7 @@ void vo_wayland_uninit(struct vo *vo)
     if (wl->wp_tablet_manager)
         zwp_tablet_manager_v2_destroy(wl->wp_tablet_manager);
 
-#if HAVE_WAYLAND_PROTOCOLS_1_48
+#if HAVE_XDG_SESSION_MANAGEMENT
     if (wl->xdg_toplevel_session)
         xdg_toplevel_session_v1_destroy(wl->xdg_toplevel_session);
 

@@ -229,7 +229,8 @@ static char *create_fname(struct MPContext *mpctx, char *template,
         case 't': {
             char tfmt = *template;
             // Translate common extensions to the closest alternative.
-            size_t i = strcspn("sklPaAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%", (char[]){tfmt, '\0'});
+            char reject[] = {tfmt, '\0'};
+            size_t i = strcspn("sklPaAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%", reject);
             tfmt =             "sHIpaAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%"[i];
             if (!tfmt || !local_time)
                 goto error_exit;

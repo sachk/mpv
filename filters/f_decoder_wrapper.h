@@ -72,6 +72,7 @@ enum dec_ctrl {
     VDCTRL_GET_HWDEC,
     VDCTRL_REINIT,
     VDCTRL_GET_BFRAMES,
+    VDCTRL_SET_START_PTS,
     // framedrop mode: 0=none, 1=standard, 2=hrseek
     VDCTRL_SET_FRAMEDROP,
     VDCTRL_CHECK_FORCED_EOF,
@@ -104,6 +105,7 @@ struct mp_decoder_fns {
 };
 
 extern const struct mp_decoder_fns vd_lavc;
+extern const struct mp_decoder_fns vd_starfish;
 extern const struct mp_decoder_fns ad_lavc;
 extern const struct mp_decoder_fns ad_spdif;
 
