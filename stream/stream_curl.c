@@ -82,6 +82,7 @@ struct curl_opts {
     double connect_timeout;
     int64_t buffer_size;
     int64_t max_request_size;
+    int parallel_requests;
 };
 
 #ifndef CURL_HTTP_VERSION_3
@@ -113,6 +114,7 @@ const struct m_sub_options curl_conf = {
             M_RANGE(2 * CURL_MAX_WRITE_SIZE, M_MAX_MEM_BYTES)},
         {"max-request-size", OPT_BYTE_SIZE(max_request_size),
             M_RANGE(0, M_MAX_MEM_BYTES)},
+        {"parallel-requests", OPT_INT(parallel_requests), M_RANGE(1, 16)},
         {0}
     },
     .defaults = &(const struct curl_opts) {
@@ -125,6 +127,7 @@ const struct m_sub_options curl_conf = {
         .connect_timeout = 30,
         .buffer_size = 4 << 20, // 4 MiB
         .max_request_size = 0,
+        .parallel_requests = 1,
     },
     .size = sizeof(struct curl_opts),
 };
@@ -146,6 +149,33 @@ struct curl_ctx {
     bool exit;
 };
 
+struct priv;
+
+enum curl_handle_kind {
+    CURL_HANDLE_PRIMARY,
+    CURL_HANDLE_DYNAMIC,
+};
+
+struct curl_handle_ref {
+    enum curl_handle_kind kind;
+    struct priv *p;
+};
+
+struct dynamic_request {
+    struct curl_handle_ref ref;
+    CURL *curl;
+    uint8_t *data;
+    size_t size;
+    size_t consumed;
+    uint64_t start;
+    uint64_t end;
+    int retry_count;
+    bool active;
+    bool scheduled;
+    bool ready;
+    bool response_ok;
+};
+
 // Per-stream state, owned by the curl thread.
 struct priv {
     struct mp_log *log;
@@ -157,6 +187,7 @@ struct priv {
     struct mp_network_opts *net_opts;
 
     CURL *curl;
+    struct curl_handle_ref primary_ref;
     struct curl_slist *headers;
     char *url;
     const char *effective_url;
@@ -174,6 +205,17 @@ struct priv {
     bool active;               // handle is currently active in the multi
     bool finished;             // current request has reached EOF
 
+    // Parallel ranged prefetch. Requests fill private segment buffers and are
+    // appended to the shared ring in byte order after the primary request.
+    struct dynamic_request *requests;
+    uint8_t *request_data;
+    int num_requests;
+    uint64_t primary_end;
+    uint64_t next_schedule;
+    bool dynamic_started;
+    bool dynamic_supported;
+    bool primary_done;
+
     // Probe state. Set on the curl thread read by curl_open after.
     bool probed;
     bool stream_ok;
@@ -185,6 +227,7 @@ struct priv {
     size_t buffer_size;
     size_t head, tail, count;
     bool paused;         // write callback paused due to a full buffer
+    bool dynamic_waiting; // completed ordered range is blocked on ring space
     bool stream_eof;     // producer has delivered all data
     bool stream_error;   // unrecoverable error
     atomic_bool aborted; // canceled by user (mp_cancel)
@@ -198,6 +241,9 @@ enum cmd_kind {
     CMD_SEEK,
     CMD_UNPAUSE,
     CMD_EXIT,
+    CMD_START_DYNAMIC,
+    CMD_PUMP,
+    CMD_FALLBACK_DYNAMIC,
 };
 
 struct cmd {
@@ -210,6 +256,12 @@ struct cmd {
 
 static void start_request(struct priv *p);
 static void on_done(struct priv *p, CURLcode code);
+static void start_dynamic(struct priv *p);
+static void pump_dynamic(struct priv *p);
+static void stop_dynamic(struct priv *p);
+static void on_dynamic_done(struct dynamic_request *request, CURLcode code);
+static void fallback_dynamic(struct priv *p);
+static void setup_curl(struct priv *p, CURL *curl);
 
 static void run_cmd(void *arg)
 {
@@ -221,6 +273,7 @@ static void run_cmd(void *arg)
         start_request(c->p);
         break;
     case CMD_REMOVE:
+        stop_dynamic(c->p);
         if (c->p->active) {
             MP_TRACE(c->p, "removing curl handle\n");
             curl_multi_remove_handle(ctx->multi, c->p->curl);
@@ -237,6 +290,7 @@ static void run_cmd(void *arg)
         curl_easy_pause(c->p->curl, CURLPAUSE_CONT);
         break;
     case CMD_SEEK:
+        stop_dynamic(c->p);
         MP_TRACE(c->p, "seeking to %" PRIu64 "\n", c->pos);
         if (c->p->active) {
             curl_multi_remove_handle(ctx->multi, c->p->curl);
@@ -254,7 +308,17 @@ static void run_cmd(void *arg)
         c->p->request_received = 0;
         c->p->retry_count = 0;
         c->p->finished = false;
+        c->p->primary_done = false;
         start_request(c->p);
+        break;
+    case CMD_START_DYNAMIC:
+        start_dynamic(c->p);
+        break;
+    case CMD_PUMP:
+        pump_dynamic(c->p);
+        break;
+    case CMD_FALLBACK_DYNAMIC:
+        fallback_dynamic(c->p);
         break;
     case CMD_EXIT:
         ctx->exit = true;
@@ -317,12 +381,18 @@ static MP_THREAD_VOID curl_thread(void *arg)
         while ((msg = curl_multi_info_read(ctx->multi, &left))) {
             if (msg->msg != CURLMSG_DONE)
                 continue;
-            struct priv *p = NULL;
-            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &p);
-            mp_assert(p);
+            struct curl_handle_ref *ref = NULL;
+            curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &ref);
+            mp_assert(ref && ref->p);
             curl_multi_remove_handle(ctx->multi, msg->easy_handle);
-            p->active = false;
-            on_done(p, msg->data.result);
+            if (ref->kind == CURL_HANDLE_PRIMARY) {
+                ref->p->active = false;
+                on_done(ref->p, msg->data.result);
+            } else {
+                struct dynamic_request *request = (struct dynamic_request *)ref;
+                request->active = false;
+                on_dynamic_done(request, msg->data.result);
+            }
         }
 
         curl_multi_poll(ctx->multi, NULL, 0, 1000, NULL);
@@ -415,12 +485,92 @@ static int64_t parse_content_range_total(const char *value)
     return (rest.len == 0 && total > 0) ? (int64_t)total : -1;
 }
 
+static bool parse_content_range(const char *value, uint64_t *start,
+                                uint64_t *end, int64_t *total)
+{
+    unsigned long long first = 0;
+    unsigned long long last = 0;
+    long long size = 0;
+    char trailing = '\0';
+    if (!value ||
+        sscanf(value, "bytes %llu-%llu/%lld %c",
+               &first, &last, &size, &trailing) != 3 ||
+        last < first || size <= 0 || last >= (unsigned long long)size)
+    {
+        return false;
+    }
+    *start = first;
+    *end = last + 1;
+    *total = size;
+    return true;
+}
+
+static size_t dynamic_write_callback(char *ptr, size_t size, size_t nmemb,
+                                     void *userdata)
+{
+    struct dynamic_request *request = userdata;
+    struct priv *p = request->ref.p;
+    size_t bytes = size * nmemb;
+
+    if (!request->response_ok ||
+        atomic_load_explicit(&p->aborted, memory_order_relaxed) ||
+        bytes > request->end - request->start - request->size)
+    {
+        return CURL_WRITEFUNC_ERROR;
+    }
+
+    memcpy(request->data + request->size, ptr, bytes);
+    request->size += bytes;
+    return bytes;
+}
+
+static int dynamic_xferinfo_callback(void *userdata, curl_off_t dl_total,
+                                     curl_off_t dl_now, curl_off_t ul_total,
+                                     curl_off_t ul_now)
+{
+    struct dynamic_request *request = userdata;
+    return atomic_load_explicit(&request->ref.p->aborted, memory_order_relaxed);
+}
+
 static const char *header_value(CURL *c, const char *name)
 {
     struct curl_header *h = NULL;
     if (curl_easy_header(c, name, 0, CURLH_HEADER, -1, &h) == CURLHE_OK)
         return h->value;
     return NULL;
+}
+
+static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
+                                      void *userdata)
+{
+    struct dynamic_request *request = userdata;
+    struct priv *p = request->ref.p;
+    size_t bytes = size * nitems;
+    struct bstr line = bstr_strip_linebreaks((bstr){buffer, bytes});
+    if (line.len > 0)
+        return bytes;
+
+    long resp = 0;
+    curl_easy_getinfo(request->curl, CURLINFO_RESPONSE_CODE, &resp);
+    if (resp < 200 || (resp >= 300 && resp < 400))
+        return bytes;
+
+    uint64_t start = 0;
+    uint64_t end = 0;
+    int64_t total = -1;
+    bool valid =
+        resp == 206 &&
+        parse_content_range(header_value(request->curl, "Content-Range"),
+                            &start, &end, &total) &&
+        start == request->start && end == request->end &&
+        total == p->content_size;
+    if (!valid) {
+        MP_WARN(p, "parallel range %" PRIu64 "-%" PRIu64
+                   " rejected (HTTP %ld)\n",
+                request->start, request->end - 1, resp);
+    }
+    request->response_ok = valid;
+    return bytes;
 }
 
 static void finalize_probe(struct priv *p)
@@ -445,6 +595,7 @@ static void finalize_probe(struct priv *p)
 // we care about the final one.
 static void probe_http(struct priv *p, struct bstr line)
 {
+    bool schedule_dynamic = false;
     if (line.len > 0)
         return;
 
@@ -469,21 +620,40 @@ static void probe_http(struct priv *p, struct bstr line)
     // byte ranges, so trust either.
     p->seekable = !compressed && (resp == 206 || accept_ranges);
 
+    uint64_t range_start = 0;
+    uint64_t range_end = 0;
+    int64_t total = -1;
+    bool exact_range =
+        resp == 206 &&
+        parse_content_range(header_value(p->curl, "Content-Range"),
+                            &range_start, &range_end, &total);
     if (p->seekable) {
-        // Content-Range carries the full size on a partial response. On any
-        // non-206 success code use Content-Length.
-        int64_t total = parse_content_range_total(header_value(p->curl, "Content-Range"));
-        if (total < 0 && resp != 206) {
-            curl_off_t cl = -1;
-            if (curl_easy_getinfo(p->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
-                                  &cl) == CURLE_OK && cl >= 0)
-                total = cl;
+        if (exact_range) {
+            p->content_size = total;
+            p->primary_end = range_end;
+        } else {
+            // On any non-206 success code use Content-Length.
+            if (resp != 206) {
+                curl_off_t cl = -1;
+                if (curl_easy_getinfo(p->curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
+                                      &cl) == CURLE_OK && cl >= 0)
+                    total = cl;
+            } else {
+                total = parse_content_range_total(
+                    header_value(p->curl, "Content-Range"));
+            }
+            p->content_size = total;
         }
-        p->content_size = total;
     }
     p->stream_ok = true;
+    schedule_dynamic = exact_range && range_start == p->request_start &&
+                       p->opts->parallel_requests > 1 &&
+                       p->opts->max_request_size > 0;
+    p->dynamic_supported = schedule_dynamic;
 done:
     finalize_probe(p);
+    if (p->stream_ok && schedule_dynamic)
+        cmd_async(p, CMD_START_DYNAMIC);
 }
 
 static void probe_ftp(struct priv *p, struct bstr line)
@@ -597,24 +767,280 @@ static void start_request(struct priv *p)
     char range[64];
     if (chunked || capped) {
         uint64_t end = UINT64_MAX;
-        if (chunked)
-            end = start + p->opts->max_request_size - 1;
+        if (chunked) {
+            uint64_t bytes = p->opts->max_request_size;
+            end = bytes - 1 > UINT64_MAX - start
+                ? UINT64_MAX : start + bytes - 1;
+        }
         if (p->content_size > 0)
             end = MPMIN(end, p->content_size - 1);
         if (capped)
             end = MPMIN(end, p->request_end - 1);
+        if (p->dynamic_started && p->primary_end > start)
+            end = MPMIN(end, p->primary_end - 1);
         snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64, start, end);
         curl_easy_setopt(p->curl, CURLOPT_RANGE, range);
+        p->primary_end = end == UINT64_MAX ? 0 : end + 1;
     } else if (ranged) {
         snprintf(range, sizeof(range), "%" PRIu64 "-", start);
         curl_easy_setopt(p->curl, CURLOPT_RANGE, range);
     } else {
         curl_easy_setopt(p->curl, CURLOPT_RANGE, NULL);
     }
+    p->primary_done = false;
 
     p->request_received = 0;
     p->active = true;
     curl_multi_add_handle(p->ctx->multi, p->curl);
+    if (p->probed && p->dynamic_supported)
+        start_dynamic(p);
+}
+
+static uint64_t dynamic_limit(const struct priv *p)
+{
+    uint64_t limit = p->content_size;
+    if (p->request_end > 0)
+        limit = MPMIN(limit, p->request_end);
+    return limit;
+}
+
+static bool schedule_dynamic_request(struct dynamic_request *request)
+{
+    struct priv *p = request->ref.p;
+    uint64_t limit = dynamic_limit(p);
+    if (request->scheduled || p->next_schedule >= limit)
+        return false;
+
+    uint64_t bytes = p->opts->max_request_size;
+    uint64_t end = p->next_schedule +
+                   MPMIN(bytes, limit - p->next_schedule);
+    request->start = p->next_schedule;
+    request->end = end;
+    request->size = 0;
+    request->consumed = 0;
+    request->retry_count = 0;
+    request->response_ok = false;
+    request->ready = false;
+    request->scheduled = true;
+    p->next_schedule = end;
+
+    char range[64];
+    snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64,
+             request->start, request->end - 1);
+    curl_easy_setopt(request->curl, CURLOPT_RANGE, range);
+    CURLMcode result = curl_multi_add_handle(p->ctx->multi, request->curl);
+    if (result != CURLM_OK) {
+        request->scheduled = false;
+        MP_WARN(p, "could not schedule parallel range: %s\n",
+                curl_multi_strerror(result));
+        cmd_async(p, CMD_FALLBACK_DYNAMIC);
+        return false;
+    }
+    request->active = true;
+    MP_TRACE(p, "prefetching range %" PRIu64 "-%" PRIu64 "\n",
+             request->start, request->end - 1);
+    return true;
+}
+
+static void stop_dynamic(struct priv *p)
+{
+    for (int n = 0; n < p->num_requests; n++) {
+        struct dynamic_request *request = &p->requests[n];
+        if (request->active) {
+            curl_multi_remove_handle(p->ctx->multi, request->curl);
+            request->active = false;
+        }
+        if (request->curl)
+            curl_easy_cleanup(request->curl);
+    }
+    talloc_free(p->request_data);
+    talloc_free(p->requests);
+    p->request_data = NULL;
+    p->requests = NULL;
+    p->num_requests = 0;
+    p->dynamic_started = false;
+    mp_mutex_lock(&p->mtx);
+    p->dynamic_waiting = false;
+    mp_mutex_unlock(&p->mtx);
+}
+
+static void start_dynamic(struct priv *p)
+{
+    uint64_t segment_size = p->opts->max_request_size;
+    int count = p->opts->parallel_requests;
+    if (p->dynamic_started || !p->dynamic_supported ||
+        p->content_size <= 0 || p->primary_end < p->request_start)
+    {
+        return;
+    }
+    if (segment_size > SIZE_MAX ||
+        (size_t)count > SIZE_MAX / (size_t)segment_size)
+    {
+        MP_WARN(p, "parallel range buffer size is too large\n");
+        p->dynamic_supported = false;
+        return;
+    }
+
+    size_t segment_bytes = segment_size;
+    uint64_t limit = dynamic_limit(p);
+    p->primary_end = MPMIN(p->primary_end, limit);
+    p->next_schedule = p->primary_end;
+    p->num_requests = count;
+    p->requests = talloc_zero_array(p, struct dynamic_request, count);
+    p->request_data = talloc_size(p, count * segment_bytes);
+    if (!p->requests || !p->request_data) {
+        MP_WARN(p, "could not allocate parallel range requests\n");
+        talloc_free(p->request_data);
+        talloc_free(p->requests);
+        p->request_data = NULL;
+        p->requests = NULL;
+        p->num_requests = 0;
+        p->dynamic_supported = false;
+        return;
+    }
+    p->dynamic_started = true;
+
+    for (int n = 0; n < count; n++) {
+        struct dynamic_request *request = &p->requests[n];
+        request->ref.kind = CURL_HANDLE_DYNAMIC;
+        request->ref.p = p;
+        request->curl = curl_easy_init();
+        request->data = p->request_data + n * segment_bytes;
+        if (!request->curl) {
+            MP_WARN(p, "could not allocate parallel range request\n");
+            p->dynamic_supported = false;
+            stop_dynamic(p);
+            return;
+        }
+        setup_curl(p, request->curl);
+        curl_easy_setopt(request->curl, CURLOPT_PRIVATE, &request->ref);
+        curl_easy_setopt(request->curl, CURLOPT_WRITEFUNCTION,
+                         dynamic_write_callback);
+        curl_easy_setopt(request->curl, CURLOPT_WRITEDATA, request);
+        curl_easy_setopt(request->curl, CURLOPT_HEADERFUNCTION,
+                         dynamic_header_callback);
+        curl_easy_setopt(request->curl, CURLOPT_HEADERDATA, request);
+        curl_easy_setopt(request->curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(request->curl, CURLOPT_XFERINFOFUNCTION,
+                         dynamic_xferinfo_callback);
+        curl_easy_setopt(request->curl, CURLOPT_XFERINFODATA, request);
+    }
+
+    int initial = p->active ? count - 1 : count;
+    for (int n = 0; n < initial; n++)
+        schedule_dynamic_request(&p->requests[n]);
+
+    MP_VERBOSE(p, "parallel ranged streaming enabled: %d requests, "
+                  "%" PRIu64 " byte ranges\n",
+               count, segment_size);
+}
+
+static void pump_dynamic(struct priv *p)
+{
+    if (!p->dynamic_started || !p->primary_done)
+        return;
+
+    for (;;) {
+        struct dynamic_request *next = NULL;
+        for (int n = 0; n < p->num_requests; n++) {
+            struct dynamic_request *request = &p->requests[n];
+            if (request->ready &&
+                request->start + request->consumed == p->request_start)
+            {
+                next = request;
+                break;
+            }
+        }
+        if (!next)
+            break;
+
+        size_t available = next->size - next->consumed;
+        mp_mutex_lock(&p->mtx);
+        size_t space = p->buffer_size - p->count;
+        size_t copy = MPMIN(space, available);
+        if (copy > 0) {
+            size_t tail_chunk = MPMIN(p->buffer_size - p->tail, copy);
+            memcpy(p->buffer + p->tail, next->data + next->consumed,
+                   tail_chunk);
+            memcpy(p->buffer, next->data + next->consumed + tail_chunk,
+                   copy - tail_chunk);
+            p->tail = (p->tail + copy) % p->buffer_size;
+            p->count += copy;
+            next->consumed += copy;
+            p->request_start += copy;
+            mp_cond_broadcast(&p->cond);
+        }
+        if (copy == 0)
+            p->dynamic_waiting = true;
+        mp_mutex_unlock(&p->mtx);
+
+        if (copy == 0)
+            return;
+        if (next->consumed < next->size)
+            continue;
+
+        next->scheduled = false;
+        next->ready = false;
+        schedule_dynamic_request(next);
+    }
+
+    if (p->request_start >= dynamic_limit(p)) {
+        p->finished = true;
+        mp_mutex_lock(&p->mtx);
+        p->stream_eof = true;
+        p->dynamic_waiting = false;
+        mp_cond_broadcast(&p->cond);
+        mp_mutex_unlock(&p->mtx);
+    }
+}
+
+static void fallback_dynamic(struct priv *p)
+{
+    if (!p->dynamic_started)
+        return;
+    bool resume_primary =
+        p->primary_done &&
+        !atomic_load_explicit(&p->aborted, memory_order_relaxed);
+    stop_dynamic(p);
+    p->dynamic_supported = false;
+    if (resume_primary)
+        start_request(p);
+}
+
+static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
+{
+    struct priv *p = request->ref.p;
+    bool aborted = atomic_load_explicit(&p->aborted, memory_order_relaxed);
+    size_t expected = request->end - request->start;
+    if (code == CURLE_OK && request->response_ok &&
+        request->size == expected && !aborted)
+    {
+        request->ready = true;
+        pump_dynamic(p);
+        return;
+    }
+
+    bool recoverable = !aborted && is_recoverable_error(code) &&
+                       request->retry_count < p->opts->max_retries;
+    if (recoverable) {
+        request->retry_count++;
+        request->size = 0;
+        request->consumed = 0;
+        request->response_ok = false;
+        MP_WARN(p, "%s, retrying parallel range (#%d)\n",
+                curl_easy_strerror(code), request->retry_count);
+        CURLMcode result =
+            curl_multi_add_handle(p->ctx->multi, request->curl);
+        if (result == CURLM_OK) {
+            request->active = true;
+            return;
+        }
+    }
+
+    if (!aborted) {
+        MP_WARN(p, "parallel range failed; continuing with one request\n");
+        cmd_async(p, CMD_FALLBACK_DYNAMIC);
+    }
 }
 
 static void log_curl_error(struct priv *p, const char *what, CURLcode code)
@@ -653,6 +1079,25 @@ static void on_done(struct priv *p, CURLcode code)
 
     if (code == CURLE_OK && !aborted) {
         p->retry_count = 0;
+        if (p->dynamic_supported) {
+            p->primary_done = true;
+            if (!p->dynamic_started)
+                start_dynamic(p);
+            if (p->dynamic_started) {
+                if (p->request_start != p->primary_end) {
+                    MP_WARN(p, "primary range ended at unexpected offset; "
+                               "continuing with one request\n");
+                    cmd_async(p, CMD_FALLBACK_DYNAMIC);
+                    return;
+                }
+                for (int n = 0; n < p->num_requests; n++) {
+                    if (!p->requests[n].scheduled)
+                        schedule_dynamic_request(&p->requests[n]);
+                }
+                pump_dynamic(p);
+                return;
+            }
+        }
 
         bool chunked = p->seekable && p->opts->max_request_size > 0;
         bool past_size = p->content_size > 0 && p->request_start >= p->content_size;
@@ -683,6 +1128,8 @@ static void on_done(struct priv *p, CURLcode code)
         return;
     }
 
+    if (p->dynamic_started)
+        cmd_async(p, CMD_FALLBACK_DYNAMIC);
     if (!aborted)
         log_curl_error(p, "transfer failed", code);
 
@@ -720,22 +1167,10 @@ static struct curl_slist *build_header_list(struct priv *p)
     return list;
 }
 
-static void setup_curl(struct priv *p)
+static void setup_curl(struct priv *p, CURL *c)
 {
-    CURL *c = p->curl;
-
     curl_easy_setopt(c, CURLOPT_URL, p->url);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(c, CURLOPT_PRIVATE, p);
-
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, p);
-    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_callback);
-    curl_easy_setopt(c, CURLOPT_HEADERDATA, p);
-    // enable progress callback, so we can cancel transfer at any point
-    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
-    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
-    curl_easy_setopt(c, CURLOPT_XFERINFODATA, p);
 
     // Enable verbose output with trace level logging.
     curl_easy_setopt(c, CURLOPT_VERBOSE, mp_msg_test(p->log, MSGL_TRACE) ? 1L : 0L);
@@ -793,7 +1228,6 @@ static void setup_curl(struct priv *p)
         }
     }
 
-    p->headers = build_header_list(p);
     if (p->headers)
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, p->headers);
 }
@@ -825,11 +1259,17 @@ static int curl_fill_buffer(struct stream *s, void *buffer, int max_len)
 
     bool unpause = p->paused && !p->stream_eof && !p->stream_error &&
                    p->buffer_size - p->count >= p->buffer_size / 2;
+    bool pump = p->dynamic_waiting && !p->stream_eof && !p->stream_error &&
+                p->buffer_size - p->count >= p->buffer_size / 2;
+    if (pump)
+        p->dynamic_waiting = false;
 
     mp_mutex_unlock(&p->mtx);
 
     if (unpause)
         cmd_async(p, CMD_UNPAUSE);
+    if (pump)
+        cmd_async(p, CMD_PUMP);
 
     return copy;
 }
@@ -925,7 +1365,20 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
         return STREAM_ERROR;
     }
 
-    setup_curl(p);
+    p->headers = build_header_list(p);
+    p->primary_ref = (struct curl_handle_ref) {
+        .kind = CURL_HANDLE_PRIMARY,
+        .p = p,
+    };
+    setup_curl(p, p->curl);
+    curl_easy_setopt(p->curl, CURLOPT_PRIVATE, &p->primary_ref);
+    curl_easy_setopt(p->curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(p->curl, CURLOPT_WRITEDATA, p);
+    curl_easy_setopt(p->curl, CURLOPT_HEADERFUNCTION, header_callback);
+    curl_easy_setopt(p->curl, CURLOPT_HEADERDATA, p);
+    curl_easy_setopt(p->curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(p->curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
+    curl_easy_setopt(p->curl, CURLOPT_XFERINFODATA, p);
     mp_cancel_set_cb(s->cancel, on_cancel, p);
 
     cmd_sync(p, CMD_ADD, 0, false);

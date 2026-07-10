@@ -5791,6 +5791,17 @@ TLS/connection diagnostics), set ``--msg-level=curl=trace``.
     full speed but a single long-lived connection is rate-limited. Ignored for
     non-seekable streams.
 
+``--curl-parallel-requests=<1-16>``
+    Download consecutive byte ranges concurrently and deliver them to the
+    demuxer in order (default: 1, i.e. disabled). This can increase throughput
+    when a server or network path limits each connection.
+
+    Parallel requests require HTTP, a known content length, byte-range support,
+    and a non-zero ``--curl-max-request-size``. If a parallel response is
+    invalid or fails permanently, mpv discards the speculative ranges and
+    transparently continues with one request. Each request can buffer up to
+    ``--curl-max-request-size`` bytes, in addition to ``--curl-buffer-size``.
+
 DVB
 ---
 
