@@ -152,11 +152,21 @@ struct curl_ctx {
     bool exit;
     atomic_int active_requests;
     atomic_int peak_active_requests;
+    atomic_int active_streams;
+    atomic_int peak_active_streams;
+    atomic_int requests_per_stream;
+    atomic_int_fast64_t range_bytes;
+    atomic_int_fast64_t ring_bytes;
     atomic_uint_fast64_t started_requests;
     atomic_uint_fast64_t finished_requests;
     atomic_uint_fast64_t failed_requests;
     atomic_uint_fast64_t retry_attempts;
     atomic_uint_fast64_t received_bytes;
+    atomic_int_fast64_t first_received_ns;
+    atomic_int_fast64_t last_received_ns;
+    atomic_int_fast64_t rate_window_started_ns;
+    atomic_uint_fast64_t rate_window_bytes;
+    atomic_int_fast64_t peak_received_bytes_per_second;
 };
 
 struct priv;
@@ -231,6 +241,7 @@ struct priv {
     // Probe state. Set on the curl thread read by curl_open after.
     bool probed;
     bool stream_ok;
+    bool metrics_registered;
 
     // Shared state, protected by mtx.
     mp_mutex mtx;
@@ -312,6 +323,36 @@ static void finish_curl_request(struct curl_ctx *ctx, bool succeeded)
     if (!succeeded)
         atomic_fetch_add_explicit(&ctx->failed_requests, 1,
                                   memory_order_relaxed);
+}
+
+static void register_curl_stream(struct priv *p)
+{
+    p->metrics_registered = true;
+    int active = atomic_fetch_add_explicit(&p->ctx->active_streams, 1,
+                                            memory_order_relaxed) + 1;
+    int peak = atomic_load_explicit(&p->ctx->peak_active_streams,
+                                    memory_order_relaxed);
+    while (active > peak &&
+           !atomic_compare_exchange_weak_explicit(
+               &p->ctx->peak_active_streams, &peak, active,
+               memory_order_relaxed, memory_order_relaxed))
+    {}
+    atomic_store_explicit(&p->ctx->requests_per_stream,
+                          p->opts->parallel_requests, memory_order_relaxed);
+    atomic_store_explicit(&p->ctx->range_bytes, p->opts->max_request_size,
+                          memory_order_relaxed);
+    atomic_store_explicit(&p->ctx->ring_bytes, p->opts->buffer_size,
+                          memory_order_relaxed);
+}
+
+static void unregister_curl_stream(struct priv *p)
+{
+    if (!p->metrics_registered)
+        return;
+    p->metrics_registered = false;
+    int previous = atomic_fetch_sub_explicit(&p->ctx->active_streams, 1,
+                                              memory_order_relaxed);
+    mp_assert(previous > 0);
 }
 
 static void run_cmd(void *arg)
@@ -491,12 +532,37 @@ bool mp_curl_get_metrics(struct mpv_global *global,
         return false;
 
     struct curl_ctx *ctx = global->curl;
+    int64_t received =
+        atomic_load_explicit(&ctx->received_bytes, memory_order_relaxed);
+    int64_t first =
+        atomic_load_explicit(&ctx->first_received_ns, memory_order_relaxed);
+    int64_t last =
+        atomic_load_explicit(&ctx->last_received_ns, memory_order_relaxed);
+    int64_t average = last > first
+        ? (int64_t)((double)received / MP_TIME_NS_TO_S(last - first))
+        : 0;
+    int64_t peak = atomic_load_explicit(
+        &ctx->peak_received_bytes_per_second, memory_order_relaxed);
+    peak = MPMAX(peak, average);
+
     *metrics = (struct mp_curl_metrics) {
         .active_requests =
             atomic_load_explicit(&ctx->active_requests, memory_order_relaxed),
         .peak_active_requests =
             atomic_load_explicit(&ctx->peak_active_requests,
                                  memory_order_relaxed),
+        .active_streams =
+            atomic_load_explicit(&ctx->active_streams, memory_order_relaxed),
+        .peak_active_streams =
+            atomic_load_explicit(&ctx->peak_active_streams,
+                                 memory_order_relaxed),
+        .requests_per_stream =
+            atomic_load_explicit(&ctx->requests_per_stream,
+                                 memory_order_relaxed),
+        .range_bytes =
+            atomic_load_explicit(&ctx->range_bytes, memory_order_relaxed),
+        .ring_bytes =
+            atomic_load_explicit(&ctx->ring_bytes, memory_order_relaxed),
         .started_requests =
             atomic_load_explicit(&ctx->started_requests, memory_order_relaxed),
         .finished_requests =
@@ -505,8 +571,9 @@ bool mp_curl_get_metrics(struct mpv_global *global,
             atomic_load_explicit(&ctx->failed_requests, memory_order_relaxed),
         .retry_attempts =
             atomic_load_explicit(&ctx->retry_attempts, memory_order_relaxed),
-        .received_bytes =
-            atomic_load_explicit(&ctx->received_bytes, memory_order_relaxed),
+        .received_bytes = received,
+        .average_received_bytes_per_second = average,
+        .peak_received_bytes_per_second = peak,
     };
     return true;
 }
@@ -528,6 +595,46 @@ static void ring_write(void *ctx, const char *data, size_t len)
     memcpy(p->buffer, data + tail_chunk, len - tail_chunk);
     p->tail = (p->tail + len) % p->buffer_size;
     p->count += len;
+}
+
+static void record_received_bytes(struct curl_ctx *ctx, size_t bytes)
+{
+    int64_t now = mp_time_ns();
+    int_fast64_t first = 0;
+    atomic_compare_exchange_strong_explicit(
+        &ctx->first_received_ns, &first, now, memory_order_relaxed,
+        memory_order_relaxed);
+    atomic_store_explicit(&ctx->last_received_ns, now, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->received_bytes, bytes,
+                              memory_order_relaxed);
+
+    int_fast64_t started =
+        atomic_load_explicit(&ctx->rate_window_started_ns,
+                             memory_order_relaxed);
+    if (started == 0) {
+        atomic_store_explicit(&ctx->rate_window_started_ns, now,
+                              memory_order_relaxed);
+        started = now;
+    }
+    atomic_fetch_add_explicit(&ctx->rate_window_bytes, bytes,
+                              memory_order_relaxed);
+
+    const int64_t elapsed = now - started;
+    if (elapsed < MP_TIME_MS_TO_NS(500))
+        return;
+    atomic_store_explicit(&ctx->rate_window_started_ns, now,
+                          memory_order_relaxed);
+    const uint64_t window_bytes = atomic_exchange_explicit(
+        &ctx->rate_window_bytes, 0, memory_order_relaxed);
+    const int64_t bytes_per_second =
+        (int64_t)((double)window_bytes / MP_TIME_NS_TO_S(elapsed));
+    int_fast64_t peak = atomic_load_explicit(
+        &ctx->peak_received_bytes_per_second, memory_order_relaxed);
+    while (bytes_per_second > peak &&
+           !atomic_compare_exchange_weak_explicit(
+               &ctx->peak_received_bytes_per_second, &peak, bytes_per_second,
+               memory_order_relaxed, memory_order_relaxed))
+    {}
 }
 
 // Called per chunk of body data.
@@ -557,8 +664,7 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 
     p->paused = false;
     p->request_received += bytes;
-    atomic_fetch_add_explicit(&p->ctx->received_bytes, bytes,
-                              memory_order_relaxed);
+    record_received_bytes(p->ctx, bytes);
 
     mp_cond_broadcast(&p->cond);
     mp_mutex_unlock(&p->mtx);
@@ -1524,6 +1630,7 @@ static void priv_destructor(void *ptr)
     }
     if (p->headers)
         curl_slist_free_all(p->headers);
+    unregister_curl_stream(p);
     mp_mutex_destroy(&p->mtx);
     mp_cond_destroy(&p->cond);
 }
@@ -1585,6 +1692,7 @@ static int curl_open(stream_t *s, const struct stream_open_args *args)
 
     mp_mutex_init(&p->mtx);
     mp_cond_init(&p->cond);
+    register_curl_stream(p);
     p->aborted = false;
 
     p->curl = curl_easy_init();

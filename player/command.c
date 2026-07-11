@@ -1700,11 +1700,22 @@ static int mp_property_curl_transport_metrics(void *ctx,
     node_map_add_int64(result, "active-requests", metrics.active_requests);
     node_map_add_int64(result, "peak-active-requests",
                        metrics.peak_active_requests);
+    node_map_add_int64(result, "active-streams", metrics.active_streams);
+    node_map_add_int64(result, "peak-active-streams",
+                       metrics.peak_active_streams);
+    node_map_add_int64(result, "requests-per-stream",
+                       metrics.requests_per_stream);
+    node_map_add_int64(result, "range-bytes", metrics.range_bytes);
+    node_map_add_int64(result, "ring-bytes", metrics.ring_bytes);
     node_map_add_int64(result, "started-requests", metrics.started_requests);
     node_map_add_int64(result, "finished-requests", metrics.finished_requests);
     node_map_add_int64(result, "failed-requests", metrics.failed_requests);
     node_map_add_int64(result, "retry-attempts", metrics.retry_attempts);
     node_map_add_int64(result, "received-bytes", metrics.received_bytes);
+    node_map_add_int64(result, "average-received-bytes-per-second",
+                       metrics.average_received_bytes_per_second);
+    node_map_add_int64(result, "peak-received-bytes-per-second",
+                       metrics.peak_received_bytes_per_second);
     return M_PROPERTY_OK;
 }
 #endif

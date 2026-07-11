@@ -743,14 +743,27 @@ local function add_curl_metrics(s)
         return
     end
 
-    append(s, format("%d active / %d peak; %d of %d finished",
+    local configured = (metrics["requests-per-stream"] or 0) > 1
+        or (metrics["range-bytes"] or 0) > 0
+    append(s, format("%s; %d requests/stream, %s ranges, %s ring",
+                     configured and "configured limits" or "mpv defaults",
+                     metrics["requests-per-stream"] or 0,
+                     utils.format_bytes_humanized(metrics["range-bytes"] or 0),
+                     utils.format_bytes_humanized(metrics["ring-bytes"] or 0)),
+           {prefix="Curl Profile:"})
+    append(s, format("%d active / %d peak across %d / %d streams; %d of %d finished",
                      metrics["active-requests"] or 0,
                      metrics["peak-active-requests"] or 0,
+                     metrics["active-streams"] or 0,
+                     metrics["peak-active-streams"] or 0,
                      metrics["finished-requests"] or 0,
                      metrics["started-requests"] or 0),
-           {prefix="Curl Requests:"})
-    append(s, format("%s received; %d failed; %d retries",
+           {prefix="Curl Activity:"})
+    append(s, format("%s received; %s/s now, %s/s average, %s/s peak; %d failed; %d retries",
                      utils.format_bytes_humanized(metrics["received-bytes"] or 0),
+                     utils.format_bytes_humanized(mp.get_property_number("cache-speed", 0)),
+                     utils.format_bytes_humanized(metrics["average-received-bytes-per-second"] or 0),
+                     utils.format_bytes_humanized(metrics["peak-received-bytes-per-second"] or 0),
                      metrics["failed-requests"] or 0,
                      metrics["retry-attempts"] or 0),
            {prefix="Curl Traffic:"})
