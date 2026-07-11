@@ -671,7 +671,9 @@ if darwin
     subdir(join_paths('TOOLS', 'osxbundle'))
 endif
 
-libcurl = dependency('libcurl', version: '>= 7.88.0', required: get_option('libcurl'))
+libcurl = dependency('libcurl', version: '>= 7.88.0',
+                     static: get_option('starfish').enabled(),
+                     required: get_option('libcurl'))
 features += {'libcurl': libcurl.found()}
 if features['libcurl']
     dependencies += [libcurl]
@@ -1891,9 +1893,14 @@ major = client_h_define.split('|')[0].split('<<')[0].strip('() ')
 minor = client_h_define.split('|')[1].strip('() ')
 client_api_version = major + '.' + minor + '.0'
 
+libmpv_link_args = ['-Wl,-Bsymbolic']
+if get_option('starfish').enabled()
+    libmpv_link_args += '-Wl,--exclude-libs,ALL'
+endif
+
 libmpv = library('mpv', sources, dependencies: dependencies, gnu_symbol_visibility: 'hidden',
                  include_directories: incdir_public,
-                 link_args: cc.get_supported_link_arguments(['-Wl,-Bsymbolic']),
+                 link_args: cc.get_supported_link_arguments(libmpv_link_args),
                  version: client_api_version, install: get_option('libmpv'),
                  build_by_default: get_option('libmpv'))
 
