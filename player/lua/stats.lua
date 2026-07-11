@@ -737,6 +737,25 @@ local function add_file(s, print_cache, print_tags)
     end
 end
 
+local function add_curl_metrics(s)
+    local metrics = mp.get_property_native("curl-transport-metrics")
+    if not metrics or (metrics["started-requests"] or 0) == 0 then
+        return
+    end
+
+    append(s, format("%d active / %d peak; %d of %d finished",
+                     metrics["active-requests"] or 0,
+                     metrics["peak-active-requests"] or 0,
+                     metrics["finished-requests"] or 0,
+                     metrics["started-requests"] or 0),
+           {prefix="Curl Requests:"})
+    append(s, format("%s received; %d failed; %d retries",
+                     utils.format_bytes_humanized(metrics["received-bytes"] or 0),
+                     metrics["failed-requests"] or 0,
+                     metrics["retry-attempts"] or 0),
+           {prefix="Curl Traffic:"})
+end
+
 
 local function crop_noop(w, h, r)
     return r["crop-x"] == 0 and r["crop-y"] == 0 and
@@ -1195,6 +1214,7 @@ local function default_stats()
     eval_ass_formatting()
     add_header(stats)
     add_file(stats, true, false)
+    add_curl_metrics(stats)
     add_video_out(stats)
     add_video(stats)
     add_audio(stats)
@@ -1429,6 +1449,7 @@ local function cache_stats()
     end
     append(stats, utils.format_bytes_humanized(speed) .. "/s", {prefix="Speed:",
         suffix=speed_graph})
+    add_curl_metrics(stats)
 
     append(stats, utils.format_bytes_humanized(info["total-bytes"]),
            {prefix = "Total RAM:"})

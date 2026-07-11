@@ -54,6 +54,9 @@
 #include "input/keycodes.h"
 #include "sub/osd_state.h"
 #include "stream/stream.h"
+#if HAVE_LIBCURL
+#include "stream/stream_curl.h"
+#endif
 #include "demux/demux.h"
 #include "demux/stheader.h"
 #include "common/playlist.h"
@@ -1674,6 +1677,37 @@ static int mp_property_demuxer_cache_state(void *ctx, struct m_property *prop,
 
     return M_PROPERTY_OK;
 }
+
+#if HAVE_LIBCURL
+static int mp_property_curl_transport_metrics(void *ctx,
+                                              struct m_property *prop,
+                                              int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    struct mp_curl_metrics metrics;
+    if (!mp_curl_get_metrics(mpctx->global, &metrics))
+        return M_PROPERTY_UNAVAILABLE;
+
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_GET)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+
+    struct mpv_node *result = arg;
+    node_init(result, MPV_FORMAT_NODE_MAP, NULL);
+    node_map_add_int64(result, "active-requests", metrics.active_requests);
+    node_map_add_int64(result, "peak-active-requests",
+                       metrics.peak_active_requests);
+    node_map_add_int64(result, "started-requests", metrics.started_requests);
+    node_map_add_int64(result, "finished-requests", metrics.finished_requests);
+    node_map_add_int64(result, "failed-requests", metrics.failed_requests);
+    node_map_add_int64(result, "retry-attempts", metrics.retry_attempts);
+    node_map_add_int64(result, "received-bytes", metrics.received_bytes);
+    return M_PROPERTY_OK;
+}
+#endif
 
 static int mp_property_demuxer_start_time(void *ctx, struct m_property *prop,
                                           int action, void *arg)
@@ -4714,6 +4748,9 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-cache-idle", mp_property_demuxer_cache_idle},
     {"demuxer-start-time", mp_property_demuxer_start_time},
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
+#if HAVE_LIBCURL
+    {"curl-transport-metrics", mp_property_curl_transport_metrics},
+#endif
     {"cache-buffering-state", mp_property_cache_buffering},
     {"paused-for-cache", mp_property_paused_for_cache},
     {"demuxer-via-network", mp_property_demuxer_is_network},
