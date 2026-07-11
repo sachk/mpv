@@ -147,6 +147,13 @@ struct curl_ctx {
     struct mp_dispatch_queue *dispatch;
     CURLM *multi;
     bool exit;
+    atomic_int active_requests;
+    atomic_int peak_active_requests;
+    atomic_uint_fast64_t started_requests;
+    atomic_uint_fast64_t finished_requests;
+    atomic_uint_fast64_t failed_requests;
+    atomic_uint_fast64_t retry_attempts;
+    atomic_uint_fast64_t received_bytes;
 };
 
 struct priv;
@@ -264,6 +271,44 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code);
 static void fallback_dynamic(struct priv *p);
 static void setup_curl(struct priv *p, CURL *curl);
 
+static CURLMcode add_curl_handle(struct curl_ctx *ctx, CURL *handle)
+{
+    CURLMcode result = curl_multi_add_handle(ctx->multi, handle);
+    if (result != CURLM_OK)
+        return result;
+
+    int active = atomic_fetch_add_explicit(&ctx->active_requests, 1,
+                                            memory_order_relaxed) + 1;
+    atomic_fetch_add_explicit(&ctx->started_requests, 1, memory_order_relaxed);
+    int peak = atomic_load_explicit(&ctx->peak_active_requests,
+                                    memory_order_relaxed);
+    while (active > peak &&
+           !atomic_compare_exchange_weak_explicit(
+               &ctx->peak_active_requests, &peak, active,
+               memory_order_relaxed, memory_order_relaxed))
+    {}
+    return CURLM_OK;
+}
+
+static CURLMcode remove_curl_handle(struct curl_ctx *ctx, CURL *handle)
+{
+    CURLMcode result = curl_multi_remove_handle(ctx->multi, handle);
+    if (result == CURLM_OK) {
+        int previous = atomic_fetch_sub_explicit(&ctx->active_requests, 1,
+                                                  memory_order_relaxed);
+        mp_assert(previous > 0);
+    }
+    return result;
+}
+
+static void finish_curl_request(struct curl_ctx *ctx, bool succeeded)
+{
+    atomic_fetch_add_explicit(&ctx->finished_requests, 1, memory_order_relaxed);
+    if (!succeeded)
+        atomic_fetch_add_explicit(&ctx->failed_requests, 1,
+                                  memory_order_relaxed);
+}
+
 static void run_cmd(void *arg)
 {
     struct cmd *c = arg;
@@ -277,7 +322,7 @@ static void run_cmd(void *arg)
         stop_dynamic(c->p);
         if (c->p->active) {
             MP_TRACE(c->p, "removing curl handle\n");
-            curl_multi_remove_handle(ctx->multi, c->p->curl);
+            remove_curl_handle(ctx, c->p->curl);
             c->p->active = false;
         }
         break;
@@ -294,7 +339,7 @@ static void run_cmd(void *arg)
         stop_dynamic(c->p);
         MP_TRACE(c->p, "seeking to %" PRIu64 "\n", c->pos);
         if (c->p->active) {
-            curl_multi_remove_handle(ctx->multi, c->p->curl);
+            remove_curl_handle(ctx, c->p->curl);
             c->p->active = false;
         }
         mp_mutex_lock(&c->p->mtx);
@@ -385,7 +430,20 @@ static MP_THREAD_VOID curl_thread(void *arg)
             struct curl_handle_ref *ref = NULL;
             curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &ref);
             mp_assert(ref && ref->p);
-            curl_multi_remove_handle(ctx->multi, msg->easy_handle);
+            bool succeeded = msg->data.result == CURLE_OK;
+            if (ref->kind == CURL_HANDLE_PRIMARY) {
+                succeeded = succeeded && ref->p->response_ok &&
+                            !atomic_load_explicit(&ref->p->aborted,
+                                                  memory_order_relaxed);
+            } else {
+                struct dynamic_request *request = (struct dynamic_request *)ref;
+                succeeded = succeeded && request->response_ok &&
+                            request->size == request->end - request->start &&
+                            !atomic_load_explicit(&request->ref.p->aborted,
+                                                  memory_order_relaxed);
+            }
+            remove_curl_handle(ctx, msg->easy_handle);
+            finish_curl_request(ctx, succeeded);
             if (ref->kind == CURL_HANDLE_PRIMARY) {
                 ref->p->active = false;
                 on_done(ref->p, msg->data.result);
@@ -419,6 +477,33 @@ void mp_curl_global_init(struct mpv_global *global)
     ctx->dispatch = mp_dispatch_create(ctx);
     global->curl = ctx;
     mp_require(!mp_thread_create(&ctx->thread, curl_thread, ctx));
+}
+
+bool mp_curl_get_metrics(struct mpv_global *global,
+                         struct mp_curl_metrics *metrics)
+{
+    if (!global || !global->curl || !metrics)
+        return false;
+
+    struct curl_ctx *ctx = global->curl;
+    *metrics = (struct mp_curl_metrics) {
+        .active_requests =
+            atomic_load_explicit(&ctx->active_requests, memory_order_relaxed),
+        .peak_active_requests =
+            atomic_load_explicit(&ctx->peak_active_requests,
+                                 memory_order_relaxed),
+        .started_requests =
+            atomic_load_explicit(&ctx->started_requests, memory_order_relaxed),
+        .finished_requests =
+            atomic_load_explicit(&ctx->finished_requests, memory_order_relaxed),
+        .failed_requests =
+            atomic_load_explicit(&ctx->failed_requests, memory_order_relaxed),
+        .retry_attempts =
+            atomic_load_explicit(&ctx->retry_attempts, memory_order_relaxed),
+        .received_bytes =
+            atomic_load_explicit(&ctx->received_bytes, memory_order_relaxed),
+    };
+    return true;
 }
 
 // Curl callbacks
@@ -459,6 +544,8 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     p->paused = false;
 
     p->request_received += bytes;
+    atomic_fetch_add_explicit(&p->ctx->received_bytes, bytes,
+                              memory_order_relaxed);
 
     mp_cond_broadcast(&p->cond);
     mp_mutex_unlock(&p->mtx);
@@ -521,6 +608,8 @@ static size_t dynamic_write_callback(char *ptr, size_t size, size_t nmemb,
 
     memcpy(request->data + request->size, ptr, bytes);
     request->size += bytes;
+    atomic_fetch_add_explicit(&p->ctx->received_bytes, bytes,
+                              memory_order_relaxed);
     return bytes;
 }
 
@@ -826,8 +915,18 @@ static void start_request(struct priv *p)
     p->response_ok = false;
 
     p->request_received = 0;
+    CURLMcode result = add_curl_handle(p->ctx, p->curl);
+    if (result != CURLM_OK) {
+        MP_ERR(p, "could not start curl request: %s\n",
+               curl_multi_strerror(result));
+        mp_mutex_lock(&p->mtx);
+        p->probed = true;
+        p->stream_error = true;
+        mp_cond_broadcast(&p->cond);
+        mp_mutex_unlock(&p->mtx);
+        return;
+    }
     p->active = true;
-    curl_multi_add_handle(p->ctx->multi, p->curl);
     if (p->probed && p->dynamic_supported)
         start_dynamic(p);
 }
@@ -864,7 +963,7 @@ static bool schedule_dynamic_request(struct dynamic_request *request)
     snprintf(range, sizeof(range), "%" PRIu64 "-%" PRIu64,
              request->start, request->end - 1);
     curl_easy_setopt(request->curl, CURLOPT_RANGE, range);
-    CURLMcode result = curl_multi_add_handle(p->ctx->multi, request->curl);
+    CURLMcode result = add_curl_handle(p->ctx, request->curl);
     if (result != CURLM_OK) {
         request->scheduled = false;
         MP_WARN(p, "could not schedule parallel range: %s\n",
@@ -883,7 +982,7 @@ static void stop_dynamic(struct priv *p)
     for (int n = 0; n < p->num_requests; n++) {
         struct dynamic_request *request = &p->requests[n];
         if (request->active) {
-            curl_multi_remove_handle(p->ctx->multi, request->curl);
+            remove_curl_handle(p->ctx, request->curl);
             request->active = false;
         }
         if (request->curl)
@@ -1063,6 +1162,8 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
         request->retry_count < p->opts->max_retries;
     if (recoverable) {
         request->retry_count++;
+        atomic_fetch_add_explicit(&p->ctx->retry_attempts, 1,
+                                  memory_order_relaxed);
         request->size = 0;
         request->consumed = 0;
         request->response_ok = false;
@@ -1070,8 +1171,7 @@ static void on_dynamic_done(struct dynamic_request *request, CURLcode code)
             ? "HTTP range rejected" : curl_easy_strerror(code);
         MP_WARN(p, "%s, retrying parallel range (#%d)\n",
                 reason, request->retry_count);
-        CURLMcode result =
-            curl_multi_add_handle(p->ctx->multi, request->curl);
+        CURLMcode result = add_curl_handle(p->ctx, request->curl);
         if (result == CURLM_OK) {
             request->active = true;
             return;
@@ -1166,6 +1266,8 @@ static void on_done(struct priv *p, CURLcode code)
         p->retry_count < p->opts->max_retries;
     if (recoverable) {
         p->retry_count++;
+        atomic_fetch_add_explicit(&p->ctx->retry_attempts, 1,
+                                  memory_order_relaxed);
         const char *reason = response_rejected
             ? "HTTP response rejected" : curl_easy_strerror(code);
         MP_WARN(p, "%s, retrying (#%d) from %" PRIu64 "\n",

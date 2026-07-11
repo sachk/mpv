@@ -18,6 +18,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "config.h"
 
@@ -28,6 +29,21 @@ struct demuxer;
 
 // Initialize libcurl state, must be called before stream_curl is used.
 void mp_curl_global_init(struct mpv_global *global);
+
+struct mp_curl_metrics {
+    int64_t active_requests;
+    int64_t peak_active_requests;
+    int64_t started_requests;
+    int64_t finished_requests;
+    int64_t failed_requests;
+    int64_t retry_attempts;
+    int64_t received_bytes;
+};
+
+// Read a lock-free snapshot of the process-wide libcurl transport counters.
+// Returns false until the curl backend has been initialized.
+bool mp_curl_get_metrics(struct mpv_global *global,
+                         struct mp_curl_metrics *metrics);
 
 // Open `url` via mpv's libcurl backend and wrap it as a fresh AVIOContext.
 // On success returns 0, fills *pb_out with the new context, and sets *data to
