@@ -33,11 +33,18 @@ void mp_curl_global_init(struct mpv_global *global);
 struct mp_curl_metrics {
     int64_t active_requests;
     int64_t peak_active_requests;
+    int64_t active_streams;
+    int64_t peak_active_streams;
+    int64_t requests_per_stream;
+    int64_t range_bytes;
+    int64_t ring_bytes;
     int64_t started_requests;
     int64_t finished_requests;
     int64_t failed_requests;
     int64_t retry_attempts;
     int64_t received_bytes;
+    int64_t average_received_bytes_per_second;
+    int64_t peak_received_bytes_per_second;
 };
 
 // Read a lock-free snapshot of the process-wide libcurl transport counters.
