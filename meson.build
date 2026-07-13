@@ -1135,8 +1135,11 @@ wayland += {'header':
     cc.has_header('linux/input.h',
                   dependencies: wayland['deps'][0], required: get_option('wayland'))}
 pkgconf_native = find_program('pkg-config', native: true, required: get_option('wayland'))
-wayland_protocol_dir = run_command(pkgconf_native, '--variable=pkgdatadir',
-                                   'wayland-protocols', check: false).stdout().strip()
+wayland_protocol_dir = ''
+if pkgconf_native.found()
+    wayland_protocol_dir = run_command(pkgconf_native, '--variable=pkgdatadir',
+                                       'wayland-protocols', check: false).stdout().strip()
+endif
 if wayland_protocol_dir == ''
     wayland_protocol_dir = run_command('sh', '-c', 'printf %s "$WAYLAND_PROTOCOLS_DIR"', check: false).stdout().strip()
 endif
@@ -1441,9 +1444,12 @@ if features['vulkan'] or (features['gl'] and features['egl'])
     sources += files('video/filter/vf_gpu.c')
 endif
 
+features += {'dxgi-debug-d3d11': false}
+if win32
+    features += {'dxgi-debug-d3d11': cc.has_header_symbol('d3d11sdklayers.h', 'DXGI_DEBUG_D3D11')}
+endif
 if features['d3d11'] or features['egl-angle-win32'] or (features['vulkan'] and win32)
     sources += files('video/out/gpu/d3d11_helpers.c')
-    features += {'dxgi-debug-d3d11': cc.has_header_symbol('d3d11sdklayers.h', 'DXGI_DEBUG_D3D11')}
 endif
 
 # hwaccel
@@ -1492,6 +1498,9 @@ features += {'d3d-hwaccel': d3d_hwaccel.allowed()}
 if features['d3d-hwaccel']
     sources += files('video/d3d.c',
                      'video/filter/vf_d3d11vpp.c')
+    if not (features['d3d11'] or features['egl-angle-win32'] or (features['vulkan'] and win32))
+        sources += files('video/out/gpu/d3d11_helpers.c')
+    endif
 endif
 
 amf = cc.has_header('AMF/core/Factory.h', required:
@@ -1831,7 +1840,7 @@ endif
 
 # Set config.h
 conf_data = configuration_data()
-conf_data.set_quoted('CONFIGURATION', meson.build_options().strip().replace('\\', '\\\\'))
+conf_data.set_quoted('CONFIGURATION', meson.build_options().strip().replace('\\', '/'))
 conf_data.set_quoted('DEFAULT_OPTICAL_DEVICE', optical_device)
 
 # Loop over all features in the build, create a define and add them to config.h
