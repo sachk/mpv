@@ -893,7 +893,7 @@ static void hwdec_release_el(pl_gpu gpu, struct pl_frame *frame)
 }
 #endif
 
-static bool format_supported(struct priv *p, int format, bool use_uint)
+static bool format_supported(pl_gpu gpu, int format, bool use_uint)
 {
     struct pl_bit_encoding bits;
     struct pl_plane_data data[4] = {0};
@@ -902,7 +902,7 @@ static bool format_supported(struct priv *p, int format, bool use_uint)
         return false;
 
     for (int i = 0; i < planes; i++) {
-        if (!pl_plane_find_fmt(p->gpu, NULL, &data[i]))
+        if (!pl_plane_find_fmt(gpu, NULL, &data[i]))
             return false;
     }
 
@@ -940,15 +940,14 @@ static bool use_ref_luma(const struct pl_color_space *csp, const struct pl_color
     return false;
 }
 
-static bool upload_planes_sw(struct vo *vo, pl_gpu gpu, struct mp_image *mpi,
+static bool upload_planes_sw(struct priv *p, pl_gpu gpu, struct mp_image *mpi,
                              struct pl_frame *frame, pl_tex tex[4])
 {
-    struct priv *p = vo->priv;
     struct pl_plane_data data[4] = {0};
 
     // At this point, we know that the format is supported, query_format()
     // makes sure of that. Just check if we should use UINT as a fallback.
-    bool use_uint = !format_supported(vo, mpi->imgfmt, false);
+    bool use_uint = !format_supported(gpu, mpi->imgfmt, false);
     int planes = plane_data_from_imgfmt(data, &frame->repr.bits, mpi->imgfmt,
                                         use_uint);
     if (!planes)
@@ -1056,7 +1055,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
 
         stats_time_start(p->stats, "swdec-upload");
         timer_pool_start(p->sw_upload_timer);
-        bool ok = upload_planes_sw(vo, gpu, mpi, frame, tex);
+        bool ok = upload_planes_sw(p, gpu, mpi, frame, tex);
         timer_pool_stop(p->sw_upload_timer);
         stats_time_end(p->stats, "swdec-upload");
         if (!ok) {
@@ -1099,7 +1098,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
             fp->el_frame.release = hwdec_release_el;
             setup_hwdec_plane_mapping(&fp->el_frame, &desc);
         } else if (el_ok) {
-            el_ok = upload_planes_sw(vo, gpu, el, &fp->el_frame, fp->el_tex);
+            el_ok = upload_planes_sw(p, gpu, el, &fp->el_frame, fp->el_tex);
         }
 
         if (el_ok) {
@@ -1832,9 +1831,9 @@ static int query_format(struct vo *vo, int format)
     if (ra_hwdec_get(&p->hwdec_ctx, format))
         return true;
 
-    bool supported = format_supported(p, format, false);
+    bool supported = format_supported(p->gpu, format, false);
     if (!supported)
-        supported = format_supported(p, format, true);
+        supported = format_supported(p->gpu, format, true);
 
     return supported;
 }
@@ -3165,8 +3164,8 @@ static bool libmpv_check_format(struct render_backend *ctx, int imgfmt)
     if (ra_hwdec_get(&p->hwdec_ctx, imgfmt))
         return true;
 
-    return format_supported(p, imgfmt, false) ||
-           format_supported(p, imgfmt, true);
+    return format_supported(p->gpu, imgfmt, false) ||
+           format_supported(p->gpu, imgfmt, true);
 }
 
 static int libmpv_set_parameter(struct render_backend *ctx, mpv_render_param param)
