@@ -139,6 +139,7 @@ enum mp_voctrl {
     // clock so mpv audio sync (display-resample drift compensation) can slave
     // to it.
     VOCTRL_GET_EXTERNAL_VIDEO_CLOCK,     // struct voctrl_external_video_clock*
+    VOCTRL_SET_PLAYBACK_SPEED,           // double*
 };
 
 // Helper to expose what kind of content is currently playing to the VO.

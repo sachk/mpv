@@ -55,6 +55,7 @@ struct vo_wayland_state {
     struct wl_surface       *callback_surface;
     struct wl_subsurface    *video_subsurface;
     struct wl_event_queue   *color_queue;
+    uint32_t                 compositor_version;
 
     /* Geometry */
     struct mp_rect geometry;
@@ -220,6 +221,10 @@ int vo_wayland_control(struct vo *vo, int *events, int request, void *arg);
 
 void vo_wayland_handle_color(struct vo_wayland_state *wl, struct mp_image_params *params);
 void vo_wayland_handle_scale(struct vo_wayland_state *wl);
+void vo_wayland_surface_damage(struct vo_wayland_state *wl,
+                               struct wl_surface *surface,
+                               int32_t x, int32_t y, int32_t width,
+                               int32_t height);
 void vo_wayland_set_opaque_region(struct vo_wayland_state *wl, bool alpha);
 void vo_wayland_sync_swap(struct vo_wayland_state *wl);
 void vo_wayland_uninit(struct vo *vo);

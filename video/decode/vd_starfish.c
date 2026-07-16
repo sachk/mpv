@@ -38,6 +38,10 @@ struct priv {
   AVPacket *filtered_pkt;
   struct demux_packet *pending;
   bool have_filtered;
+  bool have_prepared;
+  bool prepared_owned;
+  const uint8_t *prepared_data;
+  size_t prepared_size;
   bool input_eof;
   bool sent_eof;
   bool sent_initial_geometry;
@@ -110,6 +114,12 @@ static int init_bsf(struct priv *p) {
 }
 
 static void clear_pending(struct priv *p) {
+  if (p->prepared_owned)
+    talloc_free((void *)p->prepared_data);
+  p->have_prepared = false;
+  p->prepared_owned = false;
+  p->prepared_data = NULL;
+  p->prepared_size = 0;
   if (p->pending) {
     talloc_free(p->pending);
     p->pending = NULL;
@@ -644,10 +654,10 @@ static void process_dovi_packet(struct priv *p, const uint8_t **data,
 
                 *data = new_buf;
                 *size = new_total_len;
-                mp_info(p->log,
-                        "vd_starfish: converted Profile 7 RPU to 8.1 (%zu -> "
-                        "%zu bytes, content only)\n",
-                        nalu_content_len, new_data->len);
+                mp_verbose(p->log,
+                           "vd_starfish: converted Profile 7 RPU to 8.1 (%zu -> "
+                           "%zu bytes, content only)\n",
+                           nalu_content_len, new_data->len);
               }
               dovi_data_free(new_data);
             }
@@ -703,15 +713,18 @@ static bool feed_pending(struct mp_filter *f) {
     size = p->filtered_pkt->size;
   }
 
-  const uint8_t *feed_data = data;
-  size_t feed_size = size;
-  process_dovi_packet(p, &feed_data, &feed_size);
+  if (!p->have_prepared) {
+    p->prepared_data = data;
+    p->prepared_size = size;
+    process_dovi_packet(p, &p->prepared_data, &p->prepared_size);
+    p->prepared_owned = p->prepared_data != data;
+    p->have_prepared = true;
+  }
 
   int r =
-      starfish_ctx_feed_video(p->ctx, feed_data, feed_size, p->pending->pts,
+      starfish_ctx_feed_video(p->ctx, p->prepared_data, p->prepared_size,
+                              p->pending->pts,
                               p->pending->keyframe);
-  if (feed_data != data)
-    talloc_free((void *)feed_data);
   MP_TRACE(p, "vd_starfish feed_pending size=%zu pts=%f status=%d\n", size,
            p->pending->pts, r);
   if (r == STARFISH_FEED_OK) {

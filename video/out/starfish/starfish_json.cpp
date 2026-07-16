@@ -243,28 +243,3 @@ std::string starfish_json_build_hdr_info(
       << (params->video_full_range_flag ? "true" : "false") << "}" << '}';
   return out.str();
 }
-
-std::string starfish_json_build_feed(int es_data, const void *data, size_t size,
-                                     int64_t pts_ns) {
-  std::ostringstream out;
-  out << "{\"bufferAddr\":\"0x" << std::hex << reinterpret_cast<uintptr_t>(data)
-      << std::dec << "\","
-      << "\"bufferSize\":" << size << ',' << "\"pts\":" << pts_ns << ','
-      << "\"esData\":" << es_data << '}';
-  return out.str();
-}
-
-std::string starfish_json_build_seek(int64_t pts_ns) {
-  std::ostringstream out;
-  out << "{\"position\":" << pts_ns << '}';
-  return out.str();
-}
-
-std::string starfish_json_build_play_rate(int play_rate_millis,
-                                          bool audio_output) {
-  std::ostringstream out;
-  out << "{\"audioOutput\":" << (audio_output ? "true" : "false")
-      << ",\"playRate\":" << std::fixed << std::setprecision(3)
-      << (play_rate_millis / 1000.0) << std::defaultfloat << '}';
-  return out.str();
-}

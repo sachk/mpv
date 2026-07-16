@@ -66,10 +66,3 @@ std::string
 starfish_json_build_load(const struct starfish_json_load_params *params);
 std::string starfish_json_build_hdr_info(
     const struct starfish_json_hdr_info_params *params);
-std::string starfish_json_build_feed(int es_data, const void *data, size_t size,
-                                     int64_t pts_ns);
-std::string starfish_json_build_seek(int64_t pts_ns);
-/* play_rate is per-mille (1000 = 1.0x). audio_output true if rate in [-2000,
- * 2000]. */
-std::string starfish_json_build_play_rate(int play_rate_millis,
-                                          bool audio_output);

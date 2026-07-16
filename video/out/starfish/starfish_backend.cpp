@@ -31,41 +31,30 @@ std::unique_ptr<StarfishMediaAPIs> g_primed_media;
 
 constexpr int64_t kSdkSlowCallNs = 50LL * 1000 * 1000;
 
-bool sdk_verbose_call_logging()
-{
-    const char *value = getenv("STARFISH_SDK_CALL_LOG");
-    return value && value[0] && strcmp(value, "0") != 0;
-}
-
 bool sdk_call_is_chatty(const char *what)
 {
     return what && (strcmp(what, "Feed") == 0 ||
                     strcmp(what, "getCurrentPlaytime") == 0);
 }
 
-bool sdk_call_use_trace(const char *what)
-{
-    return sdk_call_is_chatty(what) && !sdk_verbose_call_logging();
-}
-
 void log_sdk_call_begin(struct mp_log *log, const char *what)
 {
-    if (sdk_call_use_trace(what))
+    if (sdk_call_is_chatty(what))
         mp_trace(log, "Starfish SDK begin %s\n", what ? what : "(unknown)");
     else
-        mp_info(log, "Starfish SDK begin %s\n", what ? what : "(unknown)");
+        mp_verbose(log, "Starfish SDK begin %s\n", what ? what : "(unknown)");
 }
 
 void log_sdk_call_end(struct mp_log *log, const char *what, int64_t start_ns,
                       bool ok)
 {
     const int64_t elapsed_ns = mp_time_ns() - start_ns;
-    if (sdk_call_use_trace(what)) {
+    if (sdk_call_is_chatty(what)) {
         mp_trace(log, "Starfish SDK end %s ok=%d duration=%.1fms\n",
                  what ? what : "(unknown)", ok, elapsed_ns / 1e6);
     } else {
-        mp_info(log, "Starfish SDK end %s ok=%d duration=%.1fms\n",
-                what ? what : "(unknown)", ok, elapsed_ns / 1e6);
+        mp_verbose(log, "Starfish SDK end %s ok=%d duration=%.1fms\n",
+                   what ? what : "(unknown)", ok, elapsed_ns / 1e6);
     }
     if (elapsed_ns > kSdkSlowCallNs) {
         mp_warn(log, "Starfish SDK slow %s ok=%d duration=%.1fms\n",

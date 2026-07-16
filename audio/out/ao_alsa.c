@@ -63,6 +63,8 @@ struct ao_alsa_opts {
     bool ignore_chmap;
     int buffer_time;
     int frags;
+    bool no_hw_pause;
+    bool bounded_io;
 };
 
 #define OPT_BASE_STRUCT struct ao_alsa_opts
@@ -76,6 +78,8 @@ static const struct m_sub_options ao_alsa_conf = {
         {"alsa-ignore-chmap", OPT_BOOL(ignore_chmap)},
         {"alsa-buffer-time", OPT_INT(buffer_time), M_RANGE(0, INT_MAX)},
         {"alsa-periods", OPT_INT(frags), M_RANGE(0, INT_MAX)},
+        {"alsa-no-hw-pause", OPT_BOOL(no_hw_pause)},
+        {"alsa-bounded-io", OPT_BOOL(bounded_io)},
         {0}
     },
     .defaults = &(const struct ao_alsa_opts) {
@@ -105,12 +109,6 @@ struct priv {
 
     struct ao_alsa_opts *opts;
 };
-
-static bool env_flag(const char *name)
-{
-    const char *value = getenv(name);
-    return value && value[0] && strcmp(value, "0") != 0;
-}
 
 #define CHECK_ALSA_ERROR(message) \
     do { \
@@ -832,12 +830,11 @@ static int init_device(struct ao *ao, int mode)
     CHECK_ALSA_ERROR("Unable to get period size");
 
     p->can_pause = snd_pcm_hw_params_can_pause(alsa_hwparams);
-    if (env_flag("WEBOS_ALSA_NO_HW_PAUSE")) {
-        MP_VERBOSE(ao, "disabling ALSA hardware pause due to WEBOS_ALSA_NO_HW_PAUSE\n");
+    if (p->opts->no_hw_pause) {
+        MP_VERBOSE(ao, "disabling ALSA hardware pause by option\n");
         p->can_pause = false;
     }
-    p->bounded_io = env_flag("WEBOS_ALSA_BOUNDED_IO") ||
-                    env_flag("WEBOS_ALSA_NO_HW_PAUSE");
+    p->bounded_io = p->opts->bounded_io || p->opts->no_hw_pause;
 
     snd_pcm_sw_params_t *alsa_swparams;
     snd_pcm_sw_params_alloca(&alsa_swparams);
@@ -1062,24 +1059,29 @@ alsa_error:
         state->free_samples = state->free_samples / p->outburst * p->outburst;
         state->queued_samples = ao->device_buffer - state->free_samples;
         if (p->bounded_io) {
-            if (del < 0 || del > (snd_pcm_sframes_t)ao->device_buffer) {
-                int64_t now = mp_time_ns();
-                if (!p->last_delay_clamp_log_ns ||
-                    now - p->last_delay_clamp_log_ns >= MP_TIME_S_TO_NS(1))
-                {
-                    MP_VERBOSE(ao,
-                               "ignoring ALSA delay=%ld, using queued=%d\n",
-                               (long)del, state->queued_samples);
-                    p->last_delay_clamp_log_ns = now;
-                }
+            bool sane_delay = del >= 0 &&
+                              del <= (snd_pcm_sframes_t)ao->device_buffer;
+            int64_t now = mp_time_ns();
+            if (!p->last_delay_clamp_log_ns ||
+                now - p->last_delay_clamp_log_ns >= MP_TIME_S_TO_NS(1))
+            {
+                MP_VERBOSE(ao,
+                           "bounded ALSA state avail=%ld delay=%ld free=%d queued=%d sane=%d\n",
+                           (long)avail, (long)del, state->free_samples,
+                           state->queued_samples, sane_delay);
+                p->last_delay_clamp_log_ns = now;
             }
-            state->delay = state->queued_samples / (double)ao->samplerate;
+            if (sane_delay) {
+                state->queued_samples = del;
+            }
+            state->delay = (sane_delay ? del : state->queued_samples) /
+                           (double)ao->samplerate;
         } else {
             state->delay = MPMAX(del, 0) / (double)ao->samplerate;
         }
         state->playing = (pcmst == SND_PCM_STATE_RUNNING ||
                           pcmst == SND_PCM_STATE_PAUSED) &&
-                         state->queued_samples > 0;
+                         (!p->bounded_io || state->queued_samples > 0);
     }
 
     return state_ok;

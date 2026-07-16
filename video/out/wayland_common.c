@@ -48,6 +48,31 @@
 #include "stream/stream.h"
 #include "video/out/gpu/video.h"
 #include "wayland_common.h"
+
+static struct wl_event_queue *create_named_event_queue(
+    struct wl_display *display, const char *name)
+{
+#if WAYLAND_VERSION_MAJOR > 1 || \
+    (WAYLAND_VERSION_MAJOR == 1 && WAYLAND_VERSION_MINOR >= 23)
+    return wl_display_create_queue_with_name(display, name);
+#else
+    return wl_display_create_queue(display);
+#endif
+}
+
+void vo_wayland_surface_damage(struct vo_wayland_state *wl,
+                               struct wl_surface *surface,
+                               int32_t x, int32_t y, int32_t width,
+                               int32_t height)
+{
+    if (wl->compositor_version >= 4) {
+        wl_surface_damage_buffer(surface, x, y, width, height);
+    } else {
+        // damage_buffer is unavailable before wl_surface v4. Damage the full
+        // surface because buffer and surface coordinates may be scaled.
+        wl_surface_damage(surface, 0, 0, INT32_MAX, INT32_MAX);
+    }
+}
 #include "win_state.h"
 
 // Generated from wayland-protocols
@@ -2797,6 +2822,7 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
 
     if (!strcmp(interface, wl_compositor_interface.name) && (ver >= 1) && found++) {
         ver = MPMIN(ver, 6); /* Cap at 6 in case new events are added later. */
+        wl->compositor_version = ver;
         wl->compositor = wl_registry_bind(reg, id, &wl_compositor_interface, ver);
         wl->surface = wl_compositor_create_surface(wl->compositor);
         wl->video_surface = wl_compositor_create_surface(wl->compositor);
@@ -3350,7 +3376,8 @@ static void get_compositor_preferred_description(struct vo_wayland_state *wl)
         wp_color_management_surface_feedback_v1_get_preferred(wl->color_surface_feedback);
     struct wp_image_description_info_v1 *description_info =
         wp_image_description_v1_get_information(image_description);
-    struct wl_event_queue *image_description_info_queue = wl_display_create_queue(wl->display);
+    struct wl_event_queue *image_description_info_queue =
+        create_named_event_queue(wl->display, "image description info queue");
     wl->image_description_info_done = false;
     wl_proxy_set_queue((struct wl_proxy *)description_info, image_description_info_queue);
     wp_image_description_info_v1_add_listener(description_info, &image_description_info_listener, wd);
@@ -3917,7 +3944,8 @@ static int set_cursor_visibility(struct vo_wayland_seat *s, bool on)
             wp_viewport_set_destination(wl->cursor_viewport, lround(img->width / scale),
                                         lround(img->height / scale));
             wl_surface_attach(wl->cursor_surface, buffer, 0, 0);
-            wl_surface_damage_buffer(wl->cursor_surface, 0, 0, img->width, img->height);
+            vo_wayland_surface_damage(wl, wl->cursor_surface, 0, 0,
+                                      img->width, img->height);
         }
         wl_surface_commit(wl->cursor_surface);
     } else {
@@ -4629,7 +4657,8 @@ bool vo_wayland_init(struct vo *vo)
     if (wl->color_manager) {
         wl->color_surface_feedback = wp_color_manager_v1_get_surface_feedback(wl->color_manager, wl->callback_surface);
         wp_color_management_surface_feedback_v1_add_listener(wl->color_surface_feedback, &surface_feedback_listener, wl);
-        wl->color_queue = wl_display_create_queue(wl->display);
+        wl->color_queue = create_named_event_queue(
+            wl->display, "image description creator queue");
     } else {
         MP_VERBOSE(wl, "Compositor doesn't support the %s protocol!\n",
                    wp_color_manager_v1_interface.name);

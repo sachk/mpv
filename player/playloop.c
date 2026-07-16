@@ -28,6 +28,7 @@
 #include "core.h"
 #include "mpv_talloc.h"
 #include "screenshot.h"
+#include "starfish_sync.h"
 
 #include "audio/out/ao.h"
 #include "common/common.h"
@@ -112,31 +113,6 @@ void mp_core_lock(struct MPContext *mpctx)
 void mp_core_unlock(struct MPContext *mpctx)
 {
     mp_dispatch_unlock(mpctx->dispatch);
-}
-
-static bool is_starfish_video_out(struct MPContext *mpctx)
-{
-    return mpctx->video_out && mpctx->video_out->driver &&
-           strcmp(mpctx->video_out->driver->name, "starfish") == 0;
-}
-
-static bool is_alsa_audio_out(struct MPContext *mpctx)
-{
-    const char *name = mpctx->ao ? ao_get_name(mpctx->ao) : NULL;
-    return name && strcmp(name, "alsa") == 0;
-}
-
-#if HAVE_STARFISH
-static bool is_starfish_audio_out(struct MPContext *mpctx)
-{
-    const char *name = mpctx->ao ? ao_get_name(mpctx->ao) : NULL;
-    return name && strcmp(name, "starfish") == 0;
-}
-#endif
-
-static bool starfish_split_clock(struct MPContext *mpctx)
-{
-    return is_starfish_video_out(mpctx) && is_alsa_audio_out(mpctx);
 }
 
 static void prime_starfish_seek_target_before_audio_reset(struct MPContext *mpctx,
@@ -1277,23 +1253,6 @@ static void handle_dummy_ticks(struct MPContext *mpctx)
             mp_notify(mpctx, MPV_EVENT_TICK, NULL);
         }
     }
-}
-
-static bool query_external_video_clock(struct MPContext *mpctx, double *pts_out)
-{
-    if (!mpctx->video_out)
-        return false;
-    struct voctrl_external_video_clock clock = {0};
-    if (vo_control(mpctx->video_out, VOCTRL_GET_EXTERNAL_VIDEO_CLOCK, &clock)
-        != VO_TRUE)
-        return false;
-    if (clock.pts == MP_NOPTS_VALUE || clock.host_time_ns <= 0)
-        return false;
-    double age = MP_TIME_NS_TO_S(mp_time_ns() - clock.host_time_ns);
-    if (age < 0 || age > 0.250)
-        return false;
-    *pts_out = clock.pts + age * mpctx->opts->playback_speed;
-    return true;
 }
 
 // Update current playback time.

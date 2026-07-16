@@ -12,6 +12,7 @@
 
 #include "common/common.h"
 #include "common/msg.h"
+#include "options/m_option.h"
 #include "osdep/endian.h"
 #include "present_sync.h"
 #include "sub/osd.h"
@@ -59,6 +60,12 @@ struct priv {
     bool logged_osd_skip;
     bool logged_draw_frame;
     bool logged_resize;
+    char *configured_window_id;
+    int configured_window_width;
+    int configured_window_height;
+    bool use_exported_window;
+    bool audio_hint;
+    int dovi_policy;
 };
 
 struct starfish_video_geometry {
@@ -234,17 +241,16 @@ static void map_video_surface(struct vo *vo)
     }
 
     wl_surface_attach(wl->video_surface, p->solid_buffer, 0, 0);
-    wl_surface_damage_buffer(wl->video_surface, 0, 0, 1, 1);
+    vo_wayland_surface_damage(wl, wl->video_surface, 0, 0, 1, 1);
     wl_surface_attach(wl->surface, p->solid_buffer, 0, 0);
-    wl_surface_damage_buffer(wl->surface, 0, 0, 1, 1);
+    vo_wayland_surface_damage(wl, wl->surface, 0, 0, 1, 1);
 }
 
 static bool get_external_window_size(struct vo *vo, int *width, int *height)
 {
-    const char *width_env = getenv("STARFISH_WINDOW_WIDTH");
-    const char *height_env = getenv("STARFISH_WINDOW_HEIGHT");
-    *width = width_env ? atoi(width_env) : 0;
-    *height = height_env ? atoi(height_env) : 0;
+    struct priv *p = vo->priv;
+    *width = p->configured_window_width;
+    *height = p->configured_window_height;
 
     if (*width <= 0 && vo->params)
         *width = vo->params->w;
@@ -528,7 +534,8 @@ static void render_osd_surface(struct vo *vo, double pts)
     }
 
     wl_surface_attach(wl->osd_surface, buf->buffer, 0, 0);
-    wl_surface_damage_buffer(wl->osd_surface, 0, 0, vo->dwidth, vo->dheight);
+    vo_wayland_surface_damage(wl, wl->osd_surface, 0, 0,
+                              vo->dwidth, vo->dheight);
 }
 
 static void exported_window_id_assigned(void *data,
@@ -565,15 +572,18 @@ static int resize(struct vo *vo)
 static int preinit(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    const char *window_id = getenv("STARFISH_WINDOW_ID");
+    const char *window_id = p->configured_window_id;
     bool external_window = (window_id && window_id[0]) || vo->opts->WinID > 0;
-    const char *use_exported = getenv("STARFISH_USE_EXPORTED_WINDOW");
-    bool exported_enabled = use_exported && use_exported[0] &&
-                            strcmp(use_exported, "0") != 0;
 
     p->ctx = starfish_ctx_create(vo->log);
     if (!p->ctx)
         return -1;
+    if (!starfish_ctx_set_dovi_policy(p->ctx, p->dovi_policy))
+        goto err;
+    if (p->audio_hint &&
+        !starfish_ctx_configure_audio_pcm(p->ctx, 2, 48000, 16, "S16LE",
+                                          "interleaved"))
+        goto err;
 
     if (!external_window && !vo_wayland_init(vo))
         goto err;
@@ -592,7 +602,7 @@ static int preinit(struct vo *vo)
     } else if (vo->opts->WinID > 0) {
         p->window_ready = true;
         starfish_ctx_set_numeric_window_id(p->ctx, vo->opts->WinID);
-    } else if (exported_enabled && vo->wl && vo->wl->webos_foreign) {
+    } else if (p->use_exported_window && vo->wl && vo->wl->webos_foreign) {
         p->exported = wl_webos_foreign_export_element(
             vo->wl->webos_foreign, vo->wl->video_surface,
             WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT);
@@ -702,6 +712,9 @@ static int control(struct vo *vo, uint32_t request, void *data)
                    ? VO_TRUE
                    : VO_FALSE;
     }
+    case VOCTRL_SET_PLAYBACK_SPEED:
+        return data && starfish_ctx_set_playback_speed(p->ctx, *(double *)data)
+                   ? VO_TRUE : VO_FALSE;
     }
 
     int events = 0;
@@ -780,6 +793,8 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
         vo_wayland_wait_events(vo, until_time_ns);
 }
 
+#define OPT_BASE_STRUCT struct priv
+
 const struct vo_driver video_out_starfish = {
     .description = "LG webOS Starfish",
     .name = "starfish",
@@ -800,4 +815,21 @@ const struct vo_driver video_out_starfish = {
     .wait_events = wait_events,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
+    .priv_defaults = &(const struct priv) {
+        .dovi_policy = STARFISH_DOVI_AUTO,
+    },
+    .options = (const struct m_option[]) {
+        {"window-id", OPT_STRING(configured_window_id)},
+        {"window-width", OPT_INT(configured_window_width), M_RANGE(0, 16384)},
+        {"window-height", OPT_INT(configured_window_height), M_RANGE(0, 16384)},
+        {"use-exported-window", OPT_BOOL(use_exported_window)},
+        {"audio-hint", OPT_BOOL(audio_hint)},
+        {"dovi-policy", OPT_CHOICE(dovi_policy,
+            {"auto", STARFISH_DOVI_AUTO},
+            {"passthrough", STARFISH_DOVI_PASSTHROUGH},
+            {"p7-fallback", STARFISH_DOVI_P7_FALLBACK},
+            {"hdr10", STARFISH_DOVI_HDR10})},
+        {0}
+    },
+    .options_prefix = "vo-starfish",
 };

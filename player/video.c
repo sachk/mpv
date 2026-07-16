@@ -46,6 +46,7 @@
 #include "core.h"
 #include "command.h"
 #include "screenshot.h"
+#include "starfish_sync.h"
 
 enum {
     // update_video() - code also uses: <0 error, 0 eof, >0 progress
@@ -55,9 +56,6 @@ enum {
     VD_NEW_FRAME = 2,   // the call produced a new frame
     VD_WAIT = 3,        // no EOF, but no output; wait until wakeup
 };
-
-static bool is_starfish_video_out(struct MPContext *mpctx);
-static bool starfish_split_clock(struct MPContext *mpctx);
 
 static const char av_desync_help_text[] =
 "\n"
@@ -652,28 +650,6 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
     }
 }
 
-// Update the A/V sync difference when a new video frame is being shown.
-// Query the VO for an externally-owned video playback clock (e.g. Starfish's
-// getCurrentPlaytime), age-adjusted to the current host time. Returns false
-// when no VO is attached, the VO doesn't supply a clock, or the cached
-// sample is stale (>250 ms old). The caller falls back to mpctx->video_pts.
-static bool query_external_video_clock(struct MPContext *mpctx, double *pts_out)
-{
-    if (!mpctx->video_out)
-        return false;
-    struct voctrl_external_video_clock clock = {0};
-    if (vo_control(mpctx->video_out, VOCTRL_GET_EXTERNAL_VIDEO_CLOCK, &clock)
-        != VO_TRUE)
-        return false;
-    if (clock.pts == MP_NOPTS_VALUE || clock.host_time_ns <= 0)
-        return false;
-    double age = MP_TIME_NS_TO_S(mp_time_ns() - clock.host_time_ns);
-    if (age < 0 || age > 0.250)
-        return false;
-    *pts_out = clock.pts + age * mpctx->opts->playback_speed;
-    return true;
-}
-
 static void update_av_diff(struct MPContext *mpctx, double offset)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -770,25 +746,6 @@ static bool using_spdif_passthrough(struct MPContext *mpctx)
         return !af_fmt_is_pcm(format);
     }
     return false;
-}
-
-static bool is_starfish_video_out(struct MPContext *mpctx)
-{
-    return mpctx->video_out && mpctx->video_out->driver &&
-           strcmp(mpctx->video_out->driver->name, "starfish") == 0;
-}
-
-static bool is_alsa_audio_out(struct MPContext *mpctx)
-{
-    if (!mpctx->ao_chain || !mpctx->ao_chain->ao)
-        return false;
-    const char *name = ao_get_name(mpctx->ao_chain->ao);
-    return name && strcmp(name, "alsa") == 0;
-}
-
-static bool starfish_split_clock(struct MPContext *mpctx)
-{
-    return is_starfish_video_out(mpctx) && is_alsa_audio_out(mpctx);
 }
 
 // Audio drift compensation for display-sync. Tunes the audio-speed scale

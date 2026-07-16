@@ -25,7 +25,8 @@ wl_protocols_headers = []
 
 foreach v: ['1.39', '1.41', '1.44', '1.47', '1.48']
     features += {'wayland-protocols-' + v.replace('.', '-'):
-        wl_protocol_dir != ''}
+        features['starfish'] ? fs.exists(wl_protocol_dir) :
+                               wayland['deps'][2].version().version_compare('>=' + v)}
 endforeach
 
 if features['wayland-protocols-1-39']

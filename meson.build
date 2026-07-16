@@ -1121,29 +1121,47 @@ if webos_sdk_root == ''
     webos_sdk_root = meson.project_source_root() / '..' / 'build' / 'webos-sdk' / 'arm-webos-linux-gnueabi_sdk-buildroot'
 endif
 
-wayland = {
-    'deps': [dependency('wayland-client', version: '>= 1.11.0', required: get_option('wayland')),
-             dependency('wayland-cursor', version: '>= 1.11.0', required: get_option('wayland')),
-             dependency('xkbcommon', version: '>= 0.3.0', required: get_option('wayland'))],
-    'scanner': find_program('wayland-scanner', required: get_option('wayland'),
-                            dirs: [webos_sdk_root / 'bin',
-                                   webos_sdk_root / 'arm-webos-linux-gnueabi/sysroot/usr/bin']),
-}
-wayland += {'header':
-    cc.has_header('linux/input-event-codes.h',
-                  dependencies: wayland['deps'][0], required: false) or
-    cc.has_header('linux/input.h',
-                  dependencies: wayland['deps'][0], required: get_option('wayland'))}
-pkgconf_native = find_program('pkg-config', native: true, required: get_option('wayland'))
-wayland_protocol_dir = ''
-if pkgconf_native.found()
-    wayland_protocol_dir = run_command(pkgconf_native, '--variable=pkgdatadir',
-                                       'wayland-protocols', check: false).stdout().strip()
+if features['starfish']
+    # The oldest supported webOS SDK ships Wayland 1.15 and has no target
+    # wayland-protocols pkg-config package. Keep those compatibility floors
+    # scoped to Starfish cross-builds so desktop builds retain upstream's
+    # dependency guarantees and named event queues.
+    wayland = {
+        'deps': [dependency('wayland-client', version: '>= 1.11.0', required: get_option('wayland')),
+                 dependency('wayland-cursor', version: '>= 1.11.0', required: get_option('wayland')),
+                 dependency('xkbcommon', version: '>= 0.3.0', required: get_option('wayland'))],
+        'scanner': find_program('wayland-scanner', required: get_option('wayland'),
+                                dirs: [webos_sdk_root / 'bin',
+                                       webos_sdk_root / 'arm-webos-linux-gnueabi/sysroot/usr/bin']),
+    }
+    wayland += {'header':
+        cc.has_header('linux/input-event-codes.h',
+                      dependencies: wayland['deps'][0], required: false) or
+        cc.has_header('linux/input.h',
+                      dependencies: wayland['deps'][0], required: get_option('wayland'))}
+    pkgconf_native = find_program('pkg-config', native: true, required: get_option('wayland'))
+    wayland_protocol_dir = ''
+    if pkgconf_native.found()
+        wayland_protocol_dir = run_command(pkgconf_native, '--variable=pkgdatadir',
+                                           'wayland-protocols', check: false).stdout().strip()
+    endif
+    if wayland_protocol_dir == ''
+        wayland_protocol_dir = run_command('sh', '-c', 'printf %s "$WAYLAND_PROTOCOLS_DIR"', check: false).stdout().strip()
+    endif
+    wayland += {'protocol_dir': wayland_protocol_dir}
+else
+    wayland = {
+        'deps': [dependency('wayland-client', version: '>= 1.23.0', required: get_option('wayland')),
+                 dependency('wayland-cursor', version: '>= 1.23.0', required: get_option('wayland')),
+                 dependency('wayland-protocols', version: '>= 1.38', required: get_option('wayland')),
+                 dependency('xkbcommon', version: '>= 0.3.0', required: get_option('wayland'))],
+        'header': cc.has_header('linux/input-event-codes.h', required: get_option('wayland'),
+                                dependencies: dependency('wayland-client', required: get_option('wayland'))),
+        'scanner': find_program('wayland-scanner', version: '>= 1.23.0', required: get_option('wayland')),
+    }
+    wayland += {'protocol_dir': wayland['deps'][2].get_variable(
+        pkgconfig: 'pkgdatadir', internal: 'pkgdatadir')}
 endif
-if wayland_protocol_dir == ''
-    wayland_protocol_dir = run_command('sh', '-c', 'printf %s "$WAYLAND_PROTOCOLS_DIR"', check: false).stdout().strip()
-endif
-wayland += {'protocol_dir': wayland_protocol_dir}
 wayland_deps = true
 foreach dep: wayland['deps']
     if not dep.found()

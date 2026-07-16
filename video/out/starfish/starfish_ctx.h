@@ -32,6 +32,13 @@ enum starfish_feed_status {
   STARFISH_FEED_AGAIN = 1,
 };
 
+enum starfish_dovi_policy {
+  STARFISH_DOVI_AUTO = 0,
+  STARFISH_DOVI_PASSTHROUGH,
+  STARFISH_DOVI_P7_FALLBACK,
+  STARFISH_DOVI_HDR10,
+};
+
 struct starfish_video_frame {
   double pts;
   double dts;
@@ -86,6 +93,13 @@ starfish_ctx_set_numeric_window_id(struct starfish_ctx *ctx, int64_t wid);
 STARFISH_CTX_API bool starfish_ctx_set_video_geometry(struct starfish_ctx *ctx,
                                                       int width, int height,
                                                       double fps);
+STARFISH_CTX_API bool
+starfish_ctx_set_dovi_policy(struct starfish_ctx *ctx,
+                             enum starfish_dovi_policy policy);
+STARFISH_CTX_API bool
+starfish_ctx_set_audio_feed_ahead(struct starfish_ctx *ctx, double seconds);
+STARFISH_CTX_API bool
+starfish_ctx_set_playback_speed(struct starfish_ctx *ctx, double speed);
 STARFISH_CTX_API bool starfish_ctx_set_display_window(struct starfish_ctx *ctx,
                                                       int src_x, int src_y,
                                                       int src_w, int src_h,
@@ -100,12 +114,8 @@ STARFISH_CTX_API bool
 starfish_ctx_configure_audio_passthrough(struct starfish_ctx *ctx, int format,
                                           int samplerate,
                                           const struct mp_chmap *channels);
-STARFISH_CTX_API bool starfish_ctx_configure_audio_aac(struct starfish_ctx *ctx,
-                                                       int channels,
-                                                       int samplerate,
-                                                       int profile, bool raw);
-// Configure uncompressed-PCM audio fed as an elementary stream (esData=2),
-// independent of the AAC path. pcm_format is a gstreamer sample-format token
+// Configure uncompressed-PCM audio fed as an elementary stream (esData=2).
+// pcm_format is a gstreamer sample-format token
 // (e.g. "S16LE"); pcm_layout is "interleaved" or "non-interleaved".
 STARFISH_CTX_API bool
 starfish_ctx_configure_audio_pcm(struct starfish_ctx *ctx, int channels,
@@ -140,7 +150,6 @@ STARFISH_CTX_API bool starfish_ctx_is_failed(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_video_width(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_video_height(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_video_fps(struct starfish_ctx *ctx);
-STARFISH_CTX_API double starfish_ctx_get_current_pts(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx);
 
 // Stable presentation PTS for subtitle/OSD rendering. Returns false while the
