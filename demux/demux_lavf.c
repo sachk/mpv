@@ -609,7 +609,7 @@ static void select_tracks(struct demuxer *demuxer, int start)
     for (int n = start; n < priv->num_streams; n++) {
         struct sh_stream *stream = priv->streams[n]->sh;
         AVStream *st = priv->avfc->streams[n];
-        bool selected = stream && demux_stream_is_selected(stream) &&
+        bool selected = stream && demux_stream_is_reading(stream) &&
                         !stream->attached_picture;
         if (!selected && priv->streams[n]->dovi_split) {
             struct sh_stream *el =
@@ -1706,7 +1706,7 @@ static bool demux_lavf_read_packet(struct demuxer *demux,
                                     ? mp_dovi_split_el_stream(info->dovi_split)
                                     : NULL;
     bool need_for_split = split_el && demux_stream_is_selected(split_el);
-    if (!demux_stream_is_selected(stream) && !need_for_split) {
+    if (!demux_stream_is_reading(stream) && !need_for_split) {
         av_packet_free(&pkt);
         return true; // don't signal EOF if skipping a packet
     }

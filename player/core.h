@@ -447,6 +447,7 @@ typedef struct MPContext {
     int remaining_ab_loops;
 
     bool paused_for_cache;
+    bool paused_for_subtitle;
     bool demux_underrun;
     double cache_stop_time;
     int cache_buffer;
@@ -632,6 +633,7 @@ double get_relative_time(struct MPContext *mpctx);
 void reset_playback_state(struct MPContext *mpctx);
 void set_pause_state(struct MPContext *mpctx, bool user_pause);
 void update_internal_pause_state(struct MPContext *mpctx);
+void set_subtitle_switch_pause(struct MPContext *mpctx, bool paused);
 void update_core_idle_state(struct MPContext *mpctx);
 void add_step_frame(struct MPContext *mpctx, int dir, bool use_seek);
 void step_frame_mute(struct MPContext *mpctx, bool mute);

@@ -89,6 +89,7 @@ struct demux_opts {
     bool force_retry_eof;
     char **directory_filter;
     int autocreate_playlist;
+    char **preload_subtitle_streams;
 };
 
 #define SEEK_FACTOR   (1 << 1)      // argument is in range [0,1]
@@ -307,6 +308,7 @@ int demux_read_packet_async(struct sh_stream *sh, struct demux_packet **out_pkt)
 int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
                                   struct demux_packet **out_pkt);
 bool demux_stream_is_selected(struct sh_stream *stream);
+bool demux_stream_is_reading(struct sh_stream *stream);
 void demux_set_stream_wakeup_cb(struct sh_stream *sh,
                                 void (*cb)(void *ctx), void *ctx);
 struct demux_packet *demux_read_any_packet(struct demuxer *demuxer);

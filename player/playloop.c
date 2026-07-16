@@ -204,7 +204,8 @@ void update_core_idle_state(struct MPContext *mpctx)
 
 bool get_internal_paused(struct MPContext *mpctx)
 {
-    return mpctx->opts->pause || mpctx->paused_for_cache;
+    return mpctx->opts->pause || mpctx->paused_for_cache ||
+           mpctx->paused_for_subtitle;
 }
 
 // The value passed here is the new value for mpctx->opts->pause
@@ -247,6 +248,19 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
 void update_internal_pause_state(struct MPContext *mpctx)
 {
     set_pause_state(mpctx, mpctx->opts->pause);
+}
+
+void set_subtitle_switch_pause(struct MPContext *mpctx, bool paused)
+{
+    paused = paused && mpctx->playback_initialized &&
+             is_starfish_video_out(mpctx);
+    if (mpctx->paused_for_subtitle == paused)
+        return;
+
+    mpctx->paused_for_subtitle = paused;
+    MP_VERBOSE(mpctx, "Starfish subtitle switch %s\n",
+               paused ? "held" : "released");
+    update_internal_pause_state(mpctx);
 }
 
 void update_screensaver_state(struct MPContext *mpctx)
@@ -299,6 +313,7 @@ static void update_sparse_video(struct MPContext *mpctx)
 // Clear some playback-related fields on file loading or after seeks.
 void reset_playback_state(struct MPContext *mpctx)
 {
+    set_subtitle_switch_pause(mpctx, false);
     mp_filter_reset(mpctx->filter_root);
 
     reset_video_state(mpctx);
@@ -961,16 +976,31 @@ static void handle_update_subtitles(struct MPContext *mpctx)
 {
     if (mpctx->video_status == STATUS_EOF) {
         update_subtitles(mpctx, mpctx->playback_pts);
+        set_subtitle_switch_pause(mpctx, false);
         return;
     }
 
+    bool pending = false;
     for (int n = 0; n < mpctx->num_tracks; n++) {
         struct track *track = mpctx->tracks[n];
-        if (track->type == STREAM_SUB && !track->demuxer_ready) {
-            update_subtitles(mpctx, mpctx->playback_pts);
+        if (track->type == STREAM_SUB && track->selected &&
+            !track->demuxer_ready) {
+            pending = true;
             break;
         }
     }
+
+    if (pending && update_subtitles(mpctx, mpctx->playback_pts)) {
+        for (int n = 0; n < num_ptracks[STREAM_SUB]; n++) {
+            struct track *track = mpctx->current_track[n][STREAM_SUB];
+            if (track)
+                track->demuxer_ready = true;
+        }
+        pending = false;
+    }
+
+    if (mpctx->paused_for_subtitle && !pending)
+        set_subtitle_switch_pause(mpctx, false);
 }
 
 static void handle_cursor_autohide(struct MPContext *mpctx)

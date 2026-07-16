@@ -817,6 +817,9 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
         goto error;
     }
 
+    if (type == STREAM_SUB && track)
+        set_subtitle_switch_pause(mpctx, true);
+
     if (order == 0) {
         if (type == STREAM_VIDEO) {
             uninit_video_chain(mpctx);
@@ -864,6 +867,8 @@ void mp_switch_track_n(struct MPContext *mpctx, int order, enum stream_type type
         reinit_audio_chain(mpctx);
     } else if (type == STREAM_SUB && order >= 0 && order <= 2) {
         reinit_sub(mpctx, track);
+        if (!track || track->demuxer_ready)
+            set_subtitle_switch_pause(mpctx, false);
     }
 
     mp_notify(mpctx, MP_EVENT_TRACK_SWITCHED, NULL);

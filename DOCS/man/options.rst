@@ -4283,6 +4283,15 @@ Demuxer
     See ``--list-options`` for defaults and value range. ``<bytesize>`` options
     accept suffixes such as ``KiB`` and ``MiB``.
 
+``--demuxer-preload-subtitle-streams=<stream-index,...>``
+    Retain packets for the listed embedded source subtitle stream indexes while
+    the streams are not selected. Selecting one of these streams can then use
+    the demuxer cache without seeking the shared audio/video input backwards.
+
+    This is intended for clients which know which subtitle streams a user is
+    likely to select. Retained packets count toward the normal demuxer cache
+    limits. Currently supported by the Matroska and libavformat demuxers.
+
 ``--demuxer-max-back-bytes=<bytesize>``
     This controls how much past data the demuxer is allowed to preserve. This
     is useful only if the cache is enabled.

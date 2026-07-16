@@ -131,6 +131,8 @@ const struct m_sub_options demux_conf = {
             M_RANGE(0, DBL_MAX)},
         {"metadata-codepage", OPT_STRING(meta_cp)},
         {"directory-filter-types", OPT_STRINGLIST(directory_filter)},
+        {"demuxer-preload-subtitle-streams",
+            OPT_STRINGLIST(preload_subtitle_streams)},
         {"autocreate-playlist", OPT_CHOICE(autocreate_playlist,
             {"no", 0}, {"filter", 1}, {"same", 2})},
         {0}
@@ -401,6 +403,7 @@ struct demux_stream {
 
     // demuxer state
     bool selected;          // user wants packets from this stream
+    bool preloaded;         // retain packets while not selected
     bool eager;             // try to keep at least 1 packet queued
                             // if false, this stream is disabled, or passively
                             // read (like subtitles)
@@ -967,7 +970,7 @@ static void update_stream_selection_state(struct demux_internal *in,
     for (int n = 0; n < in->num_ranges; n++) {
         struct demux_cached_range *range = in->ranges[n];
 
-        if (!ds->selected)
+        if (!ds->selected && !ds->preloaded)
             clear_queue(range->streams[ds->index]);
 
         update_seek_ranges(range);
@@ -1032,12 +1035,28 @@ static void demux_add_sh_stream_locked(struct demux_internal *in,
 
     sh->index = in->num_streams;
 
+    bool preloaded = false;
+    int source_index = sh->ff_index >= 0 ? sh->ff_index : sh->index;
+    if (sh->type == STREAM_SUB && in->d_thread->depth == 0) {
+        for (int n = 0; in->d_user->opts->preload_subtitle_streams &&
+                        in->d_user->opts->preload_subtitle_streams[n]; n++) {
+            char *value = in->d_user->opts->preload_subtitle_streams[n];
+            char *end = NULL;
+            long index = strtol(value, &end, 10);
+            if (end != value && !*end && index == source_index) {
+                preloaded = true;
+                break;
+            }
+        }
+    }
+
     sh->ds = talloc(sh, struct demux_stream);
     *sh->ds = (struct demux_stream) {
         .in = in,
         .sh = sh,
         .type = sh->type,
         .index = sh->index,
+        .preloaded = preloaded,
         .global_correct_dts = true,
         .global_correct_pos = true,
     };
@@ -1058,6 +1077,12 @@ static void demux_add_sh_stream_locked(struct demux_internal *in,
     }
 
     update_stream_selection_state(in, sh->ds);
+
+    if (preloaded) {
+        MP_VERBOSE(in, "preloading subtitle track %d (source index %d)\n",
+                   sh->index, source_index);
+        in->tracks_switched = true;
+    }
 
     switch (ds->type) {
     case STREAM_AUDIO:
@@ -2182,7 +2207,8 @@ static void add_packet_locked(struct sh_stream *stream, demux_packet_t *dp)
 
     struct demux_queue *queue = ds->queue;
 
-    bool drop = !ds->selected || in->seeking || ds->sh->attached_picture;
+    bool drop = (!ds->selected && !ds->preloaded) || in->seeking ||
+                ds->sh->attached_picture;
 
     if (!drop) {
         // If libavformat splits packets, some packets will have pos unset, so
@@ -4284,8 +4310,22 @@ static bool select_track(struct demux_internal *in,
     ds->selected = selected;
     update_stream_selection_state(in, ds);
     in->tracks_switched = true;
-    if (ds->selected)
-        refresh_track(in, stream, ref_pts);
+    if (ds->selected) {
+        if (ds->preloaded) {
+            ref_pts = MP_ADD_PTS(ref_pts, -in->ts_offset);
+            ds->reader_head = find_seek_target(ds->queue, ref_pts, 0);
+            ds->skip_to_keyframe = false;
+            if (ds->reader_head) {
+                ds->base_ts = MP_PTS_OR_DEF(ds->reader_head->pts,
+                                            ds->reader_head->dts);
+            }
+            MP_VERBOSE(in, "activate preloaded track %d at %f (%s cache)\n",
+                       stream->index, ref_pts,
+                       ds->reader_head ? "from" : "waiting for");
+        } else {
+            refresh_track(in, stream, ref_pts);
+        }
+    }
     return true;
 }
 
@@ -4342,6 +4382,17 @@ bool demux_stream_is_selected(struct sh_stream *stream)
     bool r = false;
     mp_mutex_lock(&stream->ds->in->lock);
     r = stream->ds->selected;
+    mp_mutex_unlock(&stream->ds->in->lock);
+    return r;
+}
+
+bool demux_stream_is_reading(struct sh_stream *stream)
+{
+    if (!stream)
+        return false;
+    bool r = false;
+    mp_mutex_lock(&stream->ds->in->lock);
+    r = stream->ds->selected || stream->ds->preloaded;
     mp_mutex_unlock(&stream->ds->in->lock);
     return r;
 }

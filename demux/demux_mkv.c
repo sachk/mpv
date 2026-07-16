@@ -3123,7 +3123,7 @@ static int handle_block(demuxer_t *demuxer, struct block_info *block_info)
                                     ? mp_dovi_split_el_stream(track->dovi_split)
                                     : NULL;
     bool need_for_split = split_el && demux_stream_is_selected(split_el);
-    if (!demux_stream_is_selected(stream) && !need_for_split)
+    if (!demux_stream_is_reading(stream) && !need_for_split)
         return 0;
 
     current_pts = tc / 1e9 - track->codec_delay;
