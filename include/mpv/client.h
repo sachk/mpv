@@ -623,6 +623,13 @@ MPV_EXPORT int64_t mpv_get_time_ns(mpv_handle *ctx);
 MPV_EXPORT int64_t mpv_get_time_us(mpv_handle *ctx);
 
 /**
+ * Return cumulative thread CPU time spent inside libavcodec audio decode
+ * calls. This is a Jellyfin Native diagnostic extension and is not part of
+ * upstream libmpv's stable client API.
+ */
+MPV_EXPORT uint64_t mpv_get_audio_decode_cpu_time_ns(void);
+
+/**
  * Data format for options and properties. The API functions to get/set
  * properties and options support multiple formats, and this enum describes
  * them.
@@ -1961,6 +1968,8 @@ MPV_DEFINE_SYM_PTR(mpv_get_time_ns)
 #define mpv_get_time_ns pfn_mpv_get_time_ns
 MPV_DEFINE_SYM_PTR(mpv_get_time_us)
 #define mpv_get_time_us pfn_mpv_get_time_us
+MPV_DEFINE_SYM_PTR(mpv_get_audio_decode_cpu_time_ns)
+#define mpv_get_audio_decode_cpu_time_ns pfn_mpv_get_audio_decode_cpu_time_ns
 MPV_DEFINE_SYM_PTR(mpv_free_node_contents)
 #define mpv_free_node_contents pfn_mpv_free_node_contents
 MPV_DEFINE_SYM_PTR(mpv_set_option)

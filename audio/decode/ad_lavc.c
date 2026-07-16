@@ -19,11 +19,14 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
 #include <libavutil/common.h>
 #include <libavutil/intreadwrite.h>
+
+#include <mpv/client.h>
 
 #include "config.h"
 
@@ -40,6 +43,25 @@
 #include "filters/filter_internal.h"
 #include "options/m_config.h"
 #include "options/options.h"
+#include "osdep/threads.h"
+
+static atomic_uint_fast64_t audio_decode_cpu_time_ns;
+
+MPV_EXPORT uint64_t mpv_get_audio_decode_cpu_time_ns(void)
+{
+    return atomic_load_explicit(&audio_decode_cpu_time_ns,
+                                memory_order_relaxed);
+}
+
+static void record_decode_cpu_time(int64_t started_ns)
+{
+    int64_t finished_ns = mp_thread_cpu_time_ns(mp_thread_current_id());
+    if (started_ns >= 0 && finished_ns >= started_ns) {
+        atomic_fetch_add_explicit(&audio_decode_cpu_time_ns,
+                                  finished_ns - started_ns,
+                                  memory_order_relaxed);
+    }
+}
 
 struct priv {
     struct mp_codec_params *codec;
@@ -185,7 +207,9 @@ static int send_packet(struct mp_filter *da, struct demux_packet *mpkt)
 
     mp_set_av_packet(priv->avpkt, mpkt, &priv->codec_timebase);
 
+    int64_t started_ns = mp_thread_cpu_time_ns(mp_thread_current_id());
     int ret = avcodec_send_packet(avctx, mpkt ? priv->avpkt : NULL);
+    record_decode_cpu_time(started_ns);
     if (ret < 0)
         MP_ERR(da, "Error decoding audio.\n");
     return ret;
@@ -196,7 +220,9 @@ static int receive_frame(struct mp_filter *da, struct mp_frame *out)
     struct priv *priv = da->priv;
     AVCodecContext *avctx = priv->avctx;
 
+    int64_t started_ns = mp_thread_cpu_time_ns(mp_thread_current_id());
     int ret = avcodec_receive_frame(avctx, priv->avframe);
+    record_decode_cpu_time(started_ns);
 
     if (ret == AVERROR_EOF) {
         // If flushing was initialized earlier and has ended now, make it start
