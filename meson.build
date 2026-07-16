@@ -1159,8 +1159,12 @@ else
                                 dependencies: dependency('wayland-client', required: get_option('wayland'))),
         'scanner': find_program('wayland-scanner', version: '>= 1.23.0', required: get_option('wayland')),
     }
-    wayland += {'protocol_dir': wayland['deps'][2].get_variable(
-        pkgconfig: 'pkgdatadir', internal: 'pkgdatadir')}
+    wayland_protocol_dir = ''
+    if wayland['deps'][2].found()
+        wayland_protocol_dir = wayland['deps'][2].get_variable(
+            pkgconfig: 'pkgdatadir', internal: 'pkgdatadir')
+    endif
+    wayland += {'protocol_dir': wayland_protocol_dir}
 endif
 wayland_deps = true
 foreach dep: wayland['deps']
