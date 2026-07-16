@@ -313,7 +313,7 @@ struct starfish_ctx {
 static std::mutex g_current_lock;
 static starfish_ctx *g_current_ctx;
 
-/* starfish_overlay_set_present_cb and starfish_exported_set_crop_cb live in
+/* starfish_overlay_set_callbacks and starfish_exported_set_crop_cb live in
  * vo_starfish.c since they only feed VO-local OSD/crop state. */
 
 /* ----- wakeup / prime client helpers -------------------------------- */

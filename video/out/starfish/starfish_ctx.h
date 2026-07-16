@@ -54,8 +54,11 @@ struct starfish_audio_status {
 
 typedef void (*starfish_wakeup_cb)(void *opaque);
 typedef bool (*starfish_audio_prime_cb)(void *opaque, int64_t pts_ns);
-typedef void (*starfish_overlay_present_cb)(void *opaque, const uint8_t *pixels,
-                                            int width, int height, int stride);
+typedef uint8_t *(*starfish_overlay_acquire_cb)(void *opaque, int width,
+                                                int height, int *stride,
+                                                void **buffer);
+typedef void (*starfish_overlay_present_cb)(void *opaque, void *buffer,
+                                            bool visible);
 typedef void (*starfish_exported_crop_cb)(void *opaque, int orig_w, int orig_h,
                                           int src_x, int src_y, int src_w,
                                           int src_h, int dst_x, int dst_y,
@@ -73,8 +76,9 @@ starfish_ctx_from_hwdec(struct mp_hwdec_ctx *hwctx);
 
 STARFISH_CTX_API bool starfish_ctx_set_current(struct starfish_ctx *ctx);
 STARFISH_CTX_API struct starfish_ctx *starfish_ctx_get_current(void);
-STARFISH_CTX_API void
-starfish_overlay_set_present_cb(starfish_overlay_present_cb cb, void *opaque);
+STARFISH_CTX_API void starfish_overlay_set_callbacks(
+    starfish_overlay_acquire_cb acquire_cb,
+    starfish_overlay_present_cb present_cb, void *opaque);
 STARFISH_CTX_API void
 starfish_exported_set_crop_cb(starfish_exported_crop_cb cb, void *opaque);
 

@@ -15,6 +15,7 @@
 #include "options/m_option.h"
 #include "osdep/endian.h"
 #include "present_sync.h"
+#include "sub/draw_bmp.h"
 #include "sub/osd.h"
 #include "video/hwdec.h"
 #include "video/mp_image.h"
@@ -50,9 +51,10 @@ struct priv {
     struct mp_osd_res osd;
     struct wl_shm_pool *solid_buffer_pool;
     struct wl_buffer *solid_buffer;
-    uint8_t *callback_pixels;
-    size_t callback_size;
-    int callback_stride;
+    struct mp_draw_sub_cache *callback_draw_cache;
+    int64_t callback_osd_change_id;
+    struct mp_osd_res callback_osd_res;
+    bool callback_osd_state_valid;
     struct mp_image_params target_params;
     int logged_osd_pixels;
     bool have_osd_alpha_state;
@@ -77,16 +79,19 @@ struct starfish_video_geometry {
 };
 
 static pthread_mutex_t overlay_cb_lock = PTHREAD_MUTEX_INITIALIZER;
+static starfish_overlay_acquire_cb overlay_acquire_cb;
 static starfish_overlay_present_cb overlay_present_cb;
 static void *overlay_present_opaque;
 static starfish_exported_crop_cb exported_crop_cb;
 static void *exported_crop_opaque;
 
-STARFISH_CTX_API void starfish_overlay_set_present_cb(starfish_overlay_present_cb cb,
-                                                      void *opaque)
+STARFISH_CTX_API void starfish_overlay_set_callbacks(
+    starfish_overlay_acquire_cb acquire_cb,
+    starfish_overlay_present_cb present_cb, void *opaque)
 {
     pthread_mutex_lock(&overlay_cb_lock);
-    overlay_present_cb = cb;
+    overlay_acquire_cb = acquire_cb;
+    overlay_present_cb = present_cb;
     overlay_present_opaque = opaque;
     pthread_mutex_unlock(&overlay_cb_lock);
 }
@@ -426,10 +431,12 @@ static void render_osd_surface(struct vo *vo, double pts)
 {
     struct priv *p = vo->priv;
     struct vo_wayland_state *wl = vo->wl;
+    starfish_overlay_acquire_cb acquire_cb = NULL;
     starfish_overlay_present_cb cb = NULL;
     void *cb_opaque = NULL;
 
     pthread_mutex_lock(&overlay_cb_lock);
+    acquire_cb = overlay_acquire_cb;
     cb = overlay_present_cb;
     cb_opaque = overlay_present_opaque;
     pthread_mutex_unlock(&overlay_cb_lock);
@@ -445,16 +452,37 @@ static void render_osd_surface(struct vo *vo, double pts)
         return;
     }
 
-    if ((!wl || !wl->shm || !wl->osd_surface) && cb) {
-        size_t size = (size_t)vo->dheight * MP_ALIGN_UP(vo->dwidth * 4, MP_IMAGE_BYTE_ALIGN);
-        if (size != p->callback_size) {
-            free(p->callback_pixels);
-            p->callback_pixels = malloc(size);
-            p->callback_size = p->callback_pixels ? size : 0;
-            p->callback_stride = p->callback_pixels ? MP_ALIGN_UP(vo->dwidth * 4, MP_IMAGE_BYTE_ALIGN) : 0;
+    if ((!wl || !wl->shm || !wl->osd_surface) && acquire_cb && cb) {
+        struct sub_bitmap_list *osd =
+            osd_render(vo->osd, p->osd, pts, 0, mp_draw_sub_formats);
+        const bool has_pixels = osd->num_items > 0;
+        const bool unchanged =
+            p->callback_osd_state_valid &&
+            p->callback_osd_change_id == osd->change_id &&
+            osd_res_equals(p->callback_osd_res, p->osd);
+        if (unchanged) {
+            talloc_free(osd);
+            return;
         }
-        if (!p->callback_pixels) {
-            MP_ERR(vo, "failed to allocate Starfish callback OSD buffer\n");
+
+        if (!has_pixels) {
+            cb(cb_opaque, NULL, false);
+            p->callback_osd_change_id = osd->change_id;
+            p->callback_osd_res = p->osd;
+            p->callback_osd_state_valid = true;
+            p->have_osd_alpha_state = true;
+            p->last_osd_has_pixels = false;
+            p->logged_osd_pixels++;
+            talloc_free(osd);
+            return;
+        }
+
+        int stride = 0;
+        void *buffer = NULL;
+        uint8_t *pixels = acquire_cb(cb_opaque, vo->dwidth, vo->dheight,
+                                     &stride, &buffer);
+        if (!pixels || !buffer || stride < vo->dwidth * 4) {
+            talloc_free(osd);
             return;
         }
 
@@ -462,19 +490,18 @@ static void render_osd_surface(struct vo *vo, double pts)
         mp_image_setfmt(&mpi, IMGFMT_BGRA);
         mp_image_set_size(&mpi, vo->dwidth, vo->dheight);
         mpi.params.repr.alpha = PL_ALPHA_PREMULTIPLIED;
-        mpi.planes[0] = p->callback_pixels;
-        mpi.stride[0] = p->callback_stride;
+        mpi.planes[0] = pixels;
+        mpi.stride[0] = stride;
 
-        memset(mpi.planes[0], 0, p->callback_size);
-        osd_draw_on_image(vo->osd, p->osd, pts, 0, &mpi);
+        memset(mpi.planes[0], 0, (size_t)mpi.h * mpi.stride[0]);
+        if (!p->callback_draw_cache)
+            p->callback_draw_cache = mp_draw_sub_alloc(p, vo->global);
+        if (!mp_draw_sub_bitmaps(p->callback_draw_cache, &mpi, osd)) {
+            cb(cb_opaque, buffer, false);
+            talloc_free(osd);
+            return;
+        }
         {
-            bool has_pixels = false;
-            for (size_t i = 0; i + 3 < p->callback_size; i += 4) {
-                if (p->callback_pixels[i + 3]) {
-                    has_pixels = true;
-                    break;
-                }
-            }
             const bool alpha_changed = !p->have_osd_alpha_state ||
                                        has_pixels != p->last_osd_has_pixels;
             const bool should_log =
@@ -491,7 +518,11 @@ static void render_osd_surface(struct vo *vo, double pts)
             p->last_osd_has_pixels = has_pixels;
             p->logged_osd_pixels++;
         }
-        cb(cb_opaque, p->callback_pixels, mpi.w, mpi.h, mpi.stride[0]);
+        p->callback_osd_change_id = osd->change_id;
+        p->callback_osd_res = p->osd;
+        p->callback_osd_state_valid = true;
+        talloc_free(osd);
+        cb(cb_opaque, buffer, true);
         return;
     }
 
@@ -763,7 +794,6 @@ static void uninit(struct vo *vo)
         wl_buffer_destroy(p->solid_buffer);
     if (p->solid_buffer_pool)
         wl_shm_pool_destroy(p->solid_buffer_pool);
-    free(p->callback_pixels);
     talloc_free(p->window_id);
     if (p->exported)
         wl_webos_exported_destroy(p->exported);
