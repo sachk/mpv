@@ -1,10 +1,11 @@
 # Starfish sync & threading overhaul — plan
 
 Status of a multi-phase fix program for the webOS Starfish port, based on a
-full audit of the fork's diff vs upstream (merge base `02273e9d9e`). Phase 0
-is **done** (committed on `webos`). The next agent picks up at **Phase 1**,
-which is a guided on-TV testing session with the user — read that section
-first.
+full audit of the fork's diff vs upstream (merge base `02273e9d9e`). The code
+work is **complete**: Phase 2 is `d3c0fab1ad`, Phase 3 is `c62ec40d82`, and the
+Phase 4 cleanup is `cf18e4cb67`. Automated on-TV checks are also complete.
+The subjective lip-sync/seek checks and the product decision about removing
+`ao_starfish` are intentionally recorded in `../UNFINISHED.md`.
 
 Background for every phase: the audit found that most historical sync
 symptoms were fought with compensating mechanisms (grace windows, watchdogs,
@@ -33,7 +34,7 @@ build on Linux — no LG SDK). **Nothing has run on the TV yet.**
 
 ---
 
-## Phase 1 — GUIDED ON-TV TESTING (do this next, with the user)
+## Phase 1 — AUTOMATED ON-TV CHECKS COMPLETE; SUBJECTIVE CHECKS DEFERRED
 
 You are guiding the user through validating Phase 0 and running the
 ao_starfish lag experiment. Read `../AGENTS.md` first: TV is
@@ -106,7 +107,7 @@ measures the pipeline position, so nothing could correct it.
 
 ---
 
-## Phase 2 — threading hardening (after Phase 1 passes)
+## Phase 2 — DONE (`d3c0fab1ad`)
 
 1. **Route unload through the worker.** `starfish_ctx_unload()` calls
    `sf_backend_unload()` from client threads (vd destroy → playloop) while
@@ -127,7 +128,7 @@ measures the pipeline position, so nothing could correct it.
    then simplify. Most historical seek races live in illegal combinations of
    those booleans.
 
-## Phase 3 — make ao_starfish honest (design depends on Phase 1B data)
+## Phase 3 — DONE (`c62ec40d82`)
 
 Replace the fictional device model in `ao_starfish.c` `get_state()`:
 
@@ -147,7 +148,7 @@ Replace the fictional device model in `ao_starfish.c` `get_state()`:
   `ao_starfish.c` entirely (~1,250 lines) and standardize on VO starfish +
   AO alsa.
 
-## Phase 4 — hygiene (any time, low risk)
+## Phase 4 — DONE (`cf18e4cb67`)
 
 - **Dead code:** `mpctx->starfish_audio_start_bias` (read in 4 places, only
   ever assigned 0 — either wire it as a learned start-bias or delete),
