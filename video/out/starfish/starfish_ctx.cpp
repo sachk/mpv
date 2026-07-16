@@ -710,6 +710,22 @@ static void clear_queues_locked(starfish_ctx *ctx) {
   ctx->audio_bufferfull_logs = 0;
 }
 
+static void restart_loaded_pipeline_locked(starfish_ctx *ctx,
+                                           std::unique_lock<std::mutex> &lk,
+                                           const char *reason) {
+  mp_warn(ctx->log, "Starfish restarting pipeline after %s\n",
+          reason ? reason : "backend failure");
+  ctx->state = pipeline_state::UNLOADING;
+  lk.unlock();
+  const bool ok = sf_backend_unload(ctx->backend);
+  lk.lock();
+  if (!ok && ctx->state == pipeline_state::UNLOADING) {
+    mp_warn(ctx->log, "Starfish recovery unload failed, forcing IDLE\n");
+    ctx->state = pipeline_state::IDLE;
+  }
+  ctx->cv.notify_all();
+}
+
 static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
                              int64_t num_value, const char *str_value);
 
@@ -1111,6 +1127,26 @@ static feed_result try_drain(starfish_ctx *ctx,
     return feed_result::BLOCKED;
   }
   if (r == SF_BACKEND_FEED_ERROR) {
+    if (do_segment) {
+      mp_warn(ctx->log,
+              "Starfish %s rejected segment start pts=%" PRId64
+              "; reloading pipeline\n",
+              stream == STARFISH_STREAM_VIDEO ? "video" : "audio",
+              packet.pts_ns);
+      clear_queues_locked(ctx);
+      ctx->need_segment = true;
+      ctx->pending_seek_target = true;
+      ctx->pending_seek_target_ns = segment_pts_ns;
+      ctx->seek_target_valid = true;
+      ctx->seek_target_ns = segment_pts_ns;
+      prepare_segment_timeline_locked(ctx, segment_pts_ns,
+                                      "segment-feed-recovery");
+      restart_loaded_pipeline_locked(ctx, lk, "segment feed error");
+      lk.unlock();
+      wake_all(ctx);
+      lk.lock();
+      return feed_result::BLOCKED;
+    }
     mp_warn(ctx->log, "Starfish %s feed Error pts=%" PRId64 " (dropping)\n",
             stream == STARFISH_STREAM_VIDEO ? "video" : "audio",
             packet.pts_ns);
@@ -1413,7 +1449,8 @@ static bool pending_ready_matches_clock_locked(
 
 static void apply_flush_locked(starfish_ctx *ctx,
                                std::unique_lock<std::mutex> &lk) {
-  bool loaded = is_loaded_state(ctx->state);
+  const pipeline_state state_before_flush = ctx->state;
+  const bool loaded = is_loaded_state(state_before_flush);
   ctx->ended = false;
   ctx->eos_pushed = false;
   ctx->eos_pending = false;
@@ -1425,10 +1462,22 @@ static void apply_flush_locked(starfish_ctx *ctx,
                                     "seek-flush");
 
   if (loaded) {
-    lk.unlock();
-    mp_info(ctx->log, "Starfish flush applied\n");
-    sf_backend_flush(ctx->backend);
-    lk.lock();
+    // The webOS pipeline rejects Flush between LOADCOMPLETED and the first
+    // Play. Continuing after that failure poisons Feed(), so reload at the
+    // requested timestamp instead. Treat an unexpected steady-state Flush
+    // failure the same way rather than silently dropping every later packet.
+    if (state_before_flush == pipeline_state::LOADED) {
+      restart_loaded_pipeline_locked(ctx, lk, "pre-start seek");
+    } else {
+      lk.unlock();
+      const bool ok = sf_backend_flush(ctx->backend);
+      lk.lock();
+      if (ok) {
+        mp_info(ctx->log, "Starfish flush applied\n");
+      } else if (is_loaded_state(ctx->state)) {
+        restart_loaded_pipeline_locked(ctx, lk, "flush failure");
+      }
+    }
   }
 
   ctx->cv.notify_all();
