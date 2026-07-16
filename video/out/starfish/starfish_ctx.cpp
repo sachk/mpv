@@ -2586,6 +2586,23 @@ bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx, double *pts,
   return false;
 }
 
+bool starfish_ctx_get_audio_status(struct starfish_ctx *ctx,
+                                   struct starfish_audio_status *status) {
+  if (!ctx || !status)
+    return false;
+
+  std::lock_guard<std::mutex> lk(ctx->lock);
+  *status = {};
+  status->playing = ctx->state == pipeline_state::PLAYING && ctx->started;
+  status->fed = ctx->fed_audio_pts_ns != INT64_MIN;
+  const int64_t projected = project_fresh_clock_locked(ctx, mp_time_ns());
+  if (projected != INT64_MIN) {
+    status->clock_valid = true;
+    status->clock_pts_ns = projected;
+  }
+  return true;
+}
+
 bool starfish_ctx_get_osd_pts(struct starfish_ctx *ctx, double *pts) {
   if (!ctx || !pts)
     return false;

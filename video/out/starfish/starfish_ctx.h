@@ -38,6 +38,13 @@ struct starfish_video_frame {
   double duration;
 };
 
+struct starfish_audio_status {
+  bool playing;
+  bool fed;
+  bool clock_valid;
+  int64_t clock_pts_ns;
+};
+
 typedef void (*starfish_wakeup_cb)(void *opaque);
 typedef bool (*starfish_audio_prime_cb)(void *opaque, int64_t pts_ns);
 typedef void (*starfish_overlay_present_cb)(void *opaque, const uint8_t *pixels,
@@ -148,6 +155,9 @@ STARFISH_CTX_API bool starfish_ctx_get_osd_pts(struct starfish_ctx *ctx,
 STARFISH_CTX_API bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx,
                                                    double *pts,
                                                    int64_t *host_time_ns);
+STARFISH_CTX_API bool
+starfish_ctx_get_audio_status(struct starfish_ctx *ctx,
+                              struct starfish_audio_status *status);
 
 #ifdef __cplusplus
 }
