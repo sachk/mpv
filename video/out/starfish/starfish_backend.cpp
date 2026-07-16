@@ -183,6 +183,7 @@ void acb_callback_noop(long, long, long, long, long, const char *) {}
 
 struct sf_backend {
     struct mp_log *log = nullptr;
+    std::mutex callback_lock;
     sf_backend_callbacks callbacks = {};
     std::unique_ptr<StarfishMediaAPIs> media;
     std::string cached_media_id;
@@ -199,7 +200,10 @@ static void player_callback_trampoline(int32_t type, int64_t num_value,
                                        const char *str_value, void *opaque)
 {
     auto *b = static_cast<sf_backend *>(opaque);
-    if (!b || !b->callbacks.event)
+    if (!b)
+        return;
+    std::lock_guard<std::mutex> lock(b->callback_lock);
+    if (!b->callbacks.event)
         return;
     b->callbacks.event(b->callbacks.opaque, map_event(type), num_value,
                        str_value);
@@ -230,6 +234,13 @@ void sf_backend_destroy(struct sf_backend *b)
 {
     if (!b)
         return;
+    {
+        // Waiting for this lock fences any callback already executing against
+        // the owning starfish_ctx. Nulling the callback before Unload also
+        // makes teardown-generated events harmless.
+        std::lock_guard<std::mutex> lock(b->callback_lock);
+        b->callbacks = {};
+    }
     if (b->media)
         try_bool(b->log, "Unload",
                  [&] { return b->media->Unload(); });

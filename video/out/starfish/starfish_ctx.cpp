@@ -83,7 +83,15 @@ enum class pipeline_state {
   LOADED,
   PLAYING,
   PAUSED,
+  UNLOADING,
   FAILED,
+};
+
+enum class segment_state {
+  NONE,
+  AWAIT_FRAME,
+  AWAIT_PLAY,
+  READY,
 };
 
 enum class dovi_policy {
@@ -253,6 +261,7 @@ struct starfish_ctx {
   bool play_requested = true;
   bool need_segment = false;
   bool flush_requested = false;
+  bool unload_requested = false;
   bool eos_pushed = false;
   bool eos_pending = false;
   bool ended = false;
@@ -269,13 +278,10 @@ struct starfish_ctx {
   int64_t current_pts_ns = 0;
 
   /* segment first-frame deferral */
-  bool pending_segment_ready_frame = false;
-  int64_t pending_segment_ready_pts_ns = INT64_MIN;
-  bool pending_segment_ready_have_pts = false;
-  bool pending_segment_ready_saw_play = false;
-  bool pending_segment_ready_await_play = false;
+  segment_state pending_segment_state = segment_state::NONE;
+  int64_t pending_segment_pts_ns = INT64_MIN;
   bool first_segment_after_load = false;
-  std::chrono::steady_clock::time_point pending_segment_ready_watchdog =
+  std::chrono::steady_clock::time_point pending_segment_deadline =
       std::chrono::steady_clock::time_point::min();
   bool play_after_preroll_pending = false;
   int64_t play_after_preroll_target_ns = INT64_MIN;
@@ -410,6 +416,7 @@ static const char *pipeline_state_name(pipeline_state state) {
   case pipeline_state::LOADED: return "loaded";
   case pipeline_state::PLAYING: return "playing";
   case pipeline_state::PAUSED: return "paused";
+  case pipeline_state::UNLOADING: return "unloading";
   case pipeline_state::FAILED: return "failed";
   }
   return "unknown";
@@ -707,12 +714,9 @@ static void prepare_segment_timeline_locked(starfish_ctx *ctx,
   ctx->min_ready_pts_ns = start_pts_ns;
   ctx->fed_video_pts_ns = INT64_MIN;
   ctx->fed_audio_pts_ns = INT64_MIN;
-  ctx->pending_segment_ready_frame = false;
-  ctx->pending_segment_ready_pts_ns = INT64_MIN;
-  ctx->pending_segment_ready_have_pts = false;
-  ctx->pending_segment_ready_saw_play = false;
-  ctx->pending_segment_ready_await_play = false;
-  ctx->pending_segment_ready_watchdog =
+  ctx->pending_segment_state = segment_state::NONE;
+  ctx->pending_segment_pts_ns = INT64_MIN;
+  ctx->pending_segment_deadline =
       std::chrono::steady_clock::time_point::min();
   ctx->play_after_preroll_pending = false;
   ctx->play_after_preroll_target_ns = INT64_MIN;
@@ -872,23 +876,20 @@ static void queue_ready_frame_locked(starfish_ctx *ctx, int64_t pts_ns,
             reason, (double)pts_ns / 1e9);
 }
 
-static void maybe_release_pending_segment_frame_locked(starfish_ctx *ctx,
-                                                       int64_t fed_pts_ns) {
-  if (!ctx->pending_segment_ready_frame ||
-      ctx->pending_segment_ready_await_play)
-    return;
-  int64_t frame_ns = 50LL * 1000 * 1000;
-  if (ctx->fps > 0.0)
-    frame_ns = (int64_t)llround(1e9 / ctx->fps);
-  if (fed_pts_ns + frame_ns < ctx->pending_segment_ready_pts_ns)
-    return;
+static bool pending_segment_active_locked(const starfish_ctx *ctx) {
+  return ctx->pending_segment_state != segment_state::NONE;
+}
 
-  const int64_t ready_pts = ctx->pending_segment_ready_pts_ns;
-  ctx->pending_segment_ready_frame = false;
-  ctx->pending_segment_ready_pts_ns = INT64_MIN;
-  ctx->pending_segment_ready_have_pts = false;
-  ctx->pending_segment_ready_saw_play = false;
-  queue_ready_frame_locked(ctx, ready_pts, "segment target feed");
+static void queue_pending_segment_ready_locked(starfish_ctx *ctx,
+                                               const char *reason) {
+  if (ctx->pending_segment_state != segment_state::READY)
+    return;
+  const int64_t ready_pts = ctx->pending_segment_pts_ns;
+  ctx->pending_segment_state = segment_state::NONE;
+  ctx->pending_segment_pts_ns = INT64_MIN;
+  ctx->pending_segment_deadline =
+      std::chrono::steady_clock::time_point::min();
+  queue_ready_frame_locked(ctx, ready_pts, reason);
 }
 
 static bool delayed_play_ready_locked(starfish_ctx *ctx) {
@@ -913,9 +914,8 @@ static bool maybe_start_delayed_play_locked(starfish_ctx *ctx,
   const int64_t target_ns = ctx->play_after_preroll_target_ns;
   ctx->play_after_preroll_pending = false;
   ctx->play_after_preroll_target_ns = INT64_MIN;
-  if (ctx->pending_segment_ready_frame &&
-      ctx->pending_segment_ready_await_play) {
-    ctx->pending_segment_ready_watchdog =
+  if (pending_segment_active_locked(ctx)) {
+    ctx->pending_segment_deadline =
         std::chrono::steady_clock::now() + SEGMENT_READY_PLAY_WATCHDOG;
   }
   pipeline_state prev = ctx->state;
@@ -929,7 +929,7 @@ static bool maybe_start_delayed_play_locked(starfish_ctx *ctx,
   if (!ok) {
     mp_warn(ctx->log, "Starfish delayed Play failed target=%.3f\n",
             (double)target_ns / 1e9);
-    ctx->pending_segment_ready_watchdog =
+    ctx->pending_segment_deadline =
         std::chrono::steady_clock::time_point::min();
     if (!ctx->stop && !ctx->flush_requested)
       ctx->state = prev;
@@ -989,33 +989,25 @@ static bool bufferlow_stalled_locked(starfish_ctx *ctx, int64_t now) {
 
 static bool maybe_force_pending_segment_ready_locked(
     starfish_ctx *ctx, std::unique_lock<std::mutex> &lk) {
-  if (!ctx->pending_segment_ready_frame ||
-      !ctx->pending_segment_ready_await_play ||
-      ctx->pending_segment_ready_watchdog ==
+  if (!pending_segment_active_locked(ctx) ||
+      ctx->pending_segment_deadline ==
           std::chrono::steady_clock::time_point::min() ||
-      std::chrono::steady_clock::now() < ctx->pending_segment_ready_watchdog)
+      std::chrono::steady_clock::now() < ctx->pending_segment_deadline)
     return false;
 
-  int64_t ready = ctx->pending_segment_ready_pts_ns;
+  int64_t ready = ctx->pending_segment_pts_ns;
   // The SDK clock can remain pinned to the pre-seek segment until the new
   // segment produces a frame. The watchdog is the recovery path for that exact
   // no-frame state, so only trust our own fresh sampled clock here.
   if (!pending_ready_matches_clock_locked(ctx, lk, &ready, "watchdog", false) ||
-      !ctx->pending_segment_ready_frame ||
-      ctx->pending_segment_ready_pts_ns != ready)
+      !pending_segment_active_locked(ctx) || ctx->pending_segment_pts_ns != ready)
     return false;
 
   mp_warn(ctx->log,
           "Starfish PLAYING watchdog tripped, force-queue ready pts=%.3f\n",
           (double)ready / 1e9);
-  ctx->pending_segment_ready_frame = false;
-  ctx->pending_segment_ready_pts_ns = INT64_MIN;
-  ctx->pending_segment_ready_have_pts = false;
-  ctx->pending_segment_ready_saw_play = false;
-  ctx->pending_segment_ready_await_play = false;
-  ctx->pending_segment_ready_watchdog =
-      std::chrono::steady_clock::time_point::min();
-  queue_ready_frame_locked(ctx, ready, "watchdog");
+  ctx->pending_segment_state = segment_state::READY;
+  queue_pending_segment_ready_locked(ctx, "watchdog");
   lk.unlock();
   wake_stream(ctx, STARFISH_STREAM_VIDEO);
   lk.lock();
@@ -1080,12 +1072,9 @@ static feed_result try_drain(starfish_ctx *ctx,
       prime_audio = true;
     }
     if (stream == STARFISH_STREAM_VIDEO) {
-      ctx->pending_segment_ready_frame = true;
-      ctx->pending_segment_ready_pts_ns = segment_pts_ns;
-      ctx->pending_segment_ready_have_pts = false;
-      ctx->pending_segment_ready_saw_play = false;
-      ctx->pending_segment_ready_await_play = true;
-      ctx->pending_segment_ready_watchdog =
+      ctx->pending_segment_state = segment_state::AWAIT_FRAME;
+      ctx->pending_segment_pts_ns = segment_pts_ns;
+      ctx->pending_segment_deadline =
           std::chrono::steady_clock::time_point::min();
       ctx->first_segment_after_load = false;
     }
@@ -1140,7 +1129,7 @@ static feed_result try_drain(starfish_ctx *ctx,
   ctx->last_feed_media_pts_ns = packet.pts_ns;
   ctx->last_feed_sdk_pts_ns = bp.pts_ns;
 
-  if (ctx->stop || ctx->flush_requested)
+  if (ctx->stop || ctx->unload_requested || ctx->flush_requested)
     return feed_result::BLOCKED;
 
   if (r == SF_BACKEND_FEED_BUFFER_FULL || r == SF_BACKEND_FEED_RETRY) {
@@ -1178,7 +1167,6 @@ static feed_result try_drain(starfish_ctx *ctx,
     // B-frame packet PTS can move backwards in decode order.
     ctx->fed_video_pts_ns = std::max(ctx->fed_video_pts_ns, packet.pts_ns);
     maybe_start_delayed_play_locked(ctx, lk);
-    maybe_release_pending_segment_frame_locked(ctx, packet.pts_ns);
   } else if (stream == STARFISH_STREAM_AUDIO && feed_ok) {
     ctx->fed_audio_pts_ns = packet.pts_ns;
   }
@@ -1439,7 +1427,7 @@ static bool pending_ready_matches_clock_locked(
             reason ? reason : "event", (double)*ready_ns / 1e9,
             (double)clock_ns / 1e9,
             (double)delta_ns / 1e9);
-    ctx->pending_segment_ready_watchdog =
+    ctx->pending_segment_deadline =
         std::chrono::steady_clock::now() + BUFFERFULL_BACKOFF;
     return false;
   }
@@ -1452,7 +1440,7 @@ static bool pending_ready_matches_clock_locked(
             reason ? reason : "event", (double)*ready_ns / 1e9,
             (double)clock_ns / 1e9);
     *ready_ns = clock_ns;
-    ctx->pending_segment_ready_pts_ns = clock_ns;
+    ctx->pending_segment_pts_ns = clock_ns;
   }
   return true;
 }
@@ -1485,15 +1473,50 @@ static void apply_flush_locked(starfish_ctx *ctx,
   lk.lock();
 }
 
+static void apply_unload_locked(starfish_ctx *ctx,
+                                std::unique_lock<std::mutex> &lk) {
+  const bool call_unload =
+      ctx->backend &&
+      (is_loaded_state(ctx->state) || ctx->state == pipeline_state::LOADING ||
+       ctx->state == pipeline_state::FAILED ||
+       ctx->state == pipeline_state::UNLOADING);
+
+  ctx->unload_requested = false;
+  ctx->flush_requested = false;
+  ctx->eos_pending = false;
+  ctx->eos_pushed = false;
+  ctx->ended = false;
+  clear_queues_locked(ctx);
+  ctx->state = call_unload ? pipeline_state::UNLOADING
+                           : pipeline_state::IDLE;
+
+  if (call_unload) {
+    lk.unlock();
+    const bool ok = sf_backend_unload(ctx->backend);
+    lk.lock();
+    if (!ok && ctx->state == pipeline_state::UNLOADING) {
+      mp_warn(ctx->log, "Starfish unload call failed, forcing IDLE\n");
+      ctx->state = pipeline_state::IDLE;
+    }
+  }
+
+  ctx->cv.notify_all();
+}
+
 static bool should_wake_synthetic_video_locked(starfish_ctx *ctx) {
   return ctx->state == pipeline_state::PLAYING && ctx->started &&
-         !ctx->need_segment && !ctx->pending_segment_ready_frame;
+         !ctx->need_segment && !pending_segment_active_locked(ctx);
 }
 
 static void worker_loop(starfish_ctx *ctx) {
   std::unique_lock<std::mutex> lk(ctx->lock);
 
   while (!ctx->stop) {
+    if (ctx->unload_requested) {
+      apply_unload_locked(ctx, lk);
+      continue;
+    }
+
     if (ctx->flush_requested) {
       apply_flush_locked(ctx, lk);
       continue;
@@ -1521,7 +1544,7 @@ static void worker_loop(starfish_ctx *ctx) {
       }
       ctx->cv.wait_for(lk, std::chrono::milliseconds(FAILURE_WAKE_PERIOD_NS /
                                                      (1000 * 1000)), [&] {
-        return ctx->stop || ctx->flush_requested ||
+        return ctx->stop || ctx->unload_requested || ctx->flush_requested ||
                ctx->state != pipeline_state::FAILED;
       });
       continue;
@@ -1579,10 +1602,10 @@ static void worker_loop(starfish_ctx *ctx) {
         const bool have_audio = !ctx->audio_queue.empty();
         const bool segment_audio_preroll =
             ctx->need_audio && have_audio &&
-            ctx->pending_segment_ready_frame &&
-            ctx->pending_segment_ready_pts_ns != INT64_MIN &&
+            pending_segment_active_locked(ctx) &&
+            ctx->pending_segment_pts_ns != INT64_MIN &&
             ctx->audio_queue.front().pts_ns <=
-                ctx->pending_segment_ready_pts_ns + MAX_FEED_AHEAD_NS;
+                ctx->pending_segment_pts_ns + MAX_FEED_AHEAD_NS;
         const bool prefer_audio =
             !ctx->need_segment && have_audio &&
             (segment_audio_preroll ||
@@ -1669,7 +1692,8 @@ static void worker_loop(starfish_ctx *ctx) {
 
     auto wait = std::chrono::steady_clock::duration(WORKER_IDLE_WAIT);
     ctx->cv.wait_for(lk, wait, [&] {
-      return ctx->stop || ctx->flush_requested || can_load(ctx) ||
+      return ctx->stop || ctx->unload_requested || ctx->flush_requested ||
+             can_load(ctx) ||
              (is_loaded_state(ctx->state) &&
               ((should_feed_packets_locked(ctx) &&
                 (!ctx->video_queue.empty() || !ctx->audio_queue.empty())) ||
@@ -1698,10 +1722,15 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
   bool wake_audio = false;
   const int64_t event_host_ns = mp_time_ns();
 
+  if (ctx->state == pipeline_state::UNLOADING &&
+      type != SF_EVENT_UNLOAD_COMPLETED)
+    return;
+
   switch (type) {
   case SF_EVENT_FRAME_READY: {
     int64_t pts_ns = num_value;
-    if (ctx->flush_requested || ctx->need_segment ||
+    if (ctx->flush_requested || ctx->unload_requested ||
+        ctx->state == pipeline_state::UNLOADING || ctx->need_segment ||
         ctx->state == pipeline_state::IDLE ||
         ctx->state == pipeline_state::FAILED)
       break;
@@ -1719,26 +1748,13 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
       break;
     }
     note_bufferlow_progress_locked(ctx, pts_ns, event_host_ns);
-    if (ctx->pending_segment_ready_frame &&
-        ctx->pending_segment_ready_await_play) {
-      ctx->pending_segment_ready_pts_ns = pts_ns;
-      ctx->pending_segment_ready_have_pts = true;
-      if (!ctx->pending_segment_ready_saw_play) {
-        mp_info(ctx->log,
-                "Starfish deferred ready frame until PLAYING pts=%.3f\n",
-                (double)pts_ns / 1e9);
-        break;
-      }
-
-      ctx->pending_segment_ready_frame = false;
-      ctx->pending_segment_ready_pts_ns = INT64_MIN;
-      ctx->pending_segment_ready_have_pts = false;
-      ctx->pending_segment_ready_saw_play = false;
-      ctx->pending_segment_ready_await_play = false;
-      ctx->pending_segment_ready_watchdog =
-          std::chrono::steady_clock::time_point::min();
-      queue_ready_frame_locked(ctx, pts_ns, "deferred FRAMEREADY");
-      wake_video = true;
+    if (ctx->pending_segment_state == segment_state::AWAIT_FRAME ||
+        ctx->pending_segment_state == segment_state::AWAIT_PLAY) {
+      ctx->pending_segment_pts_ns = pts_ns;
+      ctx->pending_segment_state = segment_state::AWAIT_PLAY;
+      mp_info(ctx->log,
+              "Starfish deferred ready frame until PLAYING pts=%.3f\n",
+              (double)pts_ns / 1e9);
       break;
     }
     queue_ready_frame_locked(ctx, pts_ns, nullptr);
@@ -1768,47 +1784,29 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
   case SF_EVENT_PLAYING:
     mp_info(ctx->log, "Starfish StateUpdate: PLAYING\n");
     ctx->state = pipeline_state::PLAYING;
-    if (ctx->pending_segment_ready_frame &&
-        ctx->pending_segment_ready_await_play)
-      ctx->pending_segment_ready_saw_play = true;
-    if (ctx->pending_segment_ready_frame &&
-        ctx->pending_segment_ready_await_play &&
-        ctx->pending_segment_ready_have_pts) {
-      int64_t ready = ctx->pending_segment_ready_pts_ns;
+    if (ctx->pending_segment_state == segment_state::AWAIT_PLAY) {
+      int64_t ready = ctx->pending_segment_pts_ns;
       if (!pending_ready_matches_clock_locked(ctx, lk, &ready, "PLAYING",
                                               false) ||
-          !ctx->pending_segment_ready_frame ||
-          ctx->pending_segment_ready_pts_ns != ready)
+          ctx->pending_segment_state != segment_state::AWAIT_PLAY ||
+          ctx->pending_segment_pts_ns != ready)
         break;
 
-      ctx->pending_segment_ready_frame = false;
-      ctx->pending_segment_ready_pts_ns = INT64_MIN;
-      ctx->pending_segment_ready_have_pts = false;
-      ctx->pending_segment_ready_saw_play = false;
-      ctx->pending_segment_ready_await_play = false;
-      ctx->pending_segment_ready_watchdog =
-          std::chrono::steady_clock::time_point::min();
-      queue_ready_frame_locked(ctx, ready, "PLAYING state update");
-    } else if (ctx->pending_segment_ready_frame &&
-               ctx->pending_segment_ready_await_play) {
-      int64_t ready = ctx->pending_segment_ready_pts_ns;
+      ctx->pending_segment_state = segment_state::READY;
+      queue_pending_segment_ready_locked(ctx, "PLAYING state update");
+    } else if (ctx->pending_segment_state == segment_state::AWAIT_FRAME) {
+      int64_t ready = ctx->pending_segment_pts_ns;
       if (!pending_ready_matches_clock_locked(ctx, lk, &ready, "PLAYING",
                                               false) ||
-          !ctx->pending_segment_ready_frame ||
-          ctx->pending_segment_ready_pts_ns != ready)
+          ctx->pending_segment_state != segment_state::AWAIT_FRAME ||
+          ctx->pending_segment_pts_ns != ready)
         break;
 
       mp_info(ctx->log,
               "Starfish PLAYING without FRAMEREADY; using pts=%.3f\n",
               (double)ready / 1e9);
-      ctx->pending_segment_ready_frame = false;
-      ctx->pending_segment_ready_pts_ns = INT64_MIN;
-      ctx->pending_segment_ready_have_pts = false;
-      ctx->pending_segment_ready_saw_play = false;
-      ctx->pending_segment_ready_await_play = false;
-      ctx->pending_segment_ready_watchdog =
-          std::chrono::steady_clock::time_point::min();
-      queue_ready_frame_locked(ctx, ready, "PLAYING packet fallback");
+      ctx->pending_segment_state = segment_state::READY;
+      queue_pending_segment_ready_locked(ctx, "PLAYING packet fallback");
     }
     if (ctx->acb) {
       sf_backend_acb *acb = ctx->acb;
@@ -1969,6 +1967,8 @@ void starfish_ctx_unref(struct starfish_ctx *ctx) {
   if (ctx->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
     return;
 
+  starfish_ctx_unload(ctx);
+
   {
     std::lock_guard<std::mutex> lk(ctx->lock);
     ctx->stop = true;
@@ -1996,26 +1996,25 @@ bool starfish_ctx_unload(struct starfish_ctx *ctx) {
     return true;
   {
     std::unique_lock<std::mutex> lk(ctx->lock);
-    ctx->flush_requested = false;
-    ctx->eos_pending = false;
-    clear_queues_locked(ctx);
-    if (is_loaded_state(ctx->state) || ctx->state == pipeline_state::LOADING ||
-        ctx->state == pipeline_state::FAILED) {
-      lk.unlock();
-      if (ctx->backend)
-        sf_backend_unload(ctx->backend);
-      lk.lock();
+    if (ctx->state != pipeline_state::IDLE || ctx->unload_requested) {
+      if (ctx->state != pipeline_state::UNLOADING)
+        ctx->unload_requested = true;
+      ctx->cv.notify_all();
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds(2);
-      while (ctx->state != pipeline_state::IDLE && !ctx->stop) {
+      while ((ctx->state != pipeline_state::IDLE || ctx->unload_requested) &&
+             !ctx->stop) {
         if (ctx->cv.wait_until(lk, deadline) == std::cv_status::timeout)
           break;
       }
-      if (ctx->state != pipeline_state::IDLE) {
+      if (ctx->state != pipeline_state::IDLE || ctx->unload_requested) {
         mp_warn(ctx->log,
                 "Starfish unload: UNLOADCOMPLETED timeout, forcing IDLE\n");
+        ctx->unload_requested = false;
         ctx->state = pipeline_state::IDLE;
       }
+    } else {
+      clear_queues_locked(ctx);
     }
     ctx->video_codec.clear();
     ctx->ended = false;
