@@ -54,9 +54,9 @@ struct starfish_audio_status {
 
 typedef void (*starfish_wakeup_cb)(void *opaque);
 typedef bool (*starfish_audio_prime_cb)(void *opaque, int64_t pts_ns);
-typedef uint8_t *(*starfish_overlay_acquire_cb)(void *opaque, int width,
-                                                int height, int *stride,
-                                                void **buffer);
+typedef uint8_t *(*starfish_overlay_acquire_cb)(void *opaque, int x, int y,
+                                                int width, int height,
+                                                int *stride, void **buffer);
 typedef void (*starfish_overlay_present_cb)(void *opaque, void *buffer,
                                             bool visible);
 typedef void (*starfish_exported_crop_cb)(void *opaque, int orig_w, int orig_h,

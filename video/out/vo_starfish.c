@@ -16,6 +16,7 @@
 #include "osdep/endian.h"
 #include "present_sync.h"
 #include "sub/draw_bmp.h"
+#include "sub/img_convert.h"
 #include "sub/osd.h"
 #include "video/hwdec.h"
 #include "video/mp_image.h"
@@ -427,6 +428,45 @@ static double get_osd_pts(struct vo *vo)
     return pts;
 }
 
+static bool crop_osd_list(struct sub_bitmap_list *osd, int width, int height,
+                          int *x, int *y)
+{
+    struct mp_rect bounds = {width, height, 0, 0};
+    bool have_bounds = false;
+
+    for (int n = 0; n < osd->num_items; n++) {
+        struct mp_rect item;
+        if (!mp_sub_bitmaps_bb(osd->items[n], &item))
+            continue;
+        bounds.x0 = MPMIN(bounds.x0, item.x0);
+        bounds.y0 = MPMIN(bounds.y0, item.y0);
+        bounds.x1 = MPMAX(bounds.x1, item.x1);
+        bounds.y1 = MPMAX(bounds.y1, item.y1);
+        have_bounds = true;
+    }
+
+    bounds.x0 = MPCLAMP(bounds.x0, 0, width);
+    bounds.y0 = MPCLAMP(bounds.y0, 0, height);
+    bounds.x1 = MPCLAMP(bounds.x1, bounds.x0, width);
+    bounds.y1 = MPCLAMP(bounds.y1, bounds.y0, height);
+    if (!have_bounds || bounds.x0 >= bounds.x1 || bounds.y0 >= bounds.y1)
+        return false;
+
+    for (int n = 0; n < osd->num_items; n++) {
+        struct sub_bitmaps *item = osd->items[n];
+        for (int i = 0; i < item->num_parts; i++) {
+            item->parts[i].x -= bounds.x0;
+            item->parts[i].y -= bounds.y0;
+        }
+    }
+
+    *x = bounds.x0;
+    *y = bounds.y0;
+    osd->w = bounds.x1 - bounds.x0;
+    osd->h = bounds.y1 - bounds.y0;
+    return true;
+}
+
 static void render_osd_surface(struct vo *vo, double pts)
 {
     struct priv *p = vo->priv;
@@ -455,7 +495,12 @@ static void render_osd_surface(struct vo *vo, double pts)
     if ((!wl || !wl->shm || !wl->osd_surface) && acquire_cb && cb) {
         struct sub_bitmap_list *osd =
             osd_render(vo->osd, p->osd, pts, 0, mp_draw_sub_formats);
-        const bool has_pixels = osd->num_items > 0;
+        int overlay_x = 0;
+        int overlay_y = 0;
+        const bool has_pixels =
+            osd->num_items > 0 &&
+            crop_osd_list(osd, vo->dwidth, vo->dheight,
+                          &overlay_x, &overlay_y);
         const bool unchanged =
             p->callback_osd_state_valid &&
             p->callback_osd_change_id == osd->change_id &&
@@ -479,16 +524,16 @@ static void render_osd_surface(struct vo *vo, double pts)
 
         int stride = 0;
         void *buffer = NULL;
-        uint8_t *pixels = acquire_cb(cb_opaque, vo->dwidth, vo->dheight,
-                                     &stride, &buffer);
-        if (!pixels || !buffer || stride < vo->dwidth * 4) {
+        uint8_t *pixels = acquire_cb(cb_opaque, overlay_x, overlay_y,
+                                     osd->w, osd->h, &stride, &buffer);
+        if (!pixels || !buffer || stride < osd->w * 4) {
             talloc_free(osd);
             return;
         }
 
         struct mp_image mpi = {0};
         mp_image_setfmt(&mpi, IMGFMT_BGRA);
-        mp_image_set_size(&mpi, vo->dwidth, vo->dheight);
+        mp_image_set_size(&mpi, osd->w, osd->h);
         mpi.params.repr.alpha = PL_ALPHA_PREMULTIPLIED;
         mpi.planes[0] = pixels;
         mpi.stride[0] = stride;
