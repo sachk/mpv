@@ -2285,7 +2285,7 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data,
     return STARFISH_FEED_ERROR;
   if (!have_load_config(ctx))
     return STARFISH_FEED_ERROR;
-  if (ctx->flush_requested)
+  if (ctx->flush_requested || ctx->state == pipeline_state::UNLOADING)
     return STARFISH_FEED_AGAIN;
   if (ctx->video_queue_bytes + size > VIDEO_QUEUE_LIMIT)
     return STARFISH_FEED_AGAIN;
@@ -2294,7 +2294,9 @@ int starfish_ctx_feed_video(struct starfish_ctx *ctx, const void *data,
   int64_t anchor_ns = project_fresh_clock_locked(ctx, mp_time_ns());
   if (anchor_ns == INT64_MIN)
     anchor_ns = ctx->current_pts_ns;
-  if (anchor_ns != INT64_MIN &&
+  const bool starts_segment = ctx->state == pipeline_state::IDLE ||
+                              ctx->need_segment || ctx->pending_seek_target;
+  if (!starts_segment && anchor_ns != INT64_MIN &&
       pts_ns - anchor_ns > MAX_DECODER_ACCEPT_AHEAD_NS) {
     const int64_t now = mp_time_ns();
     if (!ctx->last_decoder_backpressure_log_ns ||
