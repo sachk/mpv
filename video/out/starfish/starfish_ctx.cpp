@@ -1503,6 +1503,17 @@ static void apply_unload_locked(starfish_ctx *ctx,
   ctx->state = call_unload ? pipeline_state::UNLOADING
                            : pipeline_state::IDLE;
 
+  // Release the system playback reservation before waiting for Starfish's
+  // asynchronous unload completion. If Unload fails, its callback is lost, or
+  // the process exits during teardown, ACB must not remain PLAYING/PAUSED and
+  // block another webOS media client.
+  if (ctx->acb) {
+    sf_backend_acb *acb = ctx->acb;
+    lk.unlock();
+    sf_backend_acb_set_play_state(acb, SF_ACB_UNLOADED);
+    lk.lock();
+  }
+
   if (call_unload) {
     lk.unlock();
     const bool ok = sf_backend_unload(ctx->backend);

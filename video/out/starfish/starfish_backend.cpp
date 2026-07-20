@@ -488,8 +488,14 @@ void sf_backend_acb_destroy(struct sf_backend_acb *acb)
 {
     if (!acb)
         return;
-    if (acb->initialized)
+    if (acb->initialized) {
+        // Defensive final release: callers normally mark ACB unloaded before
+        // Starfish's asynchronous Unload, but finalization must never leave a
+        // stale system playback reservation behind.
+        sf_backend_acb_set_play_state(acb, SF_ACB_UNLOADED);
         AcbAPI_finalize(acb->acb_id);
+        acb->initialized = false;
+    }
     if (acb->acb_id)
         AcbAPI_destroy(acb->acb_id);
     delete acb;
