@@ -155,6 +155,9 @@ STARFISH_CTX_API int starfish_ctx_get_video_width(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_video_height(struct starfish_ctx *ctx);
 STARFISH_CTX_API double starfish_ctx_get_video_fps(struct starfish_ctx *ctx);
 STARFISH_CTX_API int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx);
+// Return and clear the number of dropped-frame events reported by Starfish.
+STARFISH_CTX_API int64_t
+starfish_ctx_take_dropped_frames(struct starfish_ctx *ctx);
 
 // Stable presentation PTS for subtitle/OSD rendering. Returns false while the
 // Starfish clock is not trustworthy enough to choose a subtitle event.

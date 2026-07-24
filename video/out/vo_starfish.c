@@ -725,9 +725,18 @@ static void flip_page(struct vo *vo)
         present_sync_swap(vo->wl->present);
 }
 
+static void report_dropped_frames(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    int64_t dropped = starfish_ctx_take_dropped_frames(p->ctx);
+    if (dropped > 0)
+        vo_increment_drop_count(vo, dropped);
+}
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+    report_dropped_frames(vo);
 
     if (!p->logged_draw_frame) {
         MP_INFO(vo, "Starfish draw_frame: current=%d redraw=%d repeat=%d dsize=%dx%d\n",
@@ -747,6 +756,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
 static void redraw_osd(struct vo *vo)
 {
+    report_dropped_frames(vo);
     apply_video_geometry(vo, "redraw");
     map_video_surface(vo);
     render_osd_surface(vo, get_osd_pts(vo));
@@ -824,6 +834,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
 
 static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
 {
+    report_dropped_frames(vo);
     struct vo_wayland_state *wl = vo->wl;
     if (wl && wl->use_present)
         present_sync_get_info(wl->present, info);

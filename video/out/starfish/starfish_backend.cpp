@@ -158,6 +158,8 @@ sf_backend_event_type map_event(int32_t type)
         return SF_EVENT_VIDEO_INFO;
     case PF_EVENT_TYPE_STR_AUDIO_INFO:
         return SF_EVENT_AUDIO_INFO;
+    case PF_EVENT_TYPE_DROPPED_FRAME:
+        return SF_EVENT_DROPPED_FRAME;
     case PF_EVENT_TYPE_STR_ERROR:
     case PF_EVENT_TYPE_INT_ERROR:
         return SF_EVENT_ERROR;

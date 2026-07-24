@@ -59,6 +59,7 @@ constexpr size_t AUDIO_QUEUE_LIMIT = 2 * 1024 * 1024;
 constexpr int64_t MAX_DECODER_ACCEPT_AHEAD_NS = 1600LL * 1000 * 1000;
 constexpr int64_t MAX_FEED_AHEAD_NS = 1600LL * 1000 * 1000;
 constexpr int64_t PCM_DECODE_PREROLL_NS = 0;
+constexpr int64_t AUDIO_PLAY_PREROLL_NS = 40LL * 1000 * 1000;
 constexpr int64_t STALE_READY_TOLERANCE_NS = 1000LL * 1000;
 constexpr int64_t READY_CEILING_SLACK_NS = 5LL * 1000 * 1000 * 1000;
 constexpr int64_t CLOCK_SAMPLE_PERIOD_NS = 20LL * 1000 * 1000;
@@ -274,6 +275,7 @@ struct starfish_ctx {
   int64_t bufferlow_start_ns = 0;
   int64_t bufferlow_last_progress_pts_ns = INT64_MIN;
   int64_t bufferlow_last_progress_host_ns = 0;
+  int64_t dropped_frames = 0;
 
   /* packet queues */
   std::deque<queued_packet> video_queue;
@@ -876,6 +878,11 @@ static bool delayed_play_ready_locked(starfish_ctx *ctx) {
     frame_ns = (int64_t)llround(1e9 / ctx->fps);
   if (ctx->fed_video_pts_ns + frame_ns < ctx->play_after_preroll_target_ns)
     return false;
+  if (ctx->need_audio &&
+      (ctx->fed_audio_pts_ns == INT64_MIN ||
+       ctx->fed_audio_pts_ns <
+           ctx->play_after_preroll_target_ns + AUDIO_PLAY_PREROLL_NS))
+    return false;
 
   return true;
 }
@@ -909,6 +916,8 @@ static bool maybe_start_delayed_play_locked(starfish_ctx *ctx,
         std::chrono::steady_clock::time_point::min();
     if (!ctx->stop && !ctx->flush_requested)
       ctx->state = prev;
+    ctx->play_after_preroll_pending = true;
+    ctx->play_after_preroll_target_ns = target_ns;
   } else {
     mp_info(ctx->log, "Starfish Play after preroll target=%.3f fed=%.3f\n",
             (double)target_ns / 1e9, (double)ctx->fed_video_pts_ns / 1e9);
@@ -1933,6 +1942,12 @@ static void backend_event_cb(void *opaque, enum sf_backend_event_type type,
     wake_video = true;
     wake_audio = true;
     break;
+  case SF_EVENT_DROPPED_FRAME:
+    ++ctx->dropped_frames;
+    mp_verbose(ctx->log, "Starfish Event: DROPPED_FRAME value=%" PRId64 "\n",
+               num_value);
+    wake_video = true;
+    break;
   case SF_EVENT_ERROR:
     mp_err(ctx->log, "Starfish error num=%" PRId64 " str=%s\n", num_value,
            str_value ? str_value : "");
@@ -2420,7 +2435,16 @@ bool starfish_ctx_resume(struct starfish_ctx *ctx) {
     if (ctx->started && ctx->current_pts_ns != INT64_MIN) {
       ctx->video_clock_base_pts_ns = ctx->current_pts_ns;
       ctx->video_clock_base_host_ns = mp_time_ns();
+      if (ctx->state == pipeline_state::PAUSED) {
+        ctx->play_after_preroll_pending = true;
+        ctx->play_after_preroll_target_ns = ctx->current_pts_ns;
+      }
     }
+    ctx->clock_sample_valid = false;
+    ctx->clock_export_ready = false;
+    ctx->clock_stability_probe_pts_ns = INT64_MIN;
+    ctx->clock_stability_probe_host_ns = 0;
+    ctx->last_clock_attempt_ns = 0;
     ctx->play_requested = true;
   }
   ctx->cv.notify_all();
@@ -2432,13 +2456,22 @@ bool starfish_ctx_pause(struct starfish_ctx *ctx) {
     return false;
   {
     std::lock_guard<std::mutex> lk(ctx->lock);
-    if (ctx->video_clock_base_pts_ns != INT64_MIN &&
-        ctx->video_clock_base_host_ns > 0) {
-      ctx->current_pts_ns = ctx->video_clock_base_pts_ns +
-                            (mp_time_ns() - ctx->video_clock_base_host_ns);
+    const int64_t now = mp_time_ns();
+    const int64_t projected = project_fresh_clock_locked(ctx, now);
+    if (projected != INT64_MIN) {
+      ctx->current_pts_ns = projected;
+    } else if (ctx->video_clock_base_pts_ns != INT64_MIN &&
+               ctx->video_clock_base_host_ns > 0) {
+      ctx->current_pts_ns =
+          ctx->video_clock_base_pts_ns + (now - ctx->video_clock_base_host_ns);
     }
     ctx->video_clock_base_pts_ns = INT64_MIN;
     ctx->video_clock_base_host_ns = 0;
+    ctx->clock_sample_valid = false;
+    ctx->clock_export_ready = false;
+    ctx->clock_stability_probe_pts_ns = INT64_MIN;
+    ctx->clock_stability_probe_host_ns = 0;
+    ctx->last_clock_attempt_ns = 0;
     ctx->play_requested = false;
   }
   ctx->cv.notify_all();
@@ -2563,6 +2596,15 @@ int starfish_ctx_get_dovi_profile(struct starfish_ctx *ctx) {
   return ctx->dv_profile;
 }
 
+int64_t starfish_ctx_take_dropped_frames(struct starfish_ctx *ctx) {
+  if (!ctx)
+    return 0;
+  std::lock_guard<std::mutex> lk(ctx->lock);
+  const int64_t dropped = ctx->dropped_frames;
+  ctx->dropped_frames = 0;
+  return dropped;
+}
+
 bool starfish_ctx_get_video_clock(struct starfish_ctx *ctx, double *pts,
                                   int64_t *host_time_ns) {
   if (!ctx || !pts || !host_time_ns)
@@ -2594,12 +2636,15 @@ bool starfish_ctx_get_audio_status(struct starfish_ctx *ctx,
   *status = {};
   status->playing = ctx->state == pipeline_state::PLAYING && ctx->started;
   status->fed = ctx->fed_audio_pts_ns != INT64_MIN;
-  const int64_t projected = status->playing
-                                ? project_fresh_clock_locked(ctx, mp_time_ns())
-                                : INT64_MIN;
-  if (projected != INT64_MIN) {
+  int64_t clock_pts_ns = INT64_MIN;
+  if (status->playing) {
+    clock_pts_ns = project_fresh_clock_locked(ctx, mp_time_ns());
+  } else if (ctx->state == pipeline_state::PAUSED && ctx->started) {
+    clock_pts_ns = ctx->current_pts_ns;
+  }
+  if (clock_pts_ns != INT64_MIN) {
     status->clock_valid = true;
-    status->clock_pts_ns = projected;
+    status->clock_pts_ns = clock_pts_ns;
   }
   return true;
 }

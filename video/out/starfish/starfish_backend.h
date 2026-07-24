@@ -41,6 +41,7 @@ enum sf_backend_event_type {
     SF_EVENT_BUFFER_FULL,
     SF_EVENT_VIDEO_INFO,              // str_value = JSON payload
     SF_EVENT_AUDIO_INFO,              // str_value = JSON payload
+    SF_EVENT_DROPPED_FRAME,           // one event per frame dropped by Starfish
     SF_EVENT_ERROR,
 };
 
