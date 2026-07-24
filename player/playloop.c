@@ -137,12 +137,19 @@ static void release_starfish_video_for_audio_clock(struct MPContext *mpctx)
 {
     if (!mpctx->starfish_video_held_for_audio)
         return;
+    bool resume_handoff = mpctx->starfish_resume_handoff_active;
     mpctx->starfish_video_held_for_audio = false;
+    mpctx->starfish_resume_handoff_active = false;
     if (!mpctx->video_out)
         return;
-    if (vo_control(mpctx->video_out, VOCTRL_RESUME, NULL) != VO_TRUE)
-        MP_WARN(mpctx, "Starfish video resume while waiting for audio clock failed\n");
-    MP_VERBOSE(mpctx, "Starfish video released for live audio clock\n");
+    if (resume_handoff) {
+        vo_set_paused(mpctx->video_out, false);
+        MP_VERBOSE(mpctx, "coordinated ALSA and Starfish resume committed\n");
+    } else {
+        if (vo_control(mpctx->video_out, VOCTRL_RESUME, NULL) != VO_TRUE)
+            MP_WARN(mpctx, "Starfish video resume while waiting for audio clock failed\n");
+        MP_VERBOSE(mpctx, "Starfish video released for live audio clock\n");
+    }
 }
 
 static int64_t starfish_synthetic_frame_interval_ns(struct MPContext *mpctx)
@@ -220,13 +227,18 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
         mpctx->paused = internal_paused;
         if (!internal_paused)
             prepare_starfish_audio_resume(mpctx);
+        if (internal_paused && mpctx->starfish_resume_handoff_active) {
+            mpctx->starfish_video_held_for_audio = false;
+            mpctx->starfish_resume_handoff_active = false;
+        }
 
         if (mpctx->ao) {
             bool eof = mpctx->audio_status == STATUS_EOF;
             ao_set_paused(mpctx->ao, internal_paused, eof);
         }
 
-        if (mpctx->video_out)
+        if (mpctx->video_out
+            && !mpctx->starfish_resume_handoff_active)
             vo_set_paused(mpctx->video_out, internal_paused);
 
         mpctx->osd_function = 0;
@@ -1337,6 +1349,11 @@ static void handle_playback_restart(struct MPContext *mpctx)
             vo_control(mpctx->video_out, VOCTRL_PAUSE, NULL);
             mpctx->starfish_video_held_for_audio = true;
             MP_VERBOSE(mpctx, "Starfish video held for audio prebuffer\n");
+            if (mpctx->ao_chain) {
+                mpctx->ao_chain->start_pts_known = false;
+                mpctx->ao_chain->start_pts = MP_NOPTS_VALUE;
+                mp_filter_wakeup(mpctx->ao_chain->ao_filter);
+            }
         }
         return;
     }
@@ -1360,9 +1377,17 @@ static void handle_playback_restart(struct MPContext *mpctx)
         MP_DBG(mpctx, "starting video playback\n");
     }
 
-    if (starfish_split_clock(mpctx) && !get_internal_paused(mpctx) &&
-        mpctx->audio_status == STATUS_READY &&
-        mpctx->video_status >= STATUS_PLAYING)
+    bool coordinated_starfish_start = starfish_split_clock(mpctx)
+        && !get_internal_paused(mpctx)
+        && mpctx->starfish_video_held_for_audio
+        && mpctx->audio_status == STATUS_READY
+        && mpctx->video_status >= STATUS_PLAYING
+        && mpctx->ao_chain && mpctx->ao_chain->start_pts_known;
+
+    if (starfish_split_clock(mpctx) && !get_internal_paused(mpctx)
+        && mpctx->audio_status == STATUS_READY
+        && mpctx->video_status >= STATUS_PLAYING
+        && !coordinated_starfish_start)
         release_starfish_video_for_audio_clock(mpctx);
 
     if (mpctx->audio_status == STATUS_READY) {
@@ -1379,6 +1404,10 @@ static void handle_playback_restart(struct MPContext *mpctx)
         if (mpctx->audio_status == STATUS_READY)
             return;
     }
+
+    if (coordinated_starfish_start
+        && mpctx->audio_status >= STATUS_PLAYING)
+        release_starfish_video_for_audio_clock(mpctx);
 
     if (!mpctx->restart_complete) {
         mpctx->hrseek_active = false;

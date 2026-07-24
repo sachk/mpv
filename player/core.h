@@ -364,6 +364,7 @@ typedef struct MPContext {
     double starfish_audio_sync_avd_filtered;
     double starfish_audio_sync_rate_bias;
     bool starfish_video_held_for_audio;
+    bool starfish_resume_handoff_active;
     int64_t starfish_osd_last_redraw_ns;
     int64_t starfish_osd_last_log_ns;
     // Timing error (in seconds) due to rounding on vsync boundaries
