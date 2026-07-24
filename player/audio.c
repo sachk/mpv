@@ -266,6 +266,7 @@ void reset_audio_state(struct MPContext *mpctx)
     mpctx->starfish_audio_sync_last_realign_ns = 0;
     mpctx->starfish_audio_clock_wait_logged = false;
     mpctx->starfish_audio_sync_resync_pending = false;
+    mpctx->starfish_audio_start_realign_done = false;
     reset_starfish_audio_sync(mpctx);
 }
 
@@ -828,8 +829,23 @@ void mark_starfish_audio_sync_seek(struct MPContext *mpctx)
         mpctx->starfish_audio_sync_resync_pending = true;
         mpctx->starfish_audio_sync_last_realign_ns = 0;
         mpctx->starfish_audio_clock_wait_logged = false;
+        mpctx->starfish_audio_start_realign_done = false;
         reset_starfish_audio_sync(mpctx);
     }
+}
+
+void prepare_starfish_audio_resume(struct MPContext *mpctx)
+{
+    struct ao_chain *ao_c = mpctx->ao_chain;
+    if (!starfish_split_clock(mpctx) || !ao_c || !ao_c->ao || mpctx->audio_status != STATUS_PLAYING
+        || ao_is_playing(ao_c->ao))
+        return;
+
+    MP_VERBOSE(mpctx, "resyncing drained ALSA output before Starfish resume\n");
+    ao_reset(ao_c->ao);
+    reset_audio_state(mpctx);
+    mp_filter_wakeup(ao_c->ao_filter);
+    mp_wakeup_core(mpctx);
 }
 
 static void sync_alsa_to_starfish_clock(struct MPContext *mpctx)
@@ -1032,6 +1048,7 @@ static void realign_starfish_audio_start(struct MPContext *mpctx, double pts)
     mpctx->starfish_audio_sync_hard_since_ns = 0;
     mpctx->starfish_audio_sync_hard_direction = 0;
     mpctx->starfish_audio_sync_avd_filtered = 0;
+    mpctx->starfish_audio_start_realign_done = true;
     if (!mpctx->display_sync_active && mpctx->speed_factor_a != 1.0) {
         mpctx->speed_factor_a = 1.0;
         update_playback_speed(mpctx);
@@ -1073,7 +1090,8 @@ void audio_start_ao(struct MPContext *mpctx)
             desired_pts = pts;
     }
     double apts = playing_audio_pts(mpctx);
-    if (split_clock && desired_pts != MP_NOPTS_VALUE && apts != MP_NOPTS_VALUE && desired_pts > apts
+    if (split_clock && !mpctx->starfish_audio_start_realign_done && desired_pts != MP_NOPTS_VALUE
+        && apts != MP_NOPTS_VALUE && desired_pts > apts
         && desired_pts - apts > STARFISH_AUDIO_START_REALIGN_THRESHOLD) {
         realign_starfish_audio_start(mpctx, desired_pts);
         return;

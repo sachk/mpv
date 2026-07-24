@@ -218,6 +218,8 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
     bool internal_paused = get_internal_paused(mpctx);
     if (internal_paused != mpctx->paused) {
         mpctx->paused = internal_paused;
+        if (!internal_paused)
+            prepare_starfish_audio_resume(mpctx);
 
         if (mpctx->ao) {
             bool eof = mpctx->audio_status == STATUS_EOF;
