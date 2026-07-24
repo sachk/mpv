@@ -133,16 +133,6 @@ static void prime_starfish_seek_target_before_audio_reset(struct MPContext *mpct
 #endif
 }
 
-static void release_starfish_video_for_audio_clock(struct MPContext *mpctx)
-{
-    if (!mpctx->starfish_video_held_for_audio)
-        return;
-    mpctx->starfish_video_held_for_audio = false;
-    if (!mpctx->video_out)
-        return;
-    vo_set_paused(mpctx->video_out, false);
-    MP_VERBOSE(mpctx, "Starfish video released with audio clock\n");
-}
 
 static int64_t starfish_synthetic_frame_interval_ns(struct MPContext *mpctx)
 {
@@ -217,17 +207,15 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
     bool internal_paused = get_internal_paused(mpctx);
     if (internal_paused != mpctx->paused) {
         mpctx->paused = internal_paused;
-        bool coordinated_resume = !internal_paused
-            && prepare_starfish_audio_resume(mpctx);
-        if (internal_paused)
-            mpctx->starfish_video_held_for_audio = false;
+        if (!internal_paused)
+            prepare_starfish_audio_resume(mpctx);
 
         if (mpctx->ao) {
             bool eof = mpctx->audio_status == STATUS_EOF;
             ao_set_paused(mpctx->ao, internal_paused, eof);
         }
 
-        if (mpctx->video_out && !coordinated_resume)
+        if (mpctx->video_out)
             vo_set_paused(mpctx->video_out, internal_paused);
 
         mpctx->osd_function = 0;
@@ -354,13 +342,6 @@ void reset_playback_state(struct MPContext *mpctx)
     mpctx->cache_update_pts = MP_NOPTS_VALUE;
     mpctx->starfish_osd_last_redraw_ns = 0;
     mpctx->starfish_osd_last_log_ns = 0;
-    // The hold sends a raw VOCTRL_PAUSE that bypasses vo_set_paused
-    // bookkeeping, so nothing else will ever resume the pipeline. Clearing
-    // the flag without resuming (as this used to do) wedged playback when a
-    // seek arrived while video was held: the ctx stayed paused, no frame was
-    // ever produced, video never reached READY, and only a manual
-    // pause/unpause toggle recovered.
-    release_starfish_video_for_audio_clock(mpctx);
 
     encode_lavc_discontinuity(mpctx->encode_lavc_ctx);
 
@@ -1330,33 +1311,18 @@ static void handle_playback_restart(struct MPContext *mpctx)
     if (mpctx->audio_status < STATUS_READY ||
         mpctx->video_status < STATUS_READY)
     {
-        if (starfish_split_clock(mpctx) && !get_internal_paused(mpctx) &&
-            mpctx->video_status == STATUS_READY &&
-            mpctx->audio_status < STATUS_PLAYING &&
-            !mpctx->starfish_video_held_for_audio)
-        {
-            vo_set_paused(mpctx->video_out, true);
-            mpctx->starfish_video_held_for_audio = true;
-            MP_VERBOSE(mpctx, "Starfish video held for audio prebuffer\n");
-            if (mpctx->ao_chain) {
-                mpctx->ao_chain->start_pts_known = false;
-                mpctx->ao_chain->start_pts = MP_NOPTS_VALUE;
-                mp_filter_wakeup(mpctx->ao_chain->ao_filter);
-            }
-        }
         return;
     }
 
     handle_update_cache(mpctx);
 
     if (mpctx->audio_status == STATUS_READY &&
-        mpctx->video_status == STATUS_READY && !mpctx->seek.type)
+        mpctx->video_status == STATUS_READY && !mpctx->seek.type &&
+        !starfish_split_clock(mpctx))
     {
-        if (!mpctx->starfish_video_held_for_audio) {
-            audio_start_ao(mpctx);
-            if (mpctx->audio_status == STATUS_READY)
-                return;
-        }
+        audio_start_ao(mpctx);
+        if (mpctx->audio_status == STATUS_READY)
+            return;
     }
 
     if (mpctx->video_status == STATUS_READY) {
@@ -1366,18 +1332,6 @@ static void handle_playback_restart(struct MPContext *mpctx)
         MP_DBG(mpctx, "starting video playback\n");
     }
 
-    bool coordinated_starfish_start = starfish_split_clock(mpctx)
-        && !get_internal_paused(mpctx)
-        && mpctx->starfish_video_held_for_audio
-        && mpctx->audio_status == STATUS_READY
-        && mpctx->video_status >= STATUS_PLAYING
-        && mpctx->ao_chain && mpctx->ao_chain->start_pts_known;
-
-    if (starfish_split_clock(mpctx) && !get_internal_paused(mpctx)
-        && mpctx->audio_status == STATUS_READY
-        && mpctx->video_status >= STATUS_PLAYING
-        && !coordinated_starfish_start)
-        release_starfish_video_for_audio_clock(mpctx);
 
     if (mpctx->audio_status == STATUS_READY) {
         // If a new seek is queued while the current one finishes, don't
@@ -1394,9 +1348,6 @@ static void handle_playback_restart(struct MPContext *mpctx)
             return;
     }
 
-    if (coordinated_starfish_start
-        && mpctx->audio_status >= STATUS_PLAYING)
-        release_starfish_video_for_audio_clock(mpctx);
 
     if (!mpctx->restart_complete) {
         mpctx->hrseek_active = false;
