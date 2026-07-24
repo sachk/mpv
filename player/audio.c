@@ -834,16 +834,15 @@ void mark_starfish_audio_sync_seek(struct MPContext *mpctx)
     }
 }
 
-void prepare_starfish_audio_resume(struct MPContext *mpctx)
+bool prepare_starfish_audio_resume(struct MPContext *mpctx)
 {
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (!starfish_split_clock(mpctx) || !ao_c || !ao_c->ao
         || mpctx->audio_status == STATUS_EOF)
-        return;
+        return false;
 
     MP_VERBOSE(mpctx, "preparing coordinated ALSA and Starfish resume\n");
     mpctx->starfish_video_held_for_audio = true;
-    mpctx->starfish_resume_handoff_active = true;
     ao_reset(ao_c->ao);
     reset_audio_state(mpctx);
     if (mpctx->playback_pts != MP_NOPTS_VALUE) {
@@ -854,6 +853,7 @@ void prepare_starfish_audio_resume(struct MPContext *mpctx)
     }
     mp_filter_wakeup(ao_c->ao_filter);
     mp_wakeup_core(mpctx);
+    return true;
 }
 
 static void sync_alsa_to_starfish_clock(struct MPContext *mpctx)

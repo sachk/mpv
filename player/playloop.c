@@ -137,19 +137,11 @@ static void release_starfish_video_for_audio_clock(struct MPContext *mpctx)
 {
     if (!mpctx->starfish_video_held_for_audio)
         return;
-    bool resume_handoff = mpctx->starfish_resume_handoff_active;
     mpctx->starfish_video_held_for_audio = false;
-    mpctx->starfish_resume_handoff_active = false;
     if (!mpctx->video_out)
         return;
-    if (resume_handoff) {
-        vo_set_paused(mpctx->video_out, false);
-        MP_VERBOSE(mpctx, "coordinated ALSA and Starfish resume committed\n");
-    } else {
-        if (vo_control(mpctx->video_out, VOCTRL_RESUME, NULL) != VO_TRUE)
-            MP_WARN(mpctx, "Starfish video resume while waiting for audio clock failed\n");
-        MP_VERBOSE(mpctx, "Starfish video released for live audio clock\n");
-    }
+    vo_set_paused(mpctx->video_out, false);
+    MP_VERBOSE(mpctx, "Starfish video released with audio clock\n");
 }
 
 static int64_t starfish_synthetic_frame_interval_ns(struct MPContext *mpctx)
@@ -225,20 +217,17 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
     bool internal_paused = get_internal_paused(mpctx);
     if (internal_paused != mpctx->paused) {
         mpctx->paused = internal_paused;
-        if (!internal_paused)
-            prepare_starfish_audio_resume(mpctx);
-        if (internal_paused && mpctx->starfish_resume_handoff_active) {
+        bool coordinated_resume = !internal_paused
+            && prepare_starfish_audio_resume(mpctx);
+        if (internal_paused)
             mpctx->starfish_video_held_for_audio = false;
-            mpctx->starfish_resume_handoff_active = false;
-        }
 
         if (mpctx->ao) {
             bool eof = mpctx->audio_status == STATUS_EOF;
             ao_set_paused(mpctx->ao, internal_paused, eof);
         }
 
-        if (mpctx->video_out
-            && !mpctx->starfish_resume_handoff_active)
+        if (mpctx->video_out && !coordinated_resume)
             vo_set_paused(mpctx->video_out, internal_paused);
 
         mpctx->osd_function = 0;
@@ -1342,11 +1331,11 @@ static void handle_playback_restart(struct MPContext *mpctx)
         mpctx->video_status < STATUS_READY)
     {
         if (starfish_split_clock(mpctx) && !get_internal_paused(mpctx) &&
-            mpctx->video_status >= STATUS_READY &&
+            mpctx->video_status == STATUS_READY &&
             mpctx->audio_status < STATUS_PLAYING &&
             !mpctx->starfish_video_held_for_audio)
         {
-            vo_control(mpctx->video_out, VOCTRL_PAUSE, NULL);
+            vo_set_paused(mpctx->video_out, true);
             mpctx->starfish_video_held_for_audio = true;
             MP_VERBOSE(mpctx, "Starfish video held for audio prebuffer\n");
             if (mpctx->ao_chain) {
