@@ -353,6 +353,15 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         {"sub-lavc-o", OPT_KEYVALUELIST(sub_avopts), .flags = UPDATE_SUB_HARD},
         {"sub-glyph-limit", OPT_INT(sub_glyph_limit)},
         {"sub-bitmap-max-size", OPT_INT(sub_bitmap_max_size)},
+        {"sub-image-color", OPT_COLOR(sub_image_color), .flags = UPDATE_OSD},
+        {"sub-image-outline-color", OPT_COLOR(sub_image_outline_color),
+            .flags = UPDATE_OSD},
+        {"sub-image-color-mode", OPT_CHOICE(sub_image_color_mode,
+            {"replace", 0}, {"retint", 1}), .flags = UPDATE_OSD},
+        {"sub-image-position", OPT_CHOICE(sub_image_position,
+            {"none", 0}, {"bottom-block", 1}, {"all", 2}), .flags = UPDATE_OSD},
+        {"sub-image-ink-threshold", OPT_INT(sub_image_ink_threshold),
+            M_RANGE(0, 255), .flags = UPDATE_OSD},
         {0}
     },
     .size = sizeof(OPT_BASE_STRUCT),
@@ -371,6 +380,10 @@ const struct m_sub_options mp_subtitle_sub_opts = {
         .ass_video_aspect = 0,
         .sub_shaper = 1,
         .use_embedded_fonts = true,
+        // Anchoring image subtitles to their ink box is what makes --sub-pos
+        // mean the same thing for bitmap and text subtitles.
+        .sub_image_position = 1,
+        .sub_image_ink_threshold = 16,
     },
     .change_flags = UPDATE_OSD,
 };

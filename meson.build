@@ -222,6 +222,7 @@ sources = files(
     'sub/packer.c',
     'sub/sd_ass.c',
     'sub/sd_lavc.c',
+    'sub/sub_recolor.c',
 
     ## Video
     'video/csputils.c',

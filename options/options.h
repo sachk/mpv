@@ -134,6 +134,12 @@ struct mp_subtitle_opts {
     int sub_glyph_limit;
     int sub_bitmap_max_size;
     char **sub_avopts;
+    // Image (bitmap) subtitle post-processing. Colors with a==0 are "disabled".
+    struct m_color sub_image_color;
+    struct m_color sub_image_outline_color;
+    int sub_image_color_mode;
+    int sub_image_position;
+    int sub_image_ink_threshold;
 };
 
 // Options for both primary and secondary subs.

@@ -34,6 +34,7 @@
 #include "img_convert.h"
 #include "sd.h"
 #include "dec_sub.h"
+#include "sub_recolor.h"
 
 #define MAX_QUEUE 4
 
@@ -45,6 +46,9 @@ struct sub {
     struct mp_image *data;
     int bound_w, bound_h;
     int src_w, src_h;
+    // Transparent margin kept around each part for the blur; the ink box of a
+    // part is its rectangle shrunk by this on every side.
+    int extend;
     double pts;
     double endpts;
     int64_t id;
@@ -76,7 +80,25 @@ struct sd_lavc_priv {
     bool menu_active;               // in-menu: gates the highlight overlay
     struct mp_dvdnav_highlight hl;  // focused button rect + palette
     uint32_t hli_change_id;
+    // Recoloring happens at decode time, so the queued events have to be
+    // rebuilt when these change; this is the copy they were built with.
+    struct mp_sub_recolor recolor;
+    int *sort_scratch;
+    int *block_scratch;
+    struct mp_rect *blocks_scratch;
 };
+
+static struct mp_sub_recolor recolor_from_opts(struct mp_subtitle_opts *opts)
+{
+    const struct m_color *c = &opts->sub_image_color;
+    const struct m_color *o = &opts->sub_image_outline_color;
+    return (struct mp_sub_recolor){
+        .color = c->a << 24 | c->r << 16 | c->g << 8 | c->b,
+        .outline_color = o->a << 24 | o->r << 16 | o->g << 8 | o->b,
+        .mode = opts->sub_image_color_mode,
+        .ink_threshold = opts->sub_image_ink_threshold,
+    };
+}
 
 static int init(struct sd *sd)
 {
@@ -216,6 +238,8 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
     int padding = 1 + extend;
 
     priv->packer->padding = padding;
+    sub->extend = extend;
+    priv->recolor = recolor_from_opts(opts);
 
     // For the sake of libswscale, which in some cases takes sub-rects as
     // source images, and wants 16 byte start pointer and stride alignment.
@@ -298,6 +322,43 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
         mp_assert(r->nb_colors <= 256);
         uint32_t pal[256] = {0};
         memcpy(pal, data[1], r->nb_colors * 4);
+
+        // One pass over the index plane yields both the pixel occupancy that
+        // identifies the glyph fill and the box the text actually occupies.
+        // Recoloring never touches alpha, so this classification stays valid
+        // across it.
+        bool opaque[256];
+        for (int n = 0; n < 256; n++)
+            opaque[n] = (int)(pal[n] >> 24) > priv->recolor.ink_threshold;
+
+        int counts[256] = {0};
+        struct mp_rect ink = {b->w, b->h, 0, 0};
+        for (int y = 0; y < b->h; y++) {
+            uint8_t *in = data[0] + y * linesize[0];
+            int first = -1, last = -1;
+            for (int x = 0; x < b->w; x++) {
+                counts[in[x]]++;
+                if (opaque[in[x]]) {
+                    if (first < 0)
+                        first = x;
+                    last = x;
+                }
+            }
+            if (first < 0)
+                continue;
+            ink.x0 = MPMIN(ink.x0, first);
+            ink.x1 = MPMAX(ink.x1, last + 1);
+            ink.y0 = MPMIN(ink.y0, y);
+            ink.y1 = MPMAX(ink.y1, y + 1);
+        }
+
+        // PGS signals "clear the screen" as a fully transparent rect.
+        if (mp_rect_w(ink) <= 0 || mp_rect_h(ink) <= 0) {
+            b->w = b->h = 0;
+            continue;
+        }
+
+        mp_sub_recolor_palette(pal, r->nb_colors, counts, &priv->recolor);
         convert_pal(pal, 256, opts->sub_gray);
 
         // DVD navigation highlight
@@ -347,7 +408,28 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
 
         if (apply_blur)
             mp_blur_rgba_sub_bitmap(b, opts->sub_gauss);
+
+        // Trim the transparent margin the author padded the rect with, so that
+        // positioning and scaling act on the text rather than on the bitmap.
+        // A sub_bitmap is a view into the packed image, so this is a pointer
+        // advance; it shrinks what gets uploaded and blended, not the atlas,
+        // which was already packed before this point.
+        b->bitmap = (char *)b->bitmap + ink.y0 * b->stride + ink.x0 * 4;
+        b->src_x += ink.x0;
+        b->src_y += ink.y0;
+        b->x += ink.x0;
+        b->y += ink.y0;
+        b->w = mp_rect_w(ink) + extend * 2;
+        b->h = mp_rect_h(ink) + extend * 2;
     }
+
+    // Drop the parts that turned out to hold no ink at all.
+    int kept = 0;
+    for (int i = 0; i < sub->count; i++) {
+        if (sub->inbitmaps[i].w > 0 && sub->inbitmaps[i].h > 0)
+            sub->inbitmaps[kept++] = sub->inbitmaps[i];
+    }
+    sub->count = kept;
 }
 
 static void rerender_queued_subs(struct sd *sd)
@@ -480,12 +562,100 @@ static struct sub *get_current(struct sd_lavc_priv *priv, double pts)
     return current;
 }
 
+static struct mp_rect part_ink(struct sub_bitmap *b, int extend)
+{
+    return (struct mp_rect){b->x + extend, b->y + extend,
+                            b->x + b->w - extend, b->y + b->h - extend};
+}
+
+static int compare_int(const void *pa, const void *pb)
+{
+    return *(const int *)pa - *(const int *)pb;
+}
+
+// Place image subtitles the way libass places text ones: anchor the bottom of
+// the text at --sub-pos, counted from the bottom of the visible picture. A
+// value of 100 means "wherever the author put it", matching both sd_ass and
+// the previous behaviour here.
+static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res,
+                               int extend, struct mp_rect vis)
+{
+    struct sd_lavc_priv *priv = sd->priv;
+    struct mp_subtitle_opts *opts = sd->opts;
+    float sub_pos = sd->shared_opts->sub_pos[sd->order];
+    int n = res->num_parts;
+
+    if (!opts->sub_image_position || sub_pos == 100.0f || n < 1)
+        return;
+
+    MP_TARRAY_GROW(priv, priv->sort_scratch, n);
+    MP_TARRAY_GROW(priv, priv->block_scratch, n);
+    MP_TARRAY_GROW(priv, priv->blocks_scratch, n);
+    int *order = priv->sort_scratch;
+    int *block_of = priv->block_scratch;
+    struct mp_rect *blocks = priv->blocks_scratch;
+
+    // The median line height sets what counts as a break between two separate
+    // blocks of text. Unioning every part instead would drag a translated sign
+    // at the top of the frame down onto the dialogue.
+    for (int i = 0; i < n; i++)
+        block_of[i] = mp_rect_h(part_ink(&res->parts[i], extend));
+    qsort(block_of, n, sizeof(block_of[0]), compare_int);
+    int max_gap = MPMAX(1, block_of[n / 2] * 3 / 2);
+
+    // Sort by the top of the ink. A few parts per event, so insertion sort.
+    for (int i = 0; i < n; i++)
+        order[i] = i;
+    for (int i = 1; i < n; i++) {
+        int cur = order[i];
+        int y = part_ink(&res->parts[cur], extend).y0;
+        int j = i - 1;
+        while (j >= 0 && part_ink(&res->parts[order[j]], extend).y0 > y) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = cur;
+    }
+
+    int num_blocks = 0;
+    int prev_bottom = 0;
+    for (int i = 0; i < n; i++) {
+        struct mp_rect ink = part_ink(&res->parts[order[i]], extend);
+        if (i == 0 || ink.y0 - prev_bottom > max_gap) {
+            blocks[num_blocks++] = ink;
+            prev_bottom = ink.y1;
+        } else {
+            struct mp_rect *b = &blocks[num_blocks - 1];
+            b->y0 = MPMIN(b->y0, ink.y0);
+            b->y1 = MPMAX(b->y1, ink.y1);
+            prev_bottom = MPMAX(prev_bottom, ink.y1);
+        }
+        block_of[order[i]] = num_blocks - 1;
+    }
+
+    int anchor = num_blocks - 1;
+    // bottom-block: only move text that started out near the bottom, and leave
+    // signs and other top-of-frame text where the author put them.
+    if (opts->sub_image_position == 1 &&
+        (blocks[anchor].y0 + blocks[anchor].y1) / 2 < vis.y1 - mp_rect_h(vis) / 3)
+        return;
+
+    int target = vis.y1 - lrint(mp_rect_h(vis) * (100.0f - sub_pos) / 100.0);
+    int dy = target - blocks[anchor].y1;
+    // Never push a block taller than the picture off the top.
+    dy = MPMAX(dy, vis.y0 - blocks[anchor].y0);
+
+    for (int i = 0; i < n; i++) {
+        if (opts->sub_image_position == 2 || block_of[i] == anchor)
+            res->parts[i].y += dy;
+    }
+}
+
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
                                        int format, double pts)
 {
     struct sd_lavc_priv *priv = sd->priv;
     struct mp_subtitle_opts *opts = sd->opts;
-    struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
 
     priv->current_pts = pts;
 
@@ -551,30 +721,30 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
         h = MPMAX(priv->video_params.h, current->src_h);
     }
 
-    if (shared_opts->sub_pos[sd->order] != 100.0f && shared_opts->ass_style_override[sd->order]) {
-        float offset = (100.0f - shared_opts->sub_pos[sd->order]) / 100.0f * h;
+    // Rects are authored in the uncropped frame, so --video-crop has to be
+    // resolved here or subtitles written into a letterbox bar get scaled away
+    // with the bar. Everything below works in the visible picture.
+    struct mp_rect vis = priv->video_params.crop;
+    if (mp_rect_w(vis) <= 0 || mp_rect_h(vis) <= 0)
+        vis = (struct mp_rect){0, 0, w, h};
 
+    reposition_bitmaps(sd, res, current->extend, vis);
+
+    // Fold the crop into the single affine transform osd_rescale_bitmaps()
+    // already applies, rather than chaining a second scaling.
+    if (mp_rect_w(vis) != w || mp_rect_h(vis) != h) {
         for (int n = 0; n < res->num_parts; n++) {
-            struct sub_bitmap *sub = &res->parts[n];
-
-            // Decide by heuristic whether this is a sub-title or something
-            // else (top-title, covering whole screen).
-            if (sub->y < h / 2)
-                continue;
-
-            // Allow moving up the subtitle, but only until it clips.
-            sub->y = MPMAX(sub->y - offset, 0);
-            sub->y = MPMIN(sub->y + sub->h, h) - sub->h;
+            res->parts[n].x -= vis.x0;
+            res->parts[n].y -= vis.y0;
         }
     }
+    osd_rescale_bitmaps(res, mp_rect_w(vis), mp_rect_h(vis), d, video_par);
 
-    osd_rescale_bitmaps(res, w, h, d, video_par);
-
-    if (shared_opts->sub_scale[sd->order] != 1.0 && shared_opts->ass_style_override[sd->order]) {
+    if (opts->sub_scale != 1.0) {
         for (int n = 0; n < res->num_parts; n++) {
             struct sub_bitmap *sub = &res->parts[n];
 
-            float shit = (shared_opts->sub_scale[sd->order] - 1.0f) / 2;
+            float shit = (opts->sub_scale - 1.0f) / 2;
 
             // Fortunately VO isn't supposed to give a FUCKING FUCK about
             // whether the sub might e.g. go outside of the screen.
@@ -755,6 +925,25 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
             return false;
         a[0] = res;
         return true;
+    }
+    case SD_CTRL_UPDATE_OPTS: {
+        // Recoloring is baked in at decode time, so the queued events have to
+        // be expanded again for a color change to show without a seek. Their
+        // ids change, which is what makes the VO drop its cached textures.
+        struct mp_sub_recolor recolor = recolor_from_opts(sd->opts);
+        if (!memcmp(&recolor, &priv->recolor, sizeof(recolor)))
+            return CONTROL_OK;
+        for (int n = 0; n < MAX_QUEUE; n++) {
+            struct sub *sub = &priv->subs[n];
+            if (!sub->valid)
+                continue;
+            sub->count = 0;
+            sub->src_w = 0;
+            sub->src_h = 0;
+            sub->id = priv->new_id++;
+            read_sub_bitmaps(sd, sub);
+        }
+        return CONTROL_OK;
     }
     case SD_CTRL_SET_VIDEO_PARAMS:
         priv->video_params = *(struct mp_image_params *)arg;

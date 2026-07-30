@@ -110,6 +110,11 @@ codepoint_width = executable('codepoint-width', files('codepoint_width.c'),
                              include_directories: incdir, link_with: test_utils)
 test('codepoint-width', codepoint_width)
 
+sub_recolor = executable('sub-recolor', files('sub_recolor.c'), include_directories: incdir,
+                         objects: libmpv.extract_objects('sub/sub_recolor.c'),
+                         link_with: test_utils)
+test('sub-recolor', sub_recolor)
+
 paths_objects = libmpv.extract_objects('options/path.c', path_source)
 paths = executable('paths', 'paths.c', include_directories: incdir,
                    objects: paths_objects, link_with: test_utils)

@@ -2995,6 +2995,71 @@ Subtitles
 
         Never applied to text subtitles.
 
+``--sub-image-color=<color>``
+    Recolor image subtitles to this color (default: fully transparent, which
+    disables the feature). This makes ``--sub-color`` and this option together
+    give text and image subtitles the same appearance.
+
+    The decoder's palette is transformed in place, before it is expanded to
+    RGBA, so the result is exact rather than an approximation of the rendered
+    bitmap. The most frequently used opaque palette entry is taken as the glyph
+    fill, the darkest desaturated entry as the outline, and entries lying on the
+    line between the two are treated as the antialiasing ramp and recolored
+    proportionally. Palette entries that lie off that line are left untouched:
+    they are genuinely different colors, such as a translated sign or a second
+    speaker, and are usually deliberate.
+
+    See ``--sub-image-color-mode`` for how the target color is applied, and
+    ``--sub-image-outline-color`` to recolor the outline as well.
+
+    .. note::
+
+        Never applied to text subtitles.
+
+``--sub-image-color-mode=<replace|retint>``
+    How ``--sub-image-color`` is applied (default: replace).
+
+    :replace: The glyph fill becomes exactly the requested color.
+    :retint:  Each palette entry keeps its own lightness and takes the hue and
+              chroma of the requested color. Preserves gradient fills.
+
+``--sub-image-outline-color=<color>``
+    Recolor the outline and shadow of image subtitles (default: fully
+    transparent, which leaves them as authored). Only has an effect together
+    with ``--sub-image-color``.
+
+``--sub-image-position=<none|bottom-block|all>``
+    How ``--sub-pos`` is applied to image subtitles (default: bottom-block).
+
+    Image subtitles are usually wide bitmaps with large transparent margins, so
+    the position of the bitmap says little about where the text actually is.
+    Unless this is ``none``, the opaque area ("ink") of each part is measured,
+    parts are grouped into blocks by vertical proximity, and the block is
+    anchored so that the bottom of its ink sits at ``--sub-pos``, matching how
+    ``--sub-pos`` positions text subtitles.
+
+    :none:         Do not reposition; only clamp within the frame.
+    :bottom-block: Reposition only the block that starts out in the lower third
+                   of the visible video. Leaves translated signs and other
+                   top-of-frame text where the author put it.
+    :all:          Reposition every block by the same amount, preserving their
+                   relative layout.
+
+    When ``--video-crop`` is set, positions are computed inside the cropped
+    picture, so subtitles authored into a letterbox bar move onto the image
+    instead of being scaled away with the bar.
+
+    .. note::
+
+        Never applied to text subtitles.
+
+``--sub-image-ink-threshold=<0-255>``
+    Alpha value above which an image subtitle pixel counts as ink
+    (default: 16). Used to find the text within a bitmap for
+    ``--sub-image-position`` and ``--sub-image-color``. It is not 0 because
+    authoring tools commonly leave a nearly invisible halo around the glyphs,
+    which would otherwise inflate the measured text area.
+
 ``--sub-file-paths=<path-list>``
     Specify extra directories to search for subtitles matching the video.
     Multiple directories can be separated by ":" (";" on Windows).
