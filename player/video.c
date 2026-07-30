@@ -1031,20 +1031,27 @@ static void calculate_frame_duration(struct MPContext *mpctx)
     MP_STATS(mpctx, "value %f frame-duration-approx", MPMAX(0, approx_duration));
 }
 
+// Resolve --video-crop into p->crop. Returns false if the option is set but
+// does not fit the image; what to do about that is up to the caller.
+bool mp_resolve_video_crop(struct vo *vo, struct mp_image_params *p)
+{
+    struct m_geometry *gm = &vo->opts->video_crop;
+    if (gm->xy_valid || (gm->wh_valid && (gm->w > 0 || gm->h > 0)))
+        m_rect_apply(&p->crop, p->w, p->h, gm);
+
+    if (p->crop.x1 == 0 && p->crop.y1 == 0)
+        return true;
+
+    return mp_image_crop_valid(p);
+}
+
 static void apply_video_crop(struct MPContext *mpctx, struct vo *vo)
 {
     for (int n = 0; n < mpctx->num_next_frames; n++) {
-        struct m_geometry *gm = &vo->opts->video_crop;
         struct mp_image_params p = mpctx->next_frames[n]->params;
-        if (gm->xy_valid || (gm->wh_valid && (gm->w > 0 || gm->h > 0)))
-        {
-            m_rect_apply(&p.crop, p.w, p.h, gm);
-        }
 
-        if (p.crop.x1 == 0 && p.crop.y1 == 0)
-            return;
-
-        if (!mp_image_crop_valid(&p)) {
+        if (!mp_resolve_video_crop(vo, &p)) {
+            struct m_geometry *gm = &vo->opts->video_crop;
             char *str = m_option_type_rect.print(NULL, gm);
             MP_WARN(vo, "Ignoring invalid --video-crop=%s for %dx%d image\n",
                     str, p.w, p.h);
@@ -1053,6 +1060,10 @@ static void apply_video_crop(struct MPContext *mpctx, struct vo *vo)
             mp_property_do("video-crop", M_PROPERTY_SET, gm, mpctx);
             return;
         }
+
+        if (p.crop.x1 == 0 && p.crop.y1 == 0)
+            return;
+
         mpctx->next_frames[n]->params.crop = p.crop;
     }
 }

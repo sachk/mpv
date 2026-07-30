@@ -102,8 +102,15 @@ static bool update_subtitle(struct MPContext *mpctx, double video_pts,
 
     if (mpctx->vo_chain) {
         struct mp_image_params params = mpctx->vo_chain->filter->input_params;
-        if (params.imgfmt)
+        if (params.imgfmt) {
+            // Image subtitles are authored in the uncropped frame, so they need
+            // to know about --video-crop to stay on the visible picture. The
+            // crop lives on the VO's frames, not on the filter chain output.
+            if (mpctx->video_out &&
+                !mp_resolve_video_crop(mpctx->video_out, &params))
+                params.crop = (struct mp_rect){0};
             sub_control(dec_sub, SD_CTRL_SET_VIDEO_PARAMS, &params);
+        }
     }
 
     // Checking if packets have special animations is relatively expensive.
