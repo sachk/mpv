@@ -3042,8 +3042,19 @@ Subtitles
     :bottom-block: Reposition only the block that starts out in the lower third
                    of the visible video. Leaves translated signs and other
                    top-of-frame text where the author put it.
-    :all:          Reposition every block by the same amount, preserving their
-                   relative layout.
+    :all:          Treat every measured image object as one subtitle layout.
+                   Objects separated by screen-sized horizontal gaps on the
+                   same authored line are kept in left-to-right order and
+                   pulled together with ordinary dialogue spacing; authored
+                   multiline rows remain separate. The complete layout is
+                   translated to ``--sub-pos`` and ``--sub-scale`` applies one
+                   common transform around its horizontal center and ink
+                   bottom, so scaling cannot displace the position selected by
+                   ``--sub-pos``.
+
+    A ``--sub-pos`` value of 100 keeps the authored vertical placement. In
+    ``all`` mode, distant same-line image objects are still joined into a
+    readable dialogue row.
 
     When ``--video-crop`` is set, positions are computed inside the cropped
     picture, so subtitles authored into a letterbox bar move onto the image

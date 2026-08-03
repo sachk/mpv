@@ -1,0 +1,192 @@
+#include <stdlib.h>
+
+#include "sub/osd.h"
+#include "sub/sub_image_geometry.h"
+#include "sub/sub_image_segmentation.h"
+#include "test_utils.h"
+
+static struct sub_bitmap bitmap(int x, int y, int w, int h)
+{
+    return (struct sub_bitmap) {
+        .w = w,
+        .h = h,
+        .x = x,
+        .y = y,
+        .dw = w,
+        .dh = h,
+    };
+}
+
+static int ink_bottom(const struct sub_bitmaps *imgs, int extend)
+{
+    int bottom = INT_MIN;
+    for (int i = 0; i < imgs->num_parts; i++) {
+        const struct sub_bitmap *part = &imgs->parts[i];
+        int pad = part->h > 0 ? lrint(extend * part->dh / (double)part->h) : 0;
+        bottom = MPMAX(bottom, part->y + part->dh - pad);
+    }
+    return bottom;
+}
+
+static void test_authored_y_normalizes_to_one_anchor(void)
+{
+    struct mp_rect visible = { 0, 0, 1920, 1080 };
+    struct sub_bitmap low_parts[] = {
+        bitmap(700, 760, 120, 40),
+        bitmap(830, 770, 80, 30),
+    };
+    struct sub_bitmap high_parts[] = {
+        bitmap(700, 260, 120, 40),
+        bitmap(830, 270, 80, 30),
+    };
+    struct sub_bitmaps low = { .parts = low_parts, .num_parts = 2 };
+    struct sub_bitmaps high = { .parts = high_parts, .num_parts = 2 };
+    int low_relative_y = low_parts[1].y - low_parts[0].y;
+    int high_relative_y = high_parts[1].y - high_parts[0].y;
+
+    mp_image_subtitle_reposition_all(&low, 0, visible, 50);
+    mp_image_subtitle_reposition_all(&high, 0, visible, 50);
+
+    assert_int_equal(ink_bottom(&low, 0), 540);
+    assert_int_equal(ink_bottom(&high, 0), 540);
+    assert_int_equal(low_parts[1].y - low_parts[0].y, low_relative_y);
+    assert_int_equal(high_parts[1].y - high_parts[0].y, high_relative_y);
+}
+
+static void test_bottom_anchored_multipart_scale(void)
+{
+    struct mp_rect visible = { 0, 0, 1920, 1080 };
+    struct sub_bitmap parts[] = {
+        bitmap(700, 500, 100, 40),
+        bitmap(820, 510, 60, 30),
+    };
+    struct sub_bitmaps imgs = { .parts = parts, .num_parts = 2 };
+    int original_bottom = ink_bottom(&imgs, 0);
+    int original_dx = parts[1].x - parts[0].x;
+
+    mp_image_subtitle_scale_all(&imgs, 0, 1.5f, visible);
+
+    assert_int_equal(parts[0].dw, 150);
+    assert_int_equal(parts[0].dh, 60);
+    assert_int_equal(parts[1].dw, 90);
+    assert_int_equal(parts[1].dh, 45);
+    assert_true(labs((parts[1].x - parts[0].x) - lrint(original_dx * 1.5)) <= 1);
+    assert_int_equal(ink_bottom(&imgs, 0), original_bottom);
+}
+
+static void test_padding_noops_and_top_clamp(void)
+{
+    struct mp_rect visible = { 0, 0, 800, 800 };
+    struct sub_bitmap padded_part = bitmap(100, 200, 110, 50);
+    struct sub_bitmaps padded = { .parts = &padded_part, .num_parts = 1 };
+    mp_image_subtitle_reposition_all(&padded, 5, visible, 50);
+    assert_int_equal(ink_bottom(&padded, 5), 400);
+
+    struct sub_bitmaps empty = { 0 };
+    mp_image_subtitle_reposition_all(&empty, 5, visible, 20);
+    mp_image_subtitle_scale_all(&empty, 5, 1.5f, visible);
+
+    struct sub_bitmap unchanged_part = bitmap(50, 60, 70, 80);
+    struct sub_bitmap before = unchanged_part;
+    struct sub_bitmaps unchanged = { .parts = &unchanged_part, .num_parts = 1 };
+    mp_image_subtitle_scale_all(&unchanged, 0, 1.0f, visible);
+    assert_memcmp(&unchanged_part, &before, sizeof(before));
+
+    struct sub_bitmap crossing_part = bitmap(100, 10, 100, 90);
+    struct sub_bitmaps crossing = { .parts = &crossing_part, .num_parts = 1 };
+    mp_image_subtitle_scale_all(&crossing, 0, 2.0f, visible);
+    assert_int_equal(crossing_part.y, visible.y0);
+
+    struct sub_bitmap oversized_part = bitmap(100, 0, 100, 600);
+    struct sub_bitmaps oversized = { .parts = &oversized_part, .num_parts = 1 };
+    mp_image_subtitle_scale_all(&oversized, 0, 2.0f, visible);
+    assert_int_equal(oversized_part.y, visible.y0);
+    assert_true(oversized_part.dh > mp_rect_h(visible));
+}
+
+static void test_distant_groups_compact_per_source_line(void)
+{
+    struct mp_rect visible = { 0, 0, 1200, 800 };
+    struct sub_bitmap parts[] = {
+        bitmap(100, 600, 100, 40),
+        bitmap(900, 600, 100, 40),
+        bitmap(300, 670, 220, 40),
+    };
+    struct sub_bitmaps imgs = { .parts = parts, .num_parts = 3 };
+    int second_line_x = parts[2].x;
+
+    mp_image_subtitle_reposition_all(&imgs, 0, visible, 100);
+
+    assert_true(parts[0].x < parts[1].x);
+    assert_int_equal(parts[1].x - (parts[0].x + parts[0].w), 20);
+    assert_int_equal(parts[2].x, second_line_x);
+    assert_int_equal(parts[0].y, 600);
+    assert_int_equal(parts[2].y, 670);
+}
+
+static void test_pgs_multipart_speakers_preserve_authored_rows(void)
+{
+    struct sub_bitmap parts[] = {
+        bitmap(100, 500, 100, 30),
+        bitmap(900, 500, 100, 30),
+        bitmap(110, 540, 120, 30),
+        bitmap(890, 540, 120, 30),
+    };
+    struct sub_bitmaps imgs = { .parts = parts, .num_parts = 4 };
+
+    mp_image_subtitle_reposition_all(&imgs, 0, (struct mp_rect) { 0, 0, 1200, 800 }, 100);
+
+    assert_int_equal(parts[1].x - (parts[0].x + parts[0].w), 15);
+    assert_int_equal(parts[3].x - (parts[2].x + parts[2].w), 15);
+    assert_int_equal(parts[0].y, parts[1].y);
+    assert_int_equal(parts[2].y, parts[3].y);
+    assert_int_equal(parts[2].y - parts[0].y, 40);
+}
+
+static void fill_rect(uint32_t *pixels, int stride, int x0, int y0, int x1, int y1)
+{
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++)
+            pixels[y * stride + x] = 0xFFFFFFFFu;
+    }
+}
+
+static void test_vobsub_pixel_groups_and_multiline_layout(void)
+{
+    enum { W = 400, H = 100, EXTEND = 5 };
+    uint32_t pixels[W * H] = { 0 };
+    fill_rect(pixels, W, 15, 10, 80, 35);
+    fill_rect(pixels, W, 20, 55, 90, 80);
+    fill_rect(pixels, W, 300, 10, 370, 35);
+    fill_rect(pixels, W, 290, 55, 380, 80);
+
+    struct sub_bitmap source = bitmap(50, 500, W, H);
+    source.bitmap = pixels;
+    source.stride = W * 4;
+    struct sub_bitmap split[4] = { 0 };
+    int occupied[W];
+    int count = mp_image_subtitle_split_columns(
+        &source, EXTEND, split, MP_ARRAY_SIZE(split), occupied, MP_ARRAY_SIZE(occupied));
+    assert_int_equal(count, 2);
+    assert_true(split[0].x < split[1].x);
+    assert_int_equal(split[0].y, source.y);
+    assert_int_equal(split[1].y, source.y);
+    assert_int_equal(split[0].h, source.h);
+    assert_int_equal(split[1].h, source.h);
+
+    struct sub_bitmaps imgs = { .parts = split, .num_parts = count };
+    mp_image_subtitle_reposition_all(&imgs, EXTEND, (struct mp_rect) { 0, 0, 1200, 800 }, 100);
+    int ink_gap = split[1].x + EXTEND - (split[0].x + split[0].w - EXTEND);
+    assert_int_equal(ink_gap, (H - EXTEND * 2) / 2);
+}
+
+int main(void)
+{
+    test_authored_y_normalizes_to_one_anchor();
+    test_bottom_anchored_multipart_scale();
+    test_padding_noops_and_top_clamp();
+    test_distant_groups_compact_per_source_line();
+    test_pgs_multipart_speakers_preserve_authored_rows();
+    test_vobsub_pixel_groups_and_multiline_layout();
+    return 0;
+}

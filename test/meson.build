@@ -115,6 +115,14 @@ sub_recolor = executable('sub-recolor', files('sub_recolor.c'), include_director
                          link_with: test_utils)
 test('sub-recolor', sub_recolor)
 
+sub_image_geometry = executable('sub-image-geometry', files('sub_image_geometry.c'),
+                                include_directories: incdir,
+                                objects: libmpv.extract_objects(
+                                    'sub/sub_image_geometry.c',
+                                    'sub/sub_image_segmentation.c'),
+                                link_with: test_utils)
+test('sub-image-geometry', sub_image_geometry)
+
 paths_objects = libmpv.extract_objects('options/path.c', path_source)
 paths = executable('paths', 'paths.c', include_directories: incdir,
                    objects: paths_objects, link_with: test_utils)

@@ -222,6 +222,8 @@ sources = files(
     'sub/packer.c',
     'sub/sd_ass.c',
     'sub/sd_lavc.c',
+    'sub/sub_image_geometry.c',
+    'sub/sub_image_segmentation.c',
     'sub/sub_recolor.c',
 
     ## Video

@@ -15,26 +15,28 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <stdlib.h>
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/common.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/opt.h>
 
-#include "mpv_talloc.h"
-#include "common/msg.h"
 #include "common/av_common.h"
+#include "common/msg.h"
+#include "dec_sub.h"
 #include "demux/stheader.h"
+#include "img_convert.h"
+#include "mpv_talloc.h"
 #include "options/options.h"
+#include "sd.h"
+#include "sub_image_geometry.h"
+#include "sub_image_segmentation.h"
+#include "sub_recolor.h"
 #include "video/mp_image.h"
 #include "video/out/bitmap_packer.h"
-#include "img_convert.h"
-#include "sd.h"
-#include "dec_sub.h"
-#include "sub_recolor.h"
 
 #define MAX_QUEUE 4
 
@@ -88,11 +90,31 @@ struct sd_lavc_priv {
     struct mp_rect *blocks_scratch;
 };
 
+static int prepare_all_position_parts(struct sd_lavc_priv *priv, struct sub *current)
+{
+    int out_count = 0;
+    int extend = current->extend;
+
+    for (int i = 0; i < current->count; i++) {
+        const struct sub_bitmap *source = &current->inbitmaps[i];
+        int ink_width = MPMAX(0, source->w - extend * 2);
+        int ink_height = MPMAX(0, source->h - extend * 2);
+        int split_gap = MPMAX(extend * 2 + 1, ink_height / 2);
+        int max_groups = 1 + ink_width / MPMAX(1, split_gap + 1);
+        MP_TARRAY_GROW(priv, priv->outbitmaps, out_count + max_groups);
+        MP_TARRAY_GROW(priv, priv->block_scratch, ink_width);
+        out_count += mp_image_subtitle_split_columns(
+            source, extend, &priv->outbitmaps[out_count], max_groups, priv->block_scratch, ink_width);
+    }
+
+    return out_count;
+}
+
 static struct mp_sub_recolor recolor_from_opts(struct mp_subtitle_opts *opts)
 {
     const struct m_color *c = &opts->sub_image_color;
     const struct m_color *o = &opts->sub_image_outline_color;
-    return (struct mp_sub_recolor){
+    return (struct mp_sub_recolor) {
         .color = c->a << 24 | c->r << 16 | c->g << 8 | c->b,
         .outline_color = o->a << 24 | o->r << 16 | o->g << 8 | o->b,
         .mode = opts->sub_image_color_mode,
@@ -261,7 +283,7 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
         // save the rect for later (dumb hack to avoid more complexity)
         *b = (struct sub_bitmap){ .bitmap = r };
 
-        priv->packer->in[sub->count] = (struct pos){r->w + (align - 1), r->h};
+        priv->packer->in[sub->count] = (struct pos) { r->w + (align - 1), r->h };
         sub->count++;
     }
 
@@ -320,7 +342,7 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
 
         mp_assert(r->nb_colors > 0);
         mp_assert(r->nb_colors <= 256);
-        uint32_t pal[256] = {0};
+        uint32_t pal[256] = { 0 };
         memcpy(pal, data[1], r->nb_colors * 4);
 
         // One pass over the index plane yields both the pixel occupancy that
@@ -331,8 +353,8 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
         for (int n = 0; n < 256; n++)
             opaque[n] = (int)(pal[n] >> 24) > priv->recolor.ink_threshold;
 
-        int counts[256] = {0};
-        struct mp_rect ink = {b->w, b->h, 0, 0};
+        int counts[256] = { 0 };
+        struct mp_rect ink = { b->w, b->h, 0, 0 };
         for (int y = 0; y < b->h; y++) {
             uint8_t *in = data[0] + y * linesize[0];
             int first = -1, last = -1;
@@ -378,7 +400,7 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
         int hli_y1 = hlr.y1 - r->y;
 
         for (int y = -padding; y < b->h + padding; y++) {
-            uint32_t *out = (uint32_t*)((char*)b->bitmap + y * b->stride);
+            uint32_t *out = (uint32_t *)((char *)b->bitmap + y * b->stride);
             int start = 0;
             for (int x = -padding; x < 0; x++)
                 out[x] = 0;
@@ -398,7 +420,7 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
                 *out++ = 0;
         }
 
-        b->bitmap = (char*)b->bitmap - extend * b->stride - extend * 4;
+        b->bitmap = (char *)b->bitmap - extend * b->stride - extend * 4;
         b->src_x -= extend;
         b->src_y -= extend;
         b->x -= extend;
@@ -486,9 +508,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         pts = sub.pts / (double)AV_TIME_BASE;
 
     if (pts != MP_NOPTS_VALUE) {
-        if (sub.end_display_time > sub.start_display_time &&
-            sub.end_display_time != UINT32_MAX)
-        {
+        if (sub.end_display_time > sub.start_display_time && sub.end_display_time != UINT32_MAX) {
             endpts = pts + sub.end_display_time / 1000.0;
         }
         pts += sub.start_display_time / 1000.0;
@@ -535,9 +555,9 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         // Set arbitrary limit as safe-guard against insane files.
         if (priv->num_seekpoints >= 10000)
             MP_TARRAY_REMOVE_AT(priv->seekpoints, priv->num_seekpoints, 0);
-        MP_TARRAY_APPEND(priv, priv->seekpoints, priv->num_seekpoints,
-                         (struct seekpoint){.pts = pts, .endpts = endpts});
-        skip: ;
+        MP_TARRAY_APPEND(
+            priv, priv->seekpoints, priv->num_seekpoints, (struct seekpoint) { .pts = pts, .endpts = endpts });
+    skip:;
     }
 }
 
@@ -548,10 +568,9 @@ static struct sub *get_current(struct sd_lavc_priv *priv, double pts)
         struct sub *sub = &priv->subs[n];
         if (!sub->valid)
             continue;
-        if (pts == MP_NOPTS_VALUE ||
-            ((sub->pts == MP_NOPTS_VALUE || pts + 1e-6 >= sub->pts) &&
-             (sub->endpts == MP_NOPTS_VALUE || pts + 1e-6 < sub->endpts)))
-        {
+        if (pts == MP_NOPTS_VALUE
+            || ((sub->pts == MP_NOPTS_VALUE || pts + 1e-6 >= sub->pts)
+                && (sub->endpts == MP_NOPTS_VALUE || pts + 1e-6 < sub->endpts))) {
             // Ignore "trailing" subtitles with unknown length after 1 minute.
             if (sub->endpts == MP_NOPTS_VALUE && pts >= sub->pts + 60)
                 break;
@@ -564,8 +583,7 @@ static struct sub *get_current(struct sd_lavc_priv *priv, double pts)
 
 static struct mp_rect part_ink(struct sub_bitmap *b, int extend)
 {
-    return (struct mp_rect){b->x + extend, b->y + extend,
-                            b->x + b->w - extend, b->y + b->h - extend};
+    return (struct mp_rect) { b->x + extend, b->y + extend, b->x + b->w - extend, b->y + b->h - extend };
 }
 
 static int compare_int(const void *pa, const void *pb)
@@ -577,15 +595,20 @@ static int compare_int(const void *pa, const void *pb)
 // the text at --sub-pos, counted from the bottom of the visible picture. A
 // value of 100 means "wherever the author put it", matching both sd_ass and
 // the previous behaviour here.
-static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res,
-                               int extend, struct mp_rect vis)
+static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int extend, struct mp_rect vis)
 {
     struct sd_lavc_priv *priv = sd->priv;
     struct mp_subtitle_opts *opts = sd->opts;
     float sub_pos = sd->shared_opts->sub_pos[sd->order];
     int n = res->num_parts;
 
-    if (!opts->sub_image_position || sub_pos == 100.0f || n < 1)
+    if (!opts->sub_image_position || n < 1)
+        return;
+    if (opts->sub_image_position == 2) {
+        mp_image_subtitle_reposition_all(res, extend, vis, sub_pos);
+        return;
+    }
+    if (sub_pos == 100.0f)
         return;
 
     MP_TARRAY_GROW(priv, priv->sort_scratch, n);
@@ -636,8 +659,7 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res,
     int anchor = num_blocks - 1;
     // bottom-block: only move text that started out near the bottom, and leave
     // signs and other top-of-frame text where the author put them.
-    if (opts->sub_image_position == 1 &&
-        (blocks[anchor].y0 + blocks[anchor].y1) / 2 < vis.y1 - mp_rect_h(vis) / 3)
+    if (opts->sub_image_position == 1 && (blocks[anchor].y0 + blocks[anchor].y1) / 2 < vis.y1 - mp_rect_h(vis) / 3)
         return;
 
     int target = vis.y1 - lrint(mp_rect_h(vis) * (100.0f - sub_pos) / 100.0);
@@ -651,8 +673,7 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res,
     }
 }
 
-static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
-                                       int format, double pts)
+static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int format, double pts)
 {
     struct sd_lavc_priv *priv = sd->priv;
     struct mp_subtitle_opts *opts = sd->opts;
@@ -664,13 +685,19 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
     if (!current)
         return NULL;
 
-    MP_TARRAY_GROW(priv, priv->outbitmaps, current->count);
-    for (int n = 0; n < current->count; n++)
-        priv->outbitmaps[n] = current->inbitmaps[n];
+    int output_count = 0;
+    if (opts->sub_image_position == 2) {
+        output_count = prepare_all_position_parts(priv, current);
+    } else {
+        MP_TARRAY_GROW(priv, priv->outbitmaps, current->count);
+        for (int n = 0; n < current->count; n++)
+            priv->outbitmaps[n] = current->inbitmaps[n];
+        output_count = current->count;
+    }
 
-    struct sub_bitmaps *res = &(struct sub_bitmaps){0};
+    struct sub_bitmaps *res = &(struct sub_bitmaps) { 0 };
     res->parts = priv->outbitmaps;
-    res->num_parts = current->count;
+    res->num_parts = output_count;
     if (priv->displayed_id != current->id)
         res->change_id++;
     priv->displayed_id = current->id;
@@ -681,29 +708,21 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
     res->video_color_space = true;
 
     double video_par = 0;
-    if (priv->avctx->codec_id == AV_CODEC_ID_DVD_SUBTITLE &&
-        opts->stretch_dvd_subs)
-    {
+    if (priv->avctx->codec_id == AV_CODEC_ID_DVD_SUBTITLE && opts->stretch_dvd_subs) {
         // For DVD subs, try to keep the subtitle PAR at display PAR.
         double par = priv->video_params.p_w / (double)priv->video_params.p_h;
         if (isnormal(par))
             video_par = par;
     }
-    if (priv->avctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE)
-    {
+    if (priv->avctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
         // For Blu-ray subs on SD video, try to match the video PAR.
-        if (priv->video_params.w == 720 &&
-            (priv->video_params.h == 480 ||
-             priv->video_params.h == 576))
-        {
+        if (priv->video_params.w == 720 && (priv->video_params.h == 480 || priv->video_params.h == 576)) {
             double par = priv->video_params.p_w / (double)priv->video_params.p_h;
             if (isnormal(par))
                 video_par = par * -1;
             else
                 video_par = -1;
-        }
-        else
-        {
+        } else {
             // Force letter-boxing on all other Blu-ray subtitles
             video_par = -1;
         }
@@ -726,7 +745,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
     // with the bar. Everything below works in the visible picture.
     struct mp_rect vis = priv->video_params.crop;
     if (mp_rect_w(vis) <= 0 || mp_rect_h(vis) <= 0)
-        vis = (struct mp_rect){0, 0, w, h};
+        vis = (struct mp_rect) { 0, 0, w, h };
 
     reposition_bitmaps(sd, res, current->extend, vis);
 
@@ -741,17 +760,21 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
     osd_rescale_bitmaps(res, mp_rect_w(vis), mp_rect_h(vis), d, video_par);
 
     if (opts->sub_scale != 1.0) {
-        for (int n = 0; n < res->num_parts; n++) {
-            struct sub_bitmap *sub = &res->parts[n];
+        if (opts->sub_image_position == 2) {
+            struct mp_rect output_visible = { d.ml, d.mt, d.w - d.mr, d.h - d.mb };
+            mp_image_subtitle_scale_all(res, current->extend, opts->sub_scale, output_visible);
+        } else {
+            for (int n = 0; n < res->num_parts; n++) {
+                struct sub_bitmap *sub = &res->parts[n];
+                float shit = (opts->sub_scale - 1.0f) / 2;
 
-            float shit = (opts->sub_scale - 1.0f) / 2;
-
-            // Fortunately VO isn't supposed to give a FUCKING FUCK about
-            // whether the sub might e.g. go outside of the screen.
-            sub->x -= sub->dw * shit;
-            sub->y -= sub->dh * shit;
-            sub->dw += sub->dw * shit * 2;
-            sub->dh += sub->dh * shit * 2;
+                // Preserve the historical per-part center scaling unless all
+                // authored image geometry is explicitly overridden.
+                sub->x -= sub->dw * shit;
+                sub->y -= sub->dh * shit;
+                sub->dw += sub->dw * shit * 2;
+                sub->dh += sub->dh * shit * 2;
+            }
         }
     }
 
@@ -764,9 +787,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d,
             struct sub_bitmap *a = &res->parts[n];
             struct sub_bitmap *b = &priv->prevret[n];
 
-            if (a->x != b->x || a->y != b->y ||
-                a->dw != b->dw || a->dh != b->dh)
-            {
+            if (a->x != b->x || a->y != b->y || a->dw != b->dw || a->dh != b->dh) {
                 res->change_id++;
                 break;
             }
@@ -819,10 +840,9 @@ static bool accepts_packet(struct sd *sd, double min_pts)
         struct sub *sub = &priv->subs[n];
         if (!sub->valid)
             continue;
-        if (pts == MP_NOPTS_VALUE ||
-            ((sub->pts == MP_NOPTS_VALUE || sub->pts >= pts) ||
-             (sub->endpts == MP_NOPTS_VALUE || pts < sub->endpts)))
-        {
+        if (pts == MP_NOPTS_VALUE
+            || ((sub->pts == MP_NOPTS_VALUE || sub->pts >= pts)
+                || (sub->endpts == MP_NOPTS_VALUE || pts < sub->endpts))) {
             last_needed = n;
         }
     }
@@ -871,8 +891,7 @@ static double step_sub(struct sd *sd, double now, int movement)
     if (priv->num_seekpoints == 0)
         return MP_NOPTS_VALUE;
 
-    qsort(priv->seekpoints, priv->num_seekpoints, sizeof(priv->seekpoints[0]),
-          compare_seekpoint);
+    qsort(priv->seekpoints, priv->num_seekpoints, sizeof(priv->seekpoints[0]), compare_seekpoint);
 
     do {
         int closest = -1;
