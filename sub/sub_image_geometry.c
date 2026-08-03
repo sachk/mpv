@@ -16,8 +16,14 @@
 
 static struct mp_rect part_ink(const struct sub_bitmap *part, int extend)
 {
-    return (
-        struct mp_rect) { part->x + extend, part->y + extend, part->x + part->w - extend, part->y + part->h - extend };
+    int pad_x = part->w > 0 ? lrint(extend * part->dw / (double)part->w) : 0;
+    int pad_y = part->h > 0 ? lrint(extend * part->dh / (double)part->h) : 0;
+    return (struct mp_rect) {
+        part->x + pad_x,
+        part->y + pad_y,
+        part->x + part->dw - pad_x,
+        part->y + part->dh - pad_y,
+    };
 }
 
 static bool overlaps_vertically(struct mp_rect part, int y0, int y1)
@@ -182,17 +188,24 @@ void mp_image_subtitle_scale_all(struct sub_bitmaps *imgs, int extend, float sca
 
     float origin_x = (ink_x0 + ink_x1) / 2.0f;
     float origin_y = ink_y1;
+    float scaled_ink_x0 = origin_x + (ink_x0 - origin_x) * scale;
+    float scaled_ink_x1 = origin_x + (ink_x1 - origin_x) * scale;
     float scaled_ink_y0 = origin_y + (ink_y0 - origin_y) * scale;
     float scaled_ink_y1 = origin_y;
+    float dx = scaled_ink_x0 < visible.x0 ? visible.x0 - scaled_ink_x0 : 0.0f;
+    if (scaled_ink_x1 + dx > visible.x1)
+        dx = visible.x1 - scaled_ink_x1;
+    if (scaled_ink_x1 - scaled_ink_x0 > mp_rect_w(visible))
+        dx = visible.x0 - scaled_ink_x0;
     float dy = scaled_ink_y0 < visible.y0 ? visible.y0 - scaled_ink_y0 : 0.0f;
     if (scaled_ink_y1 - scaled_ink_y0 > mp_rect_h(visible))
         dy = visible.y0 - scaled_ink_y0;
 
     for (int i = 0; i < imgs->num_parts; i++) {
         struct sub_bitmap *part = &imgs->parts[i];
-        float x0 = origin_x + (part->x - origin_x) * scale;
+        float x0 = origin_x + (part->x - origin_x) * scale + dx;
         float y0 = origin_y + (part->y - origin_y) * scale + dy;
-        float x1 = origin_x + (part->x + part->dw - origin_x) * scale;
+        float x1 = origin_x + (part->x + part->dw - origin_x) * scale + dx;
         float y1 = origin_y + (part->y + part->dh - origin_y) * scale + dy;
         int rx0 = lrintf(x0);
         int ry0 = lrintf(y0);

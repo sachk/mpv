@@ -104,6 +104,28 @@ static void test_padding_noops_and_top_clamp(void)
     assert_true(oversized_part.dh > mp_rect_h(visible));
 }
 
+static void test_full_output_allows_letterbox_and_pillarbox_placement(void)
+{
+    struct mp_rect output = { 0, 0, 1920, 1080 };
+    struct sub_bitmap letterbox_part = bitmap(800, 800, 320, 70);
+    struct sub_bitmaps letterbox = { .parts = &letterbox_part, .num_parts = 1 };
+    mp_image_subtitle_reposition_all(&letterbox, 0, output, 95);
+    assert_int_equal(ink_bottom(&letterbox, 0), 1026);
+    assert_true(ink_bottom(&letterbox, 0) > 945);
+
+    struct sub_bitmap pillarbox_part = bitmap(500, 700, 920, 80);
+    struct sub_bitmaps pillarbox = { .parts = &pillarbox_part, .num_parts = 1 };
+    mp_image_subtitle_scale_all(&pillarbox, 0, 1.5f, output);
+    assert_true(pillarbox_part.x < 420);
+    assert_true(pillarbox_part.x + pillarbox_part.dw > 1500);
+
+    struct sub_bitmap wider_than_output_part = bitmap(300, 700, 1320, 80);
+    struct sub_bitmaps wider_than_output = { .parts = &wider_than_output_part, .num_parts = 1 };
+    mp_image_subtitle_scale_all(&wider_than_output, 0, 2.0f, output);
+    assert_int_equal(wider_than_output_part.x, output.x0);
+    assert_true(wider_than_output_part.dw > mp_rect_w(output));
+}
+
 static void test_distant_groups_compact_per_source_line(void)
 {
     struct mp_rect visible = { 0, 0, 1200, 800 };
@@ -185,6 +207,7 @@ int main(void)
     test_authored_y_normalizes_to_one_anchor();
     test_bottom_anchored_multipart_scale();
     test_padding_noops_and_top_clamp();
+    test_full_output_allows_letterbox_and_pillarbox_placement();
     test_distant_groups_compact_per_source_line();
     test_pgs_multipart_speakers_preserve_authored_rows();
     test_vobsub_pixel_groups_and_multiline_layout();

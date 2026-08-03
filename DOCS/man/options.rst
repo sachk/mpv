@@ -3047,18 +3047,21 @@ Subtitles
                    same authored line are kept in left-to-right order and
                    pulled together with ordinary dialogue spacing; authored
                    multiline rows remain separate. The complete layout is
-                   translated to ``--sub-pos`` and ``--sub-scale`` applies one
-                   common transform around its horizontal center and ink
-                   bottom, so scaling cannot displace the position selected by
-                   ``--sub-pos``.
+                   translated to ``--sub-pos`` across the complete output
+                   frame, including letterbox and pillarbox bars.
+                   ``--sub-scale`` applies one common transform around its
+                   horizontal center and ink bottom, so scaling cannot
+                   displace the position selected by ``--sub-pos``. Oversized
+                   layouts may use the bars up to the output edges.
 
     A ``--sub-pos`` value of 100 keeps the authored vertical placement. In
     ``all`` mode, distant same-line image objects are still joined into a
     readable dialogue row.
 
-    When ``--video-crop`` is set, positions are computed inside the cropped
-    picture, so subtitles authored into a letterbox bar move onto the image
-    instead of being scaled away with the bar.
+    When ``--video-crop`` is set, authored positions are first mapped from the
+    cropped picture. In ``all`` mode, the explicit position override is then
+    applied across the complete output frame instead of being confined to the
+    visible video rectangle.
 
     .. note::
 

@@ -7,6 +7,7 @@
  * version 2.1 of the License, or (at your option) any later version.
  */
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -66,11 +67,14 @@ int mp_image_subtitle_split_columns(const struct sub_bitmap *source, int extend,
         if (boundary || (x == ink_width && group_start >= 0)) {
             int view_x0 = group_start;
             int view_x1 = MPMIN(source->w, previous + 1 + extend * 2);
+            int display_x0 = lrint(view_x0 * source->dw / (double)source->w);
+            int display_x1 = lrint(view_x1 * source->dw / (double)source->w);
             struct sub_bitmap part = *source;
             part.bitmap = (uint8_t *)part.bitmap + view_x0 * 4;
             part.src_x += view_x0;
-            part.x += view_x0;
+            part.x += display_x0;
             part.w = view_x1 - view_x0;
+            part.dw = display_x1 - display_x0;
             output[out_count++] = part;
             group_start = -1;
         }

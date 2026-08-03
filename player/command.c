@@ -8431,14 +8431,17 @@ void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *
     if (flags & UPDATE_TERM)
         mp_update_logging(mpctx, false);
 
-    if (flags & (UPDATE_OSD | UPDATE_SUB_FILT | UPDATE_SUB_HARD)) {
+    if (flags & (UPDATE_OSD | UPDATE_SUB_FILT | UPDATE_SUB_HARD | UPDATE_SUB_ASS_HARD)) {
         for (int n = 0; n < num_ptracks[STREAM_SUB]; n++) {
             struct track *track = mpctx->current_track[n][STREAM_SUB];
             struct dec_sub *sub = track ? track->d_sub : NULL;
             if (sub) {
                 int ret = sub_control(sub, SD_CTRL_UPDATE_OPTS, &flags);
-                if (ret == CONTROL_OK && flags & (UPDATE_SUB_FILT | UPDATE_SUB_HARD)) {
+                if (ret == CONTROL_OK && flags & (UPDATE_SUB_FILT | UPDATE_SUB_HARD | UPDATE_SUB_ASS_HARD)) {
                     sub_redecode_cached_packets(sub);
+                    sub_reset(sub);
+                    if (track->selected && flags & (UPDATE_SUB_FILT | UPDATE_SUB_HARD))
+                        reselect_demux_stream(mpctx, track, true);
                 }
             }
         }

@@ -534,7 +534,7 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
             update_subtitle_speed(sub);
         m_config_cache_update(sub->shared_opts_cache);
         propagate = true;
-        if (flags & UPDATE_SUB_HARD) {
+        if (flags & (UPDATE_SUB_HARD | UPDATE_SUB_ASS_HARD)) {
             // forget about the previous preload because
             // UPDATE_SUB_HARD will cause a sub reinit
             // that clears all preloaded sub packets
