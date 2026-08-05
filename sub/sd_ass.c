@@ -40,6 +40,7 @@
 #include "ass_mp.h"
 #include "packer.h"
 #include "sd.h"
+#include "sub_ass_color.h"
 
 struct sd_ass_priv {
     struct ass_library *ass_library;
@@ -581,8 +582,6 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
         set_force_flags |= ASS_OVERRIDE_BIT_BLUR;
 #endif
     }
-    if (opts->ass_override_colors)
-        set_force_flags |= ASS_OVERRIDE_BIT_COLORS;
     if (shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE &&
         !opts->sub_scale_signs)
         set_force_flags |= ASS_OVERRIDE_BIT_SELECTIVE_FONT_SCALE;
@@ -787,6 +786,14 @@ done:
     // mangle_colors() modifies the color field, so copy the thing _before_.
     res = sub_bitmaps_copy(&ctx->copy_cache, res);
 
+    if (opts->ass_override_colors && res) {
+        uint32_t desired = MP_ASS_COLOR(opts->sub_style->color);
+        for (int n = 0; n < res->num_parts; n++) {
+            struct sub_bitmap *part = &res->parts[n];
+            part->libass.color = mp_ass_text_color_override(
+                part->libass.color, desired, track->styles, track->n_styles);
+        }
+    }
     if (!converted && res)
         mangle_colors(sd, res);
 

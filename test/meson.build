@@ -115,6 +115,12 @@ sub_recolor = executable('sub-recolor', files('sub_recolor.c'), include_director
                          link_with: test_utils)
 test('sub-recolor', sub_recolor)
 
+sub_ass_color = executable('sub-ass-color', files('sub_ass_color.c'),
+                           include_directories: incdir,
+                           objects: libmpv.extract_objects('sub/sub_ass_color.c'),
+                           link_with: test_utils)
+test('sub-ass-color', sub_ass_color)
+
 sub_image_geometry = executable('sub-image-geometry', files('sub_image_geometry.c'),
                                 include_directories: incdir,
                                 objects: libmpv.extract_objects(
