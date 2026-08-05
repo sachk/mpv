@@ -30,11 +30,11 @@ static void test_two_edge_upscale(void)
     uint8_t output[DW * DH * 4];
     make_glyph(source, SW, SH);
 
-    struct mp_sdf_scaler *scaler = mp_sdf_scaler_create(NULL, source, SW, SH, SW * 4, true);
+    struct mp_sdf_scaler *scaler = mp_sdf_scaler_create(NULL, source, SW, SH, SW * 4, true, 4);
     assert_true(scaler);
     assert_int_equal(mp_sdf_scaler_source_w(scaler), 16);
     assert_int_equal(mp_sdf_scaler_source_h(scaler), 16);
-    mp_sdf_scaler_render(scaler, output, DW, DH, DW * 4, 0.9f);
+    mp_sdf_scaler_render(scaler, output, DW, DH, DW * 4, 0.9f, NULL);
 
     const uint8_t *outside = pixel_at(output, DW * 4, 12, 32);
     const uint8_t *outline = pixel_at(output, DW * 4, 22, 32);
@@ -61,9 +61,9 @@ static void test_area_downscale_preserves_coverage(void)
     uint8_t output[DW * DH * 4];
     make_glyph(source, SW, SH);
 
-    struct mp_sdf_scaler *scaler = mp_sdf_scaler_create(NULL, source, SW, SH, SW * 4, false);
+    struct mp_sdf_scaler *scaler = mp_sdf_scaler_create(NULL, source, SW, SH, SW * 4, false, 4);
     assert_true(scaler);
-    mp_sdf_scaler_render(scaler, output, DW, DH, DW * 4, 1.0f);
+    mp_sdf_scaler_render(scaler, output, DW, DH, DW * 4, 1.0f, NULL);
 
     int alpha_sum = 0;
     for (int i = 0; i < DW * DH; i++)
@@ -74,9 +74,42 @@ static void test_area_downscale_preserves_coverage(void)
     talloc_free(scaler);
 }
 
+static void test_two_layer_shadow_extends_coverage(void)
+{
+    enum { SW = 8, SH = 8, DW = 96, DH = 96 };
+    uint8_t source[SW * SH * 4];
+    uint8_t output[DW * DH * 4];
+    make_glyph(source, SW, SH);
+
+    struct mp_sdf_scaler *scaler = mp_sdf_scaler_create(NULL, source, SW, SH, SW * 4, false, 8);
+    assert_true(scaler);
+    struct mp_sdf_shadow_params shadow = {
+        .enabled = true,
+        .core_sigma = 1.0f,
+        .core_grow = 1.0f,
+        .core_opacity = 0.7f,
+        .spread_enabled = true,
+        .spread_sigma = 6.0f,
+        .spread_x = 2.0f,
+        .spread_y = 3.0f,
+        .spread_opacity = 0.3f,
+    };
+    mp_sdf_scaler_render(scaler, output, DW, DH, DW * 4, 1.0f, &shadow);
+
+    const uint8_t *far = pixel_at(output, DW * 4, 2, 48);
+    const uint8_t *halo = pixel_at(output, DW * 4, 32, 48);
+    const uint8_t *glyph = pixel_at(output, DW * 4, 48, 48);
+    assert_true(far[3] == 0);
+    assert_true(halo[3] > 5 && halo[3] < 180);
+    assert_true(halo[0] < 2 && halo[1] < 2 && halo[2] < 2);
+    assert_true(glyph[3] > 250 && glyph[0] > 240 && glyph[1] > 240 && glyph[2] > 240);
+    talloc_free(scaler);
+}
+
 int main(void)
 {
     test_two_edge_upscale();
     test_area_downscale_preserves_coverage();
+    test_two_layer_shadow_extends_coverage();
     return 0;
 }

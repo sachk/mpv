@@ -45,6 +45,7 @@ struct sdf_source {
     const uint8_t *bitmap;
     int w, h, stride;
     struct mp_sdf_scaler *scaler;
+    int padding;
 };
 
 struct sdf_cache {
@@ -56,6 +57,7 @@ struct sdf_cache {
     struct mp_image *image;
     int packed_w, packed_h;
     float softness;
+    struct mp_sdf_shadow_params shadow;
     bool rendered_valid;
 };
 
@@ -693,15 +695,61 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int exten
         }
     }
 }
-static bool sdf_sources_match(const struct sdf_cache *cache, const struct sub_bitmaps *bitmaps)
+static struct mp_sdf_shadow_params sdf_shadow_params(const struct mp_subtitle_opts *opts)
+{
+    return (struct mp_sdf_shadow_params) {
+        .enabled = opts->sub_sdf_shadow,
+        .core_sigma = opts->sub_sdf_shadow_core_sigma,
+        .core_grow = opts->sub_sdf_shadow_core_grow,
+        .core_opacity = opts->sub_sdf_shadow_core_opacity,
+        .spread_enabled = opts->sub_sdf_shadow_spread,
+        .spread_sigma = opts->sub_sdf_shadow_spread_sigma,
+        .spread_grow = opts->sub_sdf_shadow_spread_grow,
+        .spread_x = opts->sub_sdf_shadow_spread_x,
+        .spread_y = opts->sub_sdf_shadow_spread_y,
+        .spread_opacity = opts->sub_sdf_shadow_spread_opacity,
+        .dither = opts->sub_sdf_shadow_dither,
+    };
+}
+
+static bool sdf_shadow_params_equal(const struct mp_sdf_shadow_params *a, const struct mp_sdf_shadow_params *b)
+{
+    return a->enabled == b->enabled && a->core_sigma == b->core_sigma && a->core_grow == b->core_grow
+        && a->core_opacity == b->core_opacity && a->spread_enabled == b->spread_enabled
+        && a->spread_sigma == b->spread_sigma && a->spread_grow == b->spread_grow && a->spread_x == b->spread_x
+        && a->spread_y == b->spread_y && a->spread_opacity == b->spread_opacity && a->dither == b->dither;
+}
+
+static int sdf_source_padding(const struct sub_bitmap *part, const struct mp_sdf_shadow_params *shadow)
+{
+    if (!shadow->enabled || part->w <= 0 || part->h <= 0)
+        return 4;
+    float scale = MPMIN(part->dw / (float)part->w, part->dh / (float)part->h);
+    if (!(scale > 0.0f))
+        return 4;
+
+    float reach = shadow->core_grow + 3.0f * shadow->core_sigma;
+    if (shadow->spread_enabled) {
+        float spread_reach = shadow->spread_grow + 3.0f * shadow->spread_sigma
+            + MPMAX(fabsf(shadow->spread_x), fabsf(shadow->spread_y));
+        reach = MPMAX(reach, spread_reach);
+    }
+    // One extra source pixel keeps the Catmull-Rom footprint inside the valid
+    // far field at the last visible shadow pixel.
+    return MPMAX(4, (int)ceilf(reach / scale) + 1);
+}
+
+static bool sdf_sources_match(
+    const struct sdf_cache *cache, const struct sub_bitmaps *bitmaps, const struct mp_sdf_shadow_params *shadow)
 {
     if (!cache || cache->num_sources != bitmaps->num_parts)
         return false;
     for (int i = 0; i < bitmaps->num_parts; i++) {
         const struct sub_bitmap *part = &bitmaps->parts[i];
         const struct sdf_source *source = &cache->sources[i];
+        int padding = sdf_source_padding(part, shadow);
         if (source->bitmap != part->bitmap || source->w != part->w || source->h != part->h
-            || source->stride != part->stride)
+            || source->stride != part->stride || source->padding != padding)
             return false;
     }
     return true;
@@ -709,7 +757,8 @@ static bool sdf_sources_match(const struct sdf_cache *cache, const struct sub_bi
 
 static bool prepare_sdf_sources(struct sd *sd, struct sub *current, const struct sub_bitmaps *bitmaps)
 {
-    if (sdf_sources_match(current->sdf, bitmaps))
+    struct mp_sdf_shadow_params shadow = sdf_shadow_params(sd->opts);
+    if (sdf_sources_match(current->sdf, bitmaps, &shadow))
         return true;
 
     struct sd_lavc_priv *priv = sd->priv;
@@ -735,8 +784,10 @@ static bool prepare_sdf_sources(struct sd *sd, struct sub *current, const struct
             .w = part->w,
             .h = part->h,
             .stride = part->stride,
+            .padding = sdf_source_padding(part, &shadow),
         };
-        source->scaler = mp_sdf_scaler_create(cache, source->bitmap, source->w, source->h, source->stride, dvd);
+        source->scaler
+            = mp_sdf_scaler_create(cache, source->bitmap, source->w, source->h, source->stride, dvd, source->padding);
         if (!source->scaler) {
             talloc_free(cache);
             return false;
@@ -758,7 +809,9 @@ static int render_sdf_subtitles(struct sd *sd, struct sub *current, struct sub_b
         return -1;
 
     struct sdf_cache *cache = current->sdf;
-    bool rerender = !cache->rendered_valid || cache->softness != sd->opts->sub_sdf_softness;
+    struct mp_sdf_shadow_params shadow = sdf_shadow_params(sd->opts);
+    bool rerender = !cache->rendered_valid || cache->softness != sd->opts->sub_sdf_softness
+        || !sdf_shadow_params_equal(&cache->shadow, &shadow);
     for (int i = 0; i < bitmaps->num_parts; i++) {
         const struct sub_bitmap *part = &bitmaps->parts[i];
         const struct sdf_source *source = &cache->sources[i];
@@ -820,9 +873,10 @@ static int render_sdf_subtitles(struct sd *sd, struct sub *current, struct sub_b
             uint8_t *destination
                 = cache->image->planes[0] + (size_t)pos.y * cache->image->stride[0] + (size_t)pos.x * 4;
             mp_sdf_scaler_render(cache->sources[i].scaler, destination, target_w, target_h, cache->image->stride[0],
-                sd->opts->sub_sdf_softness);
+                sd->opts->sub_sdf_softness, &shadow);
         }
         cache->softness = sd->opts->sub_sdf_softness;
+        cache->shadow = shadow;
         cache->rendered_valid = true;
     }
 

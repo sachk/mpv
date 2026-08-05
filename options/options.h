@@ -1,10 +1,10 @@
 #ifndef MPLAYER_OPTIONS_H
 #define MPLAYER_OPTIONS_H
 
+#include "common/common.h"
+#include "m_option.h"
 #include <stdbool.h>
 #include <stdint.h>
-#include "m_option.h"
-#include "common/common.h"
 
 typedef struct mp_vo_opts {
     struct m_obj_settings *video_driver_list;
@@ -89,7 +89,7 @@ typedef struct mp_vo_opts {
 
     struct m_geometry d3d11_composition_size;
 
-    int swapchain_depth;  // max number of images to render ahead
+    int swapchain_depth; // max number of images to render ahead
 
     struct m_geometry video_crop;
 } mp_vo_opts;
@@ -114,6 +114,17 @@ struct mp_subtitle_opts {
     bool ass_override_colors;
     float sub_gauss;
     float sub_sdf_softness;
+    bool sub_sdf_shadow;
+    float sub_sdf_shadow_core_sigma;
+    float sub_sdf_shadow_core_grow;
+    float sub_sdf_shadow_core_opacity;
+    bool sub_sdf_shadow_spread;
+    float sub_sdf_shadow_spread_sigma;
+    float sub_sdf_shadow_spread_grow;
+    float sub_sdf_shadow_spread_x;
+    float sub_sdf_shadow_spread_y;
+    float sub_sdf_shadow_spread_opacity;
+    bool sub_sdf_shadow_dither;
     bool sub_gray;
     bool ass_enabled;
     float sub_line_spacing;
@@ -216,8 +227,8 @@ typedef struct MPOpts {
     int force_vo;
     float softvol_volume;
     int rgain_mode;
-    float rgain_preamp;         // Set replaygain pre-amplification
-    bool rgain_clip;             // Enable/disable clipping prevention
+    float rgain_preamp; // Set replaygain pre-amplification
+    bool rgain_clip; // Enable/disable clipping prevention
     float rgain_fallback;
     bool softvol_mute;
     float softvol_max;

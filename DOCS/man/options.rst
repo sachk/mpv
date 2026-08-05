@@ -2992,6 +2992,34 @@ Subtitles
     crisper edge; values above 1.0 produce a softer edge. Downscaling always
     uses exact area coverage and is unaffected by this option.
 
+``--sub-sdf-shadow=<yes|no>``
+    Add an analytic two-layer black shadow while reconstructing image
+    subtitles (default: yes). Shadow dimensions use destination pixels, so the
+    result stays visually constant as the subtitle or window is resized.
+
+``--sub-sdf-shadow-core-sigma=<0.1-4.0>``
+``--sub-sdf-shadow-core-grow=<0.0-4.0>``
+``--sub-sdf-shadow-core-opacity=<0.0-1.0>``
+    Configure the tight edge-protection layer's Gaussian softness, outward
+    growth, and opacity (defaults: 1.0, 1.0, and 0.7).
+
+``--sub-sdf-shadow-spread=<yes|no>``
+    Enable the wide contrast layer (default: yes).
+
+``--sub-sdf-shadow-spread-sigma=<1.0-16.0>``
+``--sub-sdf-shadow-spread-grow=<0.0-8.0>``
+``--sub-sdf-shadow-spread-x=<-16.0-16.0>``
+``--sub-sdf-shadow-spread-y=<-16.0-16.0>``
+``--sub-sdf-shadow-spread-opacity=<0.0-1.0>``
+    Configure the wide layer's Gaussian softness, outward growth, horizontal
+    and vertical offset, and opacity (defaults: 6.0, 0.0, 2.0, 3.0, and 0.3).
+    All dimensions use destination pixels.
+
+``--sub-sdf-shadow-dither=<yes|no>``
+    Apply triangular-PDF output dithering to partial shadow coverage to prevent
+    visible banding (default: yes).
+
+
 
 ``--sub-gray``
     Convert image subtitles to grayscale. Can help to make yellow DVD/Vobsubs

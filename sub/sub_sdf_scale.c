@@ -175,7 +175,7 @@ static void unbin_color(size_t index, float color[3])
 }
 
 struct mp_sdf_scaler *mp_sdf_scaler_create(
-    void *ta_parent, const uint8_t *src, int w, int h, int stride, bool clamp_far_field)
+    void *ta_parent, const uint8_t *src, int w, int h, int stride, bool clamp_far_field, int padding)
 {
     if (!src || w <= 0 || h <= 0 || stride < w * 4)
         return NULL;
@@ -183,7 +183,7 @@ struct mp_sdf_scaler *mp_sdf_scaler_create(
     struct mp_sdf_scaler *s = talloc_zero(ta_parent, struct mp_sdf_scaler);
     if (!s)
         return NULL;
-    s->padding = 4;
+    s->padding = MPMAX(4, padding);
     s->clamp_far_field = clamp_far_field;
     int pw = w + 2 * s->padding;
     int ph = h + 2 * s->padding;
@@ -377,8 +377,35 @@ static inline uint8_t to_byte(float value)
 {
     return lrintf(MPCLAMP(value, 0.0f, 1.0f) * 255.0f);
 }
+static float gauss_step(float distance, float sigma)
+{
+    if (sigma < 1e-3f)
+        return distance >= 0.0f ? 1.0f : 0.0f;
+    return 0.5f * erfcf(-distance / (sigma * M_SQRT2));
+}
 
-void mp_sdf_scaler_render(struct mp_sdf_scaler *s, uint8_t *dst, int w, int h, int stride, float softness)
+static float shadow_alpha(const struct plane *sdf, int x, int y, float scale_x, float scale_y, float distance_scale,
+    float sigma, float grow, float dx, float dy, float opacity)
+{
+    float u = (x + 0.5f - dx) / scale_x - 0.5f;
+    float v = (y + 0.5f - dy) / scale_y - 0.5f;
+    float distance = sample_catmull_rom(sdf, u, v, 0.0f) * distance_scale + grow;
+    return gauss_step(distance, sigma) * opacity;
+}
+
+static float interleaved_gradient_noise(int x, int y)
+{
+    float value = 52.9829189f * fmodf(0.06711056f * x + 0.00583715f * y, 1.0f);
+    return fmodf(value, 1.0f);
+}
+
+static void shadow_over(float alpha, float *accum_alpha)
+{
+    *accum_alpha = alpha + *accum_alpha * (1.0f - alpha);
+}
+
+void mp_sdf_scaler_render(struct mp_sdf_scaler *s, uint8_t *dst, int w, int h, int stride, float softness,
+    const struct mp_sdf_shadow_params *shadow)
 {
     if (!s || !dst || w <= 0 || h <= 0 || stride < w * 4)
         return;
@@ -434,11 +461,29 @@ void mp_sdf_scaler_render(struct mp_sdf_scaler *s, uint8_t *dst, int w, int h, i
                         value[c] = MPCLAMP(sample_catmull_rom(&s->rgb[c], u, v, 0.0f), 0.0f, a);
                 }
             }
+            float shadow_a = 0.0f;
+            if (shadow && shadow->enabled) {
+                if (shadow->spread_enabled) {
+                    float spread = shadow_alpha(&s->sdf_alpha, x, y, scale_x, scale_y, scale, shadow->spread_sigma,
+                        shadow->spread_grow, shadow->spread_x, shadow->spread_y, shadow->spread_opacity);
+                    shadow_over(spread, &shadow_a);
+                }
+                float core = shadow_alpha(&s->sdf_alpha, x, y, scale_x, scale_y, scale, shadow->core_sigma,
+                    shadow->core_grow, 0.0f, 0.0f, shadow->core_opacity);
+                shadow_over(core, &shadow_a);
+            }
+
+            float glyph_transparency = 1.0f - a;
+            float output_a = a + shadow_a * glyph_transparency;
+            float dither = 0.0f;
+            if (shadow && shadow->dither && output_a > 0.0f && output_a < 1.0f) {
+                dither = (interleaved_gradient_noise(x, y) + interleaved_gradient_noise(x + 13, y + 7) - 1.0f) / 255.0f;
+            }
             uint8_t *pixel = row + (size_t)x * 4;
-            pixel[0] = to_byte(value[2]);
-            pixel[1] = to_byte(value[1]);
-            pixel[2] = to_byte(value[0]);
-            pixel[3] = to_byte(a);
+            pixel[0] = to_byte(value[2] + dither);
+            pixel[1] = to_byte(value[1] + dither);
+            pixel[2] = to_byte(value[0] + dither);
+            pixel[3] = to_byte(output_a + dither);
         }
     }
 
