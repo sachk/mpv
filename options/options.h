@@ -113,6 +113,7 @@ struct mp_subtitle_opts {
     bool sub_scale_signs;
     bool ass_override_colors;
     float sub_gauss;
+    float sub_sdf_softness;
     bool sub_gray;
     bool ass_enabled;
     float sub_line_spacing;

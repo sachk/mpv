@@ -226,6 +226,7 @@ sources = files(
     'sub/sub_image_geometry.c',
     'sub/sub_image_segmentation.c',
     'sub/sub_recolor.c',
+    'sub/sub_sdf_scale.c',
 
     ## Video
     'video/csputils.c',

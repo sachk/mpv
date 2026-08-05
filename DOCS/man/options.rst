@@ -2986,6 +2986,12 @@ Subtitles
     .. note::
 
         Never applied to text subtitles.
+``--sub-sdf-softness=<0.5-2.0>``
+    Set the anti-aliasing ramp width used when reconstructing image subtitles
+    with the signed-distance scaler (default: 1.0). Values below 1.0 produce a
+    crisper edge; values above 1.0 produce a softer edge. Downscaling always
+    uses exact area coverage and is unaffected by this option.
+
 
 ``--sub-gray``
     Convert image subtitles to grayscale. Can help to make yellow DVD/Vobsubs

@@ -35,10 +35,29 @@
 #include "sub_image_geometry.h"
 #include "sub_image_segmentation.h"
 #include "sub_recolor.h"
+#include "sub_sdf_scale.h"
 #include "video/mp_image.h"
 #include "video/out/bitmap_packer.h"
 
 #define MAX_QUEUE 4
+
+struct sdf_source {
+    const uint8_t *bitmap;
+    int w, h, stride;
+    struct mp_sdf_scaler *scaler;
+};
+
+struct sdf_cache {
+    struct sdf_source *sources;
+    int num_sources;
+    struct sub_bitmap *rendered;
+    int *target_sizes;
+    struct bitmap_packer *packer;
+    struct mp_image *image;
+    int packed_w, packed_h;
+    float softness;
+    bool rendered_valid;
+};
 
 struct sub {
     bool valid;
@@ -54,6 +73,7 @@ struct sub {
     double pts;
     double endpts;
     int64_t id;
+    struct sdf_cache *sdf;
 };
 
 struct seekpoint {
@@ -203,6 +223,7 @@ static void clear_sub(struct sub *sub)
     sub->count = 0;
     sub->pts = MP_NOPTS_VALUE;
     sub->endpts = MP_NOPTS_VALUE;
+    TA_FREEP(&sub->sdf);
     if (sub->valid)
         avsubtitle_free(&sub->avsub);
     sub->valid = false;
@@ -247,6 +268,7 @@ static void read_sub_bitmaps(struct sd *sd, struct sub *sub)
     struct mp_subtitle_opts *opts = sd->opts;
     struct sd_lavc_priv *priv = sd->priv;
     AVSubtitle *avsub = &sub->avsub;
+    TA_FREEP(&sub->sdf);
 
     MP_TARRAY_GROW(priv, sub->inbitmaps, avsub->num_rects);
 
@@ -671,6 +693,153 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int exten
         }
     }
 }
+static bool sdf_sources_match(const struct sdf_cache *cache, const struct sub_bitmaps *bitmaps)
+{
+    if (!cache || cache->num_sources != bitmaps->num_parts)
+        return false;
+    for (int i = 0; i < bitmaps->num_parts; i++) {
+        const struct sub_bitmap *part = &bitmaps->parts[i];
+        const struct sdf_source *source = &cache->sources[i];
+        if (source->bitmap != part->bitmap || source->w != part->w || source->h != part->h
+            || source->stride != part->stride)
+            return false;
+    }
+    return true;
+}
+
+static bool prepare_sdf_sources(struct sd *sd, struct sub *current, const struct sub_bitmaps *bitmaps)
+{
+    if (sdf_sources_match(current->sdf, bitmaps))
+        return true;
+
+    struct sd_lavc_priv *priv = sd->priv;
+    struct sdf_cache *cache = talloc_zero(priv, struct sdf_cache);
+    if (!cache)
+        return false;
+    cache->num_sources = bitmaps->num_parts;
+    cache->sources = talloc_zero_array(cache, struct sdf_source, cache->num_sources);
+    cache->rendered = talloc_array(cache, struct sub_bitmap, cache->num_sources);
+    cache->target_sizes = talloc_zero_array(cache, int, cache->num_sources * 2);
+    cache->packer = talloc_zero(cache, struct bitmap_packer);
+    if (!cache->sources || !cache->rendered || !cache->target_sizes || !cache->packer) {
+        talloc_free(cache);
+        return false;
+    }
+
+    bool dvd = priv->avctx->codec_id == AV_CODEC_ID_DVD_SUBTITLE;
+    for (int i = 0; i < cache->num_sources; i++) {
+        const struct sub_bitmap *part = &bitmaps->parts[i];
+        struct sdf_source *source = &cache->sources[i];
+        *source = (struct sdf_source) {
+            .bitmap = part->bitmap,
+            .w = part->w,
+            .h = part->h,
+            .stride = part->stride,
+        };
+        source->scaler = mp_sdf_scaler_create(cache, source->bitmap, source->w, source->h, source->stride, dvd);
+        if (!source->scaler) {
+            talloc_free(cache);
+            return false;
+        }
+    }
+
+    TA_FREEP(&current->sdf);
+    current->sdf = cache;
+    return true;
+}
+
+// Render the final-sized BGRA atlas here so every VO, including Starfish's
+// overlay plane, receives the same reconstruction instead of scaling coverage
+// with its backend-specific bilinear filter. Returns -1 when the original atlas
+// should be used, 0 for a cached render, and 1 when pixels were regenerated.
+static int render_sdf_subtitles(struct sd *sd, struct sub *current, struct sub_bitmaps *bitmaps)
+{
+    if (!bitmaps->num_parts || !prepare_sdf_sources(sd, current, bitmaps))
+        return -1;
+
+    struct sdf_cache *cache = current->sdf;
+    bool rerender = !cache->rendered_valid || cache->softness != sd->opts->sub_sdf_softness;
+    for (int i = 0; i < bitmaps->num_parts; i++) {
+        const struct sub_bitmap *part = &bitmaps->parts[i];
+        const struct sdf_source *source = &cache->sources[i];
+        int padding = mp_sdf_scaler_padding(source->scaler);
+        float sx = part->dw / (float)source->w;
+        float sy = part->dh / (float)source->h;
+        if (!(sx > 0.0f) || !(sy > 0.0f))
+            return -1;
+
+        int target_w = MPMAX(1, lrintf(mp_sdf_scaler_source_w(source->scaler) * sx));
+        int target_h = MPMAX(1, lrintf(mp_sdf_scaler_source_h(source->scaler) * sy));
+        int x = lrintf(part->x - padding * sx);
+        int y = lrintf(part->y - padding * sy);
+        if (cache->target_sizes[i * 2] != target_w || cache->target_sizes[i * 2 + 1] != target_h) {
+            rerender = true;
+        }
+        cache->target_sizes[i * 2] = target_w;
+        cache->target_sizes[i * 2 + 1] = target_h;
+        cache->rendered[i] = *part;
+        cache->rendered[i].x = x;
+        cache->rendered[i].y = y;
+        cache->rendered[i].w = target_w;
+        cache->rendered[i].h = target_h;
+        cache->rendered[i].dw = target_w;
+        cache->rendered[i].dh = target_h;
+    }
+
+    if (rerender) {
+        packer_set_size(cache->packer, cache->num_sources);
+        cache->packer->padding = 0;
+        for (int i = 0; i < cache->num_sources; i++) {
+            cache->packer->in[i] = (struct pos) {
+                cache->target_sizes[i * 2],
+                cache->target_sizes[i * 2 + 1],
+            };
+        }
+        if (packer_pack(cache->packer) < 0)
+            return -1;
+
+        struct pos bounds[2];
+        packer_get_bb(cache->packer, bounds);
+        cache->packed_w = bounds[1].x;
+        cache->packed_h = bounds[1].y;
+        if (!cache->image || cache->image->w < cache->packer->w || cache->image->h < cache->packer->h) {
+            TA_FREEP(&cache->image);
+            cache->image = mp_image_alloc(IMGFMT_BGRA, cache->packer->w, cache->packer->h);
+            if (!cache->image)
+                return -1;
+            talloc_steal(cache, cache->image);
+        }
+        if (!mp_image_make_writeable(cache->image))
+            return -1;
+        mp_image_clear(cache->image, 0, 0, cache->image->w, cache->image->h);
+
+        for (int i = 0; i < cache->num_sources; i++) {
+            struct pos pos = cache->packer->result[i];
+            int target_w = cache->target_sizes[i * 2];
+            int target_h = cache->target_sizes[i * 2 + 1];
+            uint8_t *destination
+                = cache->image->planes[0] + (size_t)pos.y * cache->image->stride[0] + (size_t)pos.x * 4;
+            mp_sdf_scaler_render(cache->sources[i].scaler, destination, target_w, target_h, cache->image->stride[0],
+                sd->opts->sub_sdf_softness);
+        }
+        cache->softness = sd->opts->sub_sdf_softness;
+        cache->rendered_valid = true;
+    }
+
+    for (int i = 0; i < cache->num_sources; i++) {
+        struct pos pos = cache->packer->result[i];
+        cache->rendered[i].src_x = pos.x;
+        cache->rendered[i].src_y = pos.y;
+        cache->rendered[i].stride = cache->image->stride[0];
+        cache->rendered[i].bitmap
+            = cache->image->planes[0] + (size_t)pos.y * cache->image->stride[0] + (size_t)pos.x * 4;
+    }
+    bitmaps->parts = cache->rendered;
+    bitmaps->packed = cache->image;
+    bitmaps->packed_w = cache->packed_w;
+    bitmaps->packed_h = cache->packed_h;
+    return rerender;
+}
 
 static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int format, double pts)
 {
@@ -777,6 +946,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int f
             sub->dh += sub->dh * delta * 2;
         }
     }
+    int sdf_render = render_sdf_subtitles(sd, current, res);
+    if (sdf_render > 0)
+        res->change_id++;
 
     if (priv->prevret_num != res->num_parts)
         res->change_id++;

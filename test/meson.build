@@ -114,6 +114,12 @@ sub_recolor = executable('sub-recolor', files('sub_recolor.c'), include_director
                          objects: libmpv.extract_objects('sub/sub_recolor.c'),
                          link_with: test_utils)
 test('sub-recolor', sub_recolor)
+sub_sdf_scale = executable('sub-sdf-scale', files('sub_sdf_scale.c'),
+                           include_directories: incdir,
+                           objects: libmpv.extract_objects('sub/sub_sdf_scale.c'),
+                           link_with: test_utils)
+test('sub-sdf-scale', sub_sdf_scale)
+
 
 sub_ass_color = executable('sub-ass-color', files('sub_ass_color.c'),
                            include_directories: incdir,
