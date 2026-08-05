@@ -581,6 +581,8 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
         set_force_flags |= ASS_OVERRIDE_BIT_BLUR;
 #endif
     }
+    if (opts->ass_override_colors)
+        set_force_flags |= ASS_OVERRIDE_BIT_COLORS;
     if (shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE &&
         !opts->sub_scale_signs)
         set_force_flags |= ASS_OVERRIDE_BIT_SELECTIVE_FONT_SCALE;

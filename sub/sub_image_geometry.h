@@ -16,6 +16,8 @@ struct sub_bitmaps;
 struct mp_osd_res;
 
 struct mp_rect mp_image_subtitle_viewport(struct mp_osd_res output, bool allow_margins);
+float mp_image_subtitle_text_scale(
+    const struct sub_bitmaps *imgs, int extend, float user_scale, struct mp_rect visible);
 void mp_image_subtitle_reposition_all(struct sub_bitmaps *imgs, int extend, struct mp_rect visible, float sub_pos);
 void mp_image_subtitle_scale_all(struct sub_bitmaps *imgs, int extend, float scale, struct mp_rect visible);
 

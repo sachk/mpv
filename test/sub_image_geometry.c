@@ -251,6 +251,30 @@ static void test_vobsub_pixel_groups_and_multiline_layout(void)
     assert_int_equal(ink_gap, (H - EXTEND * 2) / 2);
 }
 
+static void test_bitmap_text_scale_detects_alpha_row_height(void)
+{
+    enum { W = 300, H = 100 };
+    uint32_t pixels[W * H] = { 0 };
+    fill_rect(pixels, W, 20, 10, 280, 40);
+    fill_rect(pixels, W, 30, 60, 270, 90);
+
+    struct sub_bitmap part = bitmap(100, 700, W, H);
+    part.bitmap = pixels;
+    part.stride = W * 4;
+    struct sub_bitmaps imgs = {
+        .format = SUBBITMAP_BGRA,
+        .parts = &part,
+        .num_parts = 1,
+    };
+    struct mp_rect visible = { 0, 0, 1920, 1000 };
+
+    float normal = mp_image_subtitle_text_scale(&imgs, 0, 1.0f, visible);
+    float larger = mp_image_subtitle_text_scale(&imgs, 0, 1.25f, visible);
+
+    assert_true(fabsf(normal - 52.0f / 30.0f) < 0.01f);
+    assert_true(fabsf(larger - 65.0f / 30.0f) < 0.01f);
+}
+
 int main(void)
 {
     test_authored_y_normalizes_to_one_anchor();
@@ -262,5 +286,6 @@ int main(void)
     test_distant_groups_compact_per_source_line();
     test_pgs_multipart_speakers_preserve_authored_rows();
     test_vobsub_pixel_groups_and_multiline_layout();
+    test_bitmap_text_scale_detects_alpha_row_height();
     return 0;
 }

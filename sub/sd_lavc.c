@@ -758,26 +758,23 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int f
     }
     osd_rescale_bitmaps(res, mp_rect_w(vis), mp_rect_h(vis), d, video_par);
     struct mp_rect output_visible = mp_image_subtitle_viewport(d, opts->sub_use_margins);
+    float image_scale = mp_image_subtitle_text_scale(
+        res, current->extend, sd->shared_opts->sub_scale[sd->order],
+        output_visible);
     if (opts->sub_image_position == 2) {
         mp_image_subtitle_reposition_all(res, current->extend, output_visible, sd->shared_opts->sub_pos[sd->order]);
-    }
+        mp_image_subtitle_scale_all(res, current->extend, image_scale, output_visible);
+    } else if (image_scale != 1.0f) {
+        for (int n = 0; n < res->num_parts; n++) {
+            struct sub_bitmap *sub = &res->parts[n];
+            float delta = (image_scale - 1.0f) / 2;
 
-    float scale = sd->shared_opts->sub_scale[sd->order];
-    if (scale != 1.0) {
-        if (opts->sub_image_position == 2) {
-            mp_image_subtitle_scale_all(res, current->extend, scale, output_visible);
-        } else {
-            for (int n = 0; n < res->num_parts; n++) {
-                struct sub_bitmap *sub = &res->parts[n];
-                float shit = (scale - 1.0f) / 2;
-
-                // Preserve the historical per-part center scaling unless all
-                // authored image geometry is explicitly overridden.
-                sub->x -= sub->dw * shit;
-                sub->y -= sub->dh * shit;
-                sub->dw += sub->dw * shit * 2;
-                sub->dh += sub->dh * shit * 2;
-            }
+            // Preserve the historical per-part center scaling unless all
+            // authored image geometry is explicitly overridden.
+            sub->x -= sub->dw * delta;
+            sub->y -= sub->dh * delta;
+            sub->dw += sub->dw * delta * 2;
+            sub->dh += sub->dh * delta * 2;
         }
     }
 

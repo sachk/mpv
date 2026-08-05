@@ -180,6 +180,79 @@ void mp_image_subtitle_reposition_all(struct sub_bitmaps *imgs, int extend, stru
     }
 }
 
+static bool bitmap_row_has_ink(const struct sub_bitmap *part, int y)
+{
+    const uint8_t *row = (const uint8_t *)part->bitmap + y * part->stride;
+    for (int x = 0; x < part->w; x++) {
+        if (row[x * 4 + 3] >= 16)
+            return true;
+    }
+    return false;
+}
+
+static void add_detected_line(
+    const struct sub_bitmap *part, int source_height, float target, float *height_sum, int *height_count)
+{
+    float display_height = source_height * part->dh / (float)part->h;
+    if (display_height >= target * 0.2f && display_height <= target * 4.0f) {
+        *height_sum += display_height;
+        *height_count += 1;
+    }
+}
+
+float mp_image_subtitle_text_scale(
+    const struct sub_bitmaps *imgs, int extend, float user_scale, struct mp_rect visible)
+{
+    if (!imgs || imgs->num_parts < 1 || user_scale <= 0.0f || mp_rect_h(visible) <= 0)
+        return user_scale;
+
+    // mpv's default 55-point text occupies about 5.2% of a 720p-relative
+    // frame after libass font metrics are applied. Bitmap subtitle canvases
+    // vary wildly, so measure occupied alpha-row bands rather than their boxes.
+    float target = mp_rect_h(visible) * 0.052f;
+    float height_sum = 0.0f;
+    int height_count = 0;
+    if (imgs->format == SUBBITMAP_BGRA) {
+        for (int i = 0; i < imgs->num_parts; i++) {
+            const struct sub_bitmap *part = &imgs->parts[i];
+            if (!part->bitmap || part->w <= 0 || part->h <= 0 || part->dh <= 0)
+                continue;
+            int band_start = -1;
+            int last_ink = -1;
+            int join_gap = MPMAX(1, part->h / 80);
+            for (int y = 0; y < part->h; y++) {
+                if (bitmap_row_has_ink(part, y)) {
+                    if (band_start < 0)
+                        band_start = y;
+                    last_ink = y;
+                } else if (band_start >= 0 && y - last_ink > join_gap) {
+                    add_detected_line(part, last_ink - band_start + 1, target, &height_sum, &height_count);
+                    band_start = -1;
+                    last_ink = -1;
+                }
+            }
+            if (band_start >= 0)
+                add_detected_line(part, last_ink - band_start + 1, target, &height_sum, &height_count);
+        }
+    }
+
+    if (height_count == 0) {
+        for (int i = 0; i < imgs->num_parts; i++) {
+            struct mp_rect ink = part_ink(&imgs->parts[i], extend);
+            int height = ink.y1 - ink.y0;
+            if (height > 0) {
+                height_sum += height;
+                height_count++;
+            }
+        }
+    }
+    if (height_count == 0)
+        return user_scale;
+
+    float detected = height_sum / height_count;
+    return MPCLAMP(target * user_scale / detected, 0.5f, 2.5f);
+}
+
 void mp_image_subtitle_scale_all(struct sub_bitmaps *imgs, int extend, float scale, struct mp_rect visible)
 {
     if (!imgs || imgs->num_parts < 1 || scale == 1.0f || scale <= 0.0f)
