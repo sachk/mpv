@@ -592,9 +592,7 @@ static int compare_int(const void *pa, const void *pb)
 }
 
 // Place image subtitles the way libass places text ones: anchor the bottom of
-// the text at --sub-pos, counted from the bottom of the visible picture. A
-// value of 100 means "wherever the author put it", matching both sd_ass and
-// the previous behaviour here.
+// the text at --sub-pos, counted within the usable video viewport.
 static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int extend, struct mp_rect vis)
 {
     struct sd_lavc_priv *priv = sd->priv;
@@ -605,8 +603,6 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int exten
     if (!opts->sub_image_position || n < 1)
         return;
     if (opts->sub_image_position == 2)
-        return;
-    if (sub_pos == 100.0f)
         return;
 
     MP_TARRAY_GROW(priv, priv->sort_scratch, n);
@@ -647,6 +643,8 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int exten
             prev_bottom = ink.y1;
         } else {
             struct mp_rect *b = &blocks[num_blocks - 1];
+            b->x0 = MPMIN(b->x0, ink.x0);
+            b->x1 = MPMAX(b->x1, ink.x1);
             b->y0 = MPMIN(b->y0, ink.y0);
             b->y1 = MPMAX(b->y1, ink.y1);
             prev_bottom = MPMAX(prev_bottom, ink.y1);
@@ -664,10 +662,13 @@ static void reposition_bitmaps(struct sd *sd, struct sub_bitmaps *res, int exten
     int dy = target - blocks[anchor].y1;
     // Never push a block taller than the picture off the top.
     dy = MPMAX(dy, vis.y0 - blocks[anchor].y0);
+    int dx = (vis.x0 + vis.x1 - blocks[anchor].x0 - blocks[anchor].x1) / 2;
 
     for (int i = 0; i < n; i++) {
-        if (opts->sub_image_position == 2 || block_of[i] == anchor)
+        if (opts->sub_image_position == 2 || block_of[i] == anchor) {
+            res->parts[i].x += dx;
             res->parts[i].y += dy;
+        }
     }
 }
 
@@ -756,10 +757,9 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int f
         }
     }
     osd_rescale_bitmaps(res, mp_rect_w(vis), mp_rect_h(vis), d, video_par);
-    struct mp_rect output_visible = { 0, 0, d.w, d.h };
+    struct mp_rect output_visible = mp_image_subtitle_viewport(d, opts->sub_use_margins);
     if (opts->sub_image_position == 2) {
-        mp_image_subtitle_reposition_all(
-            res, current->extend, output_visible, sd->shared_opts->sub_pos[sd->order]);
+        mp_image_subtitle_reposition_all(res, current->extend, output_visible, sd->shared_opts->sub_pos[sd->order]);
     }
 
     float scale = sd->shared_opts->sub_scale[sd->order];

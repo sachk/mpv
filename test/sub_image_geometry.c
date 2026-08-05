@@ -28,6 +28,25 @@ static int ink_bottom(const struct sub_bitmaps *imgs, int extend)
     return bottom;
 }
 
+static int ink_horizontal_center(const struct sub_bitmaps *imgs)
+{
+    int left = INT_MAX;
+    int right = INT_MIN;
+    for (int i = 0; i < imgs->num_parts; i++) {
+        left = MPMIN(left, imgs->parts[i].x);
+        right = MPMAX(right, imgs->parts[i].x + imgs->parts[i].dw);
+    }
+    return (left + right) / 2;
+}
+
+static void assert_rect_matches(struct mp_rect actual, struct mp_rect expected)
+{
+    assert_int_equal(actual.x0, expected.x0);
+    assert_int_equal(actual.y0, expected.y0);
+    assert_int_equal(actual.x1, expected.x1);
+    assert_int_equal(actual.y1, expected.y1);
+}
+
 static void test_authored_y_normalizes_to_one_anchor(void)
 {
     struct mp_rect visible = { 0, 0, 1920, 1080 };
@@ -126,6 +145,35 @@ static void test_full_output_allows_letterbox_and_pillarbox_placement(void)
     assert_true(wider_than_output_part.dw > mp_rect_w(output));
 }
 
+static void test_video_viewport_excludes_black_bars(void)
+{
+    struct mp_osd_res output = {
+        .w = 1920,
+        .h = 1080,
+        .ml = 160,
+        .mr = 160,
+        .mt = 90,
+        .mb = 90,
+    };
+    assert_rect_matches(mp_image_subtitle_viewport(output, true), ((struct mp_rect) { 0, 0, 1920, 1080 }));
+    assert_rect_matches(mp_image_subtitle_viewport(output, false), ((struct mp_rect) { 160, 90, 1760, 990 }));
+
+    output.ml = output.mr = 1000;
+    assert_rect_matches(mp_image_subtitle_viewport(output, false), ((struct mp_rect) { 0, 0, 1920, 1080 }));
+}
+
+static void test_reposition_centers_and_keeps_100_continuous(void)
+{
+    struct mp_rect visible = { 160, 90, 1760, 990 };
+    struct sub_bitmap part = bitmap(300, 400, 400, 80);
+    struct sub_bitmaps imgs = { .parts = &part, .num_parts = 1 };
+
+    mp_image_subtitle_reposition_all(&imgs, 0, visible, 100);
+
+    assert_int_equal(part.x + part.dw / 2, (visible.x0 + visible.x1) / 2);
+    assert_int_equal(ink_bottom(&imgs, 0), visible.y1);
+}
+
 static void test_distant_groups_compact_per_source_line(void)
 {
     struct mp_rect visible = { 0, 0, 1200, 800 };
@@ -135,15 +183,14 @@ static void test_distant_groups_compact_per_source_line(void)
         bitmap(300, 670, 220, 40),
     };
     struct sub_bitmaps imgs = { .parts = parts, .num_parts = 3 };
-    int second_line_x = parts[2].x;
 
     mp_image_subtitle_reposition_all(&imgs, 0, visible, 100);
 
     assert_true(parts[0].x < parts[1].x);
     assert_int_equal(parts[1].x - (parts[0].x + parts[0].w), 20);
-    assert_int_equal(parts[2].x, second_line_x);
-    assert_int_equal(parts[0].y, 600);
-    assert_int_equal(parts[2].y, 670);
+    assert_int_equal(ink_horizontal_center(&imgs), (visible.x0 + visible.x1) / 2);
+    assert_int_equal(parts[2].y - parts[0].y, 70);
+    assert_int_equal(ink_bottom(&imgs, 0), visible.y1);
 }
 
 static void test_pgs_multipart_speakers_preserve_authored_rows(void)
@@ -163,6 +210,8 @@ static void test_pgs_multipart_speakers_preserve_authored_rows(void)
     assert_int_equal(parts[0].y, parts[1].y);
     assert_int_equal(parts[2].y, parts[3].y);
     assert_int_equal(parts[2].y - parts[0].y, 40);
+    assert_true(labs(ink_horizontal_center(&imgs) - 600) <= 1);
+    assert_int_equal(ink_bottom(&imgs, 0), 800);
 }
 
 static void fill_rect(uint32_t *pixels, int stride, int x0, int y0, int x1, int y1)
@@ -208,6 +257,8 @@ int main(void)
     test_bottom_anchored_multipart_scale();
     test_padding_noops_and_top_clamp();
     test_full_output_allows_letterbox_and_pillarbox_placement();
+    test_video_viewport_excludes_black_bars();
+    test_reposition_centers_and_keeps_100_continuous();
     test_distant_groups_compact_per_source_line();
     test_pgs_multipart_speakers_preserve_authored_rows();
     test_vobsub_pixel_groups_and_multiline_layout();

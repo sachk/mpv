@@ -14,6 +14,20 @@
 #include "sub/osd.h"
 #include "sub_image_geometry.h"
 
+struct mp_rect mp_image_subtitle_viewport(struct mp_osd_res output, bool allow_margins)
+{
+    struct mp_rect full = { 0, 0, output.w, output.h };
+    if (allow_margins)
+        return full;
+
+    struct mp_rect video = {
+        .x0 = MPMAX(0, output.ml),
+        .y0 = MPMAX(0, output.mt),
+        .x1 = MPMIN(output.w, output.w - output.mr),
+        .y1 = MPMIN(output.h, output.h - output.mb),
+    };
+    return mp_rect_w(video) > 0 && mp_rect_h(video) > 0 ? video : full;
+}
 static struct mp_rect part_ink(const struct sub_bitmap *part, int extend)
 {
     int pad_x = part->w > 0 ? lrint(extend * part->dw / (double)part->w) : 0;
@@ -154,13 +168,16 @@ void mp_image_subtitle_reposition_all(struct sub_bitmaps *imgs, int extend, stru
         ink.x1 = MPMAX(ink.x1, part.x1);
         ink.y1 = MPMAX(ink.y1, part.y1);
     }
-    if (ink.x0 >= ink.x1 || ink.y0 >= ink.y1 || sub_pos == 100.0f)
+    if (ink.x0 >= ink.x1 || ink.y0 >= ink.y1)
         return;
 
+    int dx = (visible.x0 + visible.x1 - ink.x0 - ink.x1) / 2;
     int target = visible.y1 - lrint(mp_rect_h(visible) * (100.0f - sub_pos) / 100.0f);
     int dy = MPMAX(target - ink.y1, visible.y0 - ink.y0);
-    for (int i = 0; i < imgs->num_parts; i++)
+    for (int i = 0; i < imgs->num_parts; i++) {
+        imgs->parts[i].x += dx;
         imgs->parts[i].y += dy;
+    }
 }
 
 void mp_image_subtitle_scale_all(struct sub_bitmaps *imgs, int extend, float scale, struct mp_rect visible)
