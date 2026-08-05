@@ -915,8 +915,6 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int f
     if (mp_rect_w(vis) <= 0 || mp_rect_h(vis) <= 0)
         vis = (struct mp_rect) { 0, 0, w, h };
 
-    reposition_bitmaps(sd, res, current->extend, vis);
-
     // Fold the crop into the single affine transform osd_rescale_bitmaps()
     // already applies, rather than chaining a second scaling.
     if (mp_rect_w(vis) != w || mp_rect_h(vis) != h) {
@@ -946,6 +944,8 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res d, int f
             sub->dh += sub->dh * delta * 2;
         }
     }
+    if (opts->sub_image_position == 1)
+        reposition_bitmaps(sd, res, current->extend, output_visible);
     int sdf_render = render_sdf_subtitles(sd, current, res);
     if (sdf_render > 0)
         res->change_id++;
