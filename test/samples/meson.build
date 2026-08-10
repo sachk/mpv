@@ -11,6 +11,14 @@ audio = custom_target('audio.flac',
               'sine=frequency=1000:duration=2', '@OUTPUT@'],
 )
 
+seek_restart_sample = custom_target('seek-restart.mkv',
+    output: 'seek-restart.mkv',
+    depends: [video, audio],
+    command: [ffmpeg, '-v', 'error', '-y', '-i', video,
+              '-itsoffset', '0.003', '-i', audio, '-map', '0:v:0',
+              '-map', '1:a:0', '-c', 'copy', '@OUTPUT@'],
+)
+
 sub = join_paths(source_root, 'test', 'samples', 'sub.srt')
 img_sub = join_paths(source_root, 'test', 'samples', 'img_sub.idx')
 
@@ -93,6 +101,12 @@ foreach name, cmd: samples
     test(testname, exe, args: [name, target.full_path()],
          depends: target, env: env, suite: 'libmpv')
 endforeach
+
+seek_restart = executable('libmpv-test-seek-restart', '../libmpv_test_seek_restart.c',
+                          include_directories: incdir, dependencies: libmpv_dep)
+test('libmpv-test-seek-restart', seek_restart,
+     args: seek_restart_sample.full_path(), depends: seek_restart_sample,
+     suite: 'libmpv')
 
 
 sdh_default = join_paths(source_root, 'test', 'samples', 'sdh_default.srt')
