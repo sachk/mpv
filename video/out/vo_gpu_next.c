@@ -3106,6 +3106,14 @@ static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
     if (err < 0)
         goto error;
 
+    // The call above leaves err at 0 on success. Every failure below jumps to
+    // `error`, which frees priv and nulls ctx->priv, so returning that 0 tells
+    // mpv_render_context_create the backend initialised — it then breaks out of
+    // the backend loop and calls check_format on a NULL priv, which segfaults.
+    // A software or pre-3.3 GL stack takes that path for real: pl_opengl_create
+    // rejects the context and the crash lands in libmpv_check_format.
+    err = MPV_ERROR_UNSUPPORTED;
+
     p->ra_ctx = p->libmpv_context->ra_ctx;
     libmpv_add_native_resources(p, params);
 
