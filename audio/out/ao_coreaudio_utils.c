@@ -117,6 +117,11 @@ OSStatus ca_select_device(struct ao *ao, char* name, AudioDeviceID *device)
                      kAudioHardwarePropertyDefaultOutputDevice,
                      device);
         CHECK_CA_ERROR("could not get default audio device");
+        if (*device == kAudioObjectUnknown) {
+            MP_ERR(ao, "no default audio output device\n");
+            err = kAudioHardwareBadDeviceError;
+            goto coreaudio_error;
+        }
     }
 
     if (mp_msg_test(ao->log, MSGL_V)) {
