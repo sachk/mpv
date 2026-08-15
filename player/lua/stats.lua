@@ -337,6 +337,12 @@ local function scroll_hint(search)
 end
 
 local function append_perfdata(header, s, dedicated_page)
+    -- Starfish has no performance-data implementation. Querying vo-passes
+    -- would still synchronously dispatch to its real-time VO thread and can
+    -- briefly stall the hardware playback clock whenever this page redraws.
+    if mp.get_property_native("current-vo") == "starfish" then
+        return
+    end
     local vo_p = mp.get_property_native("vo-passes")
     if not vo_p then
         return

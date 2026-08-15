@@ -184,6 +184,8 @@ local function load_profiles(profiles_property)
     end
 end
 
+local hooks_registered = false
+
 mp.observe_property("profile-list", "native", function (_, profiles_property)
     profiles = {}
     watched_properties = {}
@@ -198,10 +200,14 @@ mp.observe_property("profile-list", "native", function (_, profiles_property)
         return
     end
 
+    if not hooks_registered then
+        for _, name in ipairs({"on_load", "on_preloaded", "on_loaded", "on_before_start_file"}) do
+            mp.add_hook(name, 5, on_hook)
+        end
+        hooks_registered = true
+    end
+
     on_idle() -- re-evaluate all profiles immediately
 end)
 
 mp.register_idle(on_idle)
-for _, name in ipairs({"on_load", "on_preloaded", "on_loaded", "on_before_start_file"}) do
-    mp.add_hook(name, 5, on_hook)
-end
