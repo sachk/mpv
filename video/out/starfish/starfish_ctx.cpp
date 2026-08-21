@@ -612,8 +612,9 @@ static void apply_hdr_info(starfish_ctx *ctx) {
 /* ----- session lifecycle ------------------------------------------- */
 
 static bool have_load_config(starfish_ctx *ctx) {
-  return !ctx->video_codec.empty() && ctx->width > 0 && ctx->height > 0 &&
-         ctx->fps_num > 0 && ctx->fps_den > 0;
+  // Frame rate stays optional: containers such as Matroska without a default
+  // frame duration report no FPS, and the load payload simply omits the hint.
+  return !ctx->video_codec.empty() && ctx->width > 0 && ctx->height > 0;
 }
 
 static bool is_loaded_state(pipeline_state s) {
