@@ -747,26 +747,24 @@ static const char *header_value(CURL *c, const char *name)
     return NULL;
 }
 
-static void parse_content_range(CURL *c, int64_t *out_start, int64_t *out_total)
+static int64_t parse_content_range_start(CURL *c)
 {
-    *out_start = *out_total = -1;
     const char *value = header_value(c, "Content-Range");
     if (!value)
-        return;
-    bstr range, total;
-    if (!bstr_split_tok(bstr0(value), "/", &range, &total))
-        return;
-    bstr rest;
-    long long v = bstrtoll(total, &rest, 10);
-    if (rest.len == 0 && v > 0)
-        *out_total = v;
+        return -1;
+    bstr range;
+    if (!bstr_split_tok(bstr0(value), "/", &range, &(bstr){0}))
+        return -1;
     bstr_eatstart0(&range, "bytes");
     bstr start;
     if (!bstr_split_tok(bstr_lstrip(range), "-", &start, &(bstr){0}))
-        return;
-    v = bstrtoll(start, &rest, 10);
-    if (start.len > 0 && rest.len == 0 && v >= 0)
-        *out_start = v;
+        return -1;
+    bstr rest;
+    long long value_start = bstrtoll(start, &rest, 10);
+    return start.len > 0 && rest.len == 0 && value_start >= 0
+        ? value_start : -1;
+}
+
 
 static size_t dynamic_header_callback(char *buffer, size_t size, size_t nitems,
                                       void *userdata)
@@ -847,11 +845,10 @@ static void probe_http(struct priv *p, struct bstr line)
         goto done;
     }
 
-    int64_t range_start, range_total;
-    parse_content_range(p->curl, &range_start, &range_total);
+    int64_t response_start = parse_content_range_start(p->curl);
 
     // A request with an explicit start offset must be honored by the server
-    if (p->start_offset > 0 && range_start != p->start_offset) {
+    if (p->start_offset > 0 && response_start != p->start_offset) {
         MP_ERR(p, "Server ignored range request at offset %" PRId64 "\n",
                p->start_offset);
         goto done;
@@ -946,7 +943,7 @@ static void validate_http_response(struct priv *p, struct bstr line)
         is_http_success(resp) &&
         (!p->seekable ||
          (resp == 206 && p->primary_end > p->request_start &&
-          parse_content_range(header_value(p->curl, "Content-Range"),
+          parse_exact_content_range(header_value(p->curl, "Content-Range"),
                               &start, &end, &total) &&
           start == p->request_start && end == p->primary_end &&
           total == p->content_size));
