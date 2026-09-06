@@ -248,7 +248,7 @@ extern "C" {
  * relational operators (<, >, <=, >=).
  */
 #define MPV_MAKE_VERSION(major, minor) (((major) << 16) | (minor) | 0UL)
-#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 6)
+#define MPV_CLIENT_API_VERSION MPV_MAKE_VERSION(2, 7)
 
 /**
  * The API user is allowed to "#define MPV_ENABLE_DEPRECATED 0" before
@@ -501,6 +501,19 @@ MPV_EXPORT mpv_handle *mpv_create(void);
  * @return error code
  */
 MPV_EXPORT int mpv_initialize(mpv_handle *ctx);
+
+/**
+ * Fork extension: initialize with a NULL-terminated array of command-line
+ * arguments (without argv[0]). These override config-file options before
+ * scripts, input and video output are initialized. Use --name=value syntax.
+ * The array and strings are only borrowed for this call and are not modified.
+ * Passing NULL is equivalent to mpv_initialize().
+ *
+ * This does not prevent scripts or runtime commands from changing options.
+ *
+ * @return error code
+ */
+MPV_EXPORT int mpv_initialize_opts(mpv_handle *ctx, char **options);
 
 /**
  * Disconnect and destroy the mpv_handle. ctx will be deallocated with this
@@ -1954,6 +1967,8 @@ MPV_DEFINE_SYM_PTR(mpv_create)
 #define mpv_create pfn_mpv_create
 MPV_DEFINE_SYM_PTR(mpv_initialize)
 #define mpv_initialize pfn_mpv_initialize
+MPV_DEFINE_SYM_PTR(mpv_initialize_opts)
+#define mpv_initialize_opts pfn_mpv_initialize_opts
 MPV_DEFINE_SYM_PTR(mpv_destroy)
 #define mpv_destroy pfn_mpv_destroy
 MPV_DEFINE_SYM_PTR(mpv_terminate_destroy)

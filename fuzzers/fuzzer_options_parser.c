@@ -21,8 +21,6 @@
 
 #include "common.h"
 
-int mpv_initialize_opts(mpv_handle *ctx, char **options);
-
 #define MAX_INPUT_SIZE 2048
 #define MAX_OPTS_NUM 10000
 

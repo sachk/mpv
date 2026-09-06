@@ -326,6 +326,7 @@ static void init_sym_table(struct mp_script_args *args, void *lib) {
     INIT_SYM(mpv_client_id);
     INIT_SYM(mpv_create);
     INIT_SYM(mpv_initialize);
+    INIT_SYM(mpv_initialize_opts);
     INIT_SYM(mpv_destroy);
     INIT_SYM(mpv_terminate_destroy);
     INIT_SYM(mpv_create_client);

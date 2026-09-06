@@ -32,6 +32,9 @@ API changes
 
 ::
 
+ --- Spool fork ---
+ 2.7    - expose mpv_initialize_opts(): apply command-line overrides after
+          config parsing and before input, script and video initialization.
  --- mpv 0.41.0 ---
  2.6    - add MPV_RENDER_PARAM_BACKEND for selecting the render API backend.
  --- mpv 0.40.0 ---
