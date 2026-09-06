@@ -68,6 +68,11 @@
 #include "osdep/windows_utils.h"
 #endif
 
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+#include <libplacebo/vulkan.h>
+#include "mpv/render_vk.h"
+#endif
+
 
 struct osd_entry {
     pl_tex tex;
@@ -131,6 +136,25 @@ struct priv {
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     pl_opengl libmpv_opengl;
 #endif
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    pl_vulkan libmpv_vulkan;
+    // The caller's image, wrapped once and re-wrapped whenever it hands us a
+    // different one. There is no swapchain on this path: the caller owns
+    // presentation, so this texture is the whole target.
+    pl_tex libmpv_vk_target;
+    // Handing the image back requires a semaphore. A timeline one can be
+    // signalled every frame without anybody waiting on it, which is what is
+    // wanted here: ordering comes from both sides submitting to the same
+    // queue, and libplacebo's own layout barrier carries the dependency.
+    VkSemaphore libmpv_vk_hold_sem;
+    uint64_t libmpv_vk_hold_value;
+    uint64_t libmpv_vk_image;
+    int libmpv_vk_format;
+    int libmpv_vk_w, libmpv_vk_h;
+#endif
+    // Set while a frame is being rendered into a target the caller owns, in
+    // which case there is nothing to start or submit on a swapchain.
+    pl_tex external_target;
     struct vo *libmpv_vo;
     struct mp_hwdec_devices *hwdec_devs;
     struct ra_hwdec_ctx hwdec_ctx;
@@ -1309,6 +1333,12 @@ static void apply_crop(struct pl_frame *frame, struct mp_rect crop,
 
 static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
 {
+    // Nothing to hint at when the caller owns the target: it chose the format
+    // before mpv was handed the image, and says so through the target options
+    // instead.
+    if (!p->sw)
+        return false;
+
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
 
     struct mp_image_params params = {
@@ -1576,8 +1606,23 @@ static bool render_frame(struct priv *p, struct vo *vo, struct vo_frame *frame)
     }
 
     struct pl_swapchain_frame swframe;
-    bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
-    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
+    bool should_draw;
+    if (p->external_target) {
+        // The caller owns the target and its presentation, so there is no
+        // swapchain to ask and nothing to wait for. Colorimetry is left at
+        // the sRGB default and shaped by the target options, which is the only
+        // thing that can describe an image mpv never created.
+        swframe = (struct pl_swapchain_frame) {
+            .fbo = p->external_target,
+            .flipped = false,
+            .color_repr = pl_color_repr_rgb,
+            .color_space = pl_color_space_srgb,
+        };
+        should_draw = true;
+    } else {
+        should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
+    }
+    if (!should_draw || (!p->external_target && !pl_swapchain_start_frame(p->sw, &swframe))) {
         if (frame->current) {
             // Advance the queue state to the current PTS to discard unused frames
             struct pl_queue_params qparams = *pl_queue_params(
@@ -3073,16 +3118,117 @@ static void libmpv_add_native_resources(struct priv *p, mpv_render_param *params
 
 static void libmpv_destroy(struct render_backend *ctx);
 
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+// An imported device presents nothing, so there is no swapchain behind this.
+// It exists because the renderer reaches for one to ask about dithering depth
+// and target colorimetry, and every one of those questions has the same answer
+// here: the caller already decided.
+static const struct ra_swapchain_fns libmpv_external_swapchain_fns = {0};
+
+static int libmpv_init_vulkan(struct render_backend *ctx, struct priv *p,
+                              mpv_render_param *params)
+{
+    mpv_vulkan_init_params *init =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_INIT_PARAMS, NULL);
+    if (!init || !init->instance || !init->physical_device || !init->device)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    p->libmpv_vulkan = pl_vulkan_import(p->pllog, pl_vulkan_import_params(
+        .instance = (VkInstance) init->instance,
+        .get_proc_addr = (PFN_vkGetInstanceProcAddr) init->get_instance_proc_addr,
+        .phys_device = (VkPhysicalDevice) init->physical_device,
+        .device = (VkDevice) init->device,
+        .extensions = init->device_extensions,
+        .num_extensions = init->num_device_extensions,
+        .features = init->device_features,
+        // One queue, the family's first. libplacebo picks within a family and
+        // cannot be told an index, so this is the only arrangement in which
+        // both sides provably submit to the same queue -- which is what lets
+        // the layout barrier order the frame without a semaphore.
+        .queue_graphics = {
+            .index = init->queue_family_index,
+            .count = 1,
+        },
+    ));
+    if (!p->libmpv_vulkan) {
+        MP_FATAL(ctx, "Failed importing the caller's Vulkan device.\n");
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    p->gpu = p->libmpv_vulkan->gpu;
+
+    // The renderer wants a ra_ctx for its timers and for the questions it asks
+    // a swapchain. Give it one over the imported device rather than scatter
+    // null checks through code that has no other reason to know about this.
+    p->ra_ctx = talloc_zero(p, struct ra_ctx);
+    p->ra_ctx->log = ctx->log;
+    p->ra_ctx->global = ctx->global;
+    p->ra_ctx->opts = (struct ra_ctx_opts) { .allow_sw = true };
+    p->ra_ctx->ra = ra_create_pl(p->gpu, ctx->log);
+    if (!p->ra_ctx->ra)
+        return MPV_ERROR_UNSUPPORTED;
+    p->ra_ctx->swapchain = talloc_zero(p, struct ra_swapchain);
+    p->ra_ctx->swapchain->ctx = p->ra_ctx;
+    p->ra_ctx->swapchain->fns = &libmpv_external_swapchain_fns;
+
+    p->libmpv_vk_hold_sem = pl_vulkan_sem_create(p->gpu, pl_vulkan_sem_params(
+        .type = VK_SEMAPHORE_TYPE_TIMELINE,
+    ));
+    if (!p->libmpv_vk_hold_sem) {
+        MP_FATAL(ctx, "Failed creating the image handover semaphore.\n");
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    return 0;
+}
+
+// Wrap the caller's image, reusing the wrapper while it keeps handing us the
+// same one. Wrapping twice is undefined, and a Qt-style renderer hands back
+// the same texture until the item resizes.
+static int libmpv_vulkan_target(struct priv *p, mpv_vulkan_image *image)
+{
+    if (p->libmpv_vk_target && p->libmpv_vk_image == image->image &&
+        p->libmpv_vk_format == image->format &&
+        p->libmpv_vk_w == image->w && p->libmpv_vk_h == image->h)
+        return 0;
+
+    pl_tex_destroy(p->gpu, &p->libmpv_vk_target);
+    p->libmpv_vk_target = pl_vulkan_wrap(p->gpu, pl_vulkan_wrap_params(
+        .image = (VkImage) (uintptr_t) image->image,
+        .width = image->w,
+        .height = image->h,
+        .format = (VkFormat) image->format,
+        .usage = (VkImageUsageFlags) image->usage,
+    ));
+    if (!p->libmpv_vk_target) {
+        MP_ERR(p, "Failed wrapping the caller's VkImage.\n");
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    p->libmpv_vk_image = image->image;
+    p->libmpv_vk_format = image->format;
+    p->libmpv_vk_w = image->w;
+    p->libmpv_vk_h = image->h;
+    return 0;
+}
+#endif
+
 static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
 {
-#if !(HAVE_GL && defined(PL_HAVE_OPENGL))
+#if !((HAVE_GL && defined(PL_HAVE_OPENGL)) || (HAVE_VULKAN && defined(PL_HAVE_VULKAN)))
     return MPV_ERROR_NOT_IMPLEMENTED;
 #else
     char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     if (!api)
         return MPV_ERROR_INVALID_PARAMETER;
-    if (strcmp(api, MPV_RENDER_API_TYPE_OPENGL) != 0)
+    bool vulkan = strcmp(api, MPV_RENDER_API_TYPE_VULKAN) == 0;
+    if (!vulkan && strcmp(api, MPV_RENDER_API_TYPE_OPENGL) != 0)
         return MPV_ERROR_NOT_IMPLEMENTED;
+#if !(HAVE_VULKAN && defined(PL_HAVE_VULKAN))
+    if (vulkan)
+        return MPV_ERROR_NOT_IMPLEMENTED;
+#endif
+#if !(HAVE_GL && defined(PL_HAVE_OPENGL))
+    if (!vulkan)
+        return MPV_ERROR_NOT_IMPLEMENTED;
+#endif
 
     int err = MPV_ERROR_UNSUPPORTED;
     ctx->priv = talloc_zero(NULL, struct priv);
@@ -3095,6 +3241,22 @@ static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
     p->log = ctx->log;
     p->stats = stats_ctx_create(p, ctx->global, "libmpv/gpu-next");
 
+    p->pllog = mppl_log_create(p, p->log);
+    if (!p->pllog)
+        goto error;
+
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    if (vulkan) {
+        err = libmpv_init_vulkan(ctx, p, params);
+        if (err < 0)
+            goto error;
+        err = MPV_ERROR_UNSUPPORTED;
+        libmpv_add_native_resources(p, params);
+        mppl_log_set_probing(p->pllog, false);
+    }
+#endif
+#if HAVE_GL && defined(PL_HAVE_OPENGL)
+    if (!vulkan) {
     p->libmpv_context = talloc_zero(p, struct libmpv_gpu_context);
     *p->libmpv_context = (struct libmpv_gpu_context) {
         .global = ctx->global,
@@ -3119,9 +3281,6 @@ static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
 
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(p, ctx->global, &ra_ctx_conf);
     struct GL *gl = ra_gl_get(p->ra_ctx->ra);
-    p->pllog = mppl_log_create(p, p->log);
-    if (!p->pllog)
-        goto error;
 
     struct pl_opengl_params pl_params = *pl_opengl_params(
         .debug = ctx_opts->debug,
@@ -3146,6 +3305,8 @@ static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
         ));
     if (!p->sw)
         goto error;
+    }
+#endif
 
     p->hwdec_devs = hwdec_devices_create();
     if (!p->hwdec_devs)
@@ -3237,6 +3398,17 @@ static int libmpv_get_target_size(struct render_backend *ctx,
                                   mpv_render_param *params,
                                   int *out_w, int *out_h)
 {
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    mpv_vulkan_image *image =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_IMAGE, NULL);
+    if (image) {
+        if (image->w < 1 || image->h < 1)
+            return MPV_ERROR_INVALID_PARAMETER;
+        *out_w = image->w;
+        *out_h = image->h;
+        return 0;
+    }
+#endif
     mpv_opengl_fbo *fbo =
         get_mpv_render_param(params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
     if (!fbo || fbo->w < 1 || fbo->h < 1)
@@ -3249,6 +3421,29 @@ static int libmpv_get_target_size(struct render_backend *ctx,
 
 static int libmpv_start_frame(struct priv *p, mpv_render_param *params)
 {
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    if (p->libmpv_vulkan) {
+        mpv_vulkan_image *image =
+            get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_IMAGE, NULL);
+        if (!image || image->w < 1 || image->h < 1)
+            return MPV_ERROR_INVALID_PARAMETER;
+
+        int err = libmpv_vulkan_target(p, image);
+        if (err < 0)
+            return err;
+
+        // A wrapped image starts out held by the caller. Hand it over for the
+        // duration of the frame, saying which layout it arrives in; taking it
+        // back afterwards is what leaves it sampleable.
+        pl_vulkan_release_ex(p->gpu, pl_vulkan_release_params(
+            .tex = p->libmpv_vk_target,
+            .layout = (VkImageLayout) image->layout,
+            .qf = VK_QUEUE_FAMILY_IGNORED,
+        ));
+        p->external_target = p->libmpv_vk_target;
+        return 0;
+    }
+#endif
     mpv_opengl_fbo *fbo =
         get_mpv_render_param(params, MPV_RENDER_PARAM_OPENGL_FBO, NULL);
     if (!fbo || fbo->w < 1 || fbo->h < 1)
@@ -3286,6 +3481,26 @@ static int libmpv_render(struct render_backend *ctx, mpv_render_param *params,
         return err;
 
     bool ok = render_frame(p, p->libmpv_vo, frame);
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    if (p->external_target) {
+        // Give the image back in the layout the caller will sample it from,
+        // and flush, so the work is in the queue before whatever the caller
+        // submits next.
+        pl_vulkan_hold_ex(p->gpu, pl_vulkan_hold_params(
+            .tex = p->libmpv_vk_target,
+            .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .qf = VK_QUEUE_FAMILY_IGNORED,
+            .semaphore = {
+                .sem = p->libmpv_vk_hold_sem,
+                .value = ++p->libmpv_vk_hold_value,
+            },
+        ));
+        pl_gpu_flush(p->gpu);
+        p->external_target = NULL;
+        p->frame_pending = false;
+        return ok ? 0 : MPV_ERROR_GENERIC;
+    }
+#endif
     if (ok && p->frame_pending) {
         ok = pl_swapchain_submit_frame(p->sw);
         if (!ok)
@@ -3323,6 +3538,15 @@ static void libmpv_destroy(struct render_backend *ctx)
 
     if (p->sw)
         pl_swapchain_destroy(&p->sw);
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+    if (p->libmpv_vulkan) {
+        // The wrapper goes, the caller's VkImage stays: it was never ours.
+        pl_tex_destroy(p->gpu, &p->libmpv_vk_target);
+        pl_vulkan_sem_destroy(p->gpu, &p->libmpv_vk_hold_sem);
+        pl_vulkan_destroy(&p->libmpv_vulkan);
+        p->external_target = NULL;
+    }
+#endif
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     if (p->libmpv_opengl)
         pl_opengl_destroy(&p->libmpv_opengl);
