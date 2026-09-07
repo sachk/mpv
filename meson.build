@@ -1953,7 +1953,7 @@ if get_option('libmpv')
 
     headers = ['include/mpv/client.h', 'include/mpv/render.h',
                'include/mpv/render_gl.h', 'include/mpv/render_vk.h',
-               'include/mpv/stream_cb.h']
+               'include/mpv/render_d3d11.h', 'include/mpv/stream_cb.h']
     install_headers(headers, subdir: 'mpv')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv

@@ -51,6 +51,7 @@ extern "C" {
  *
  * OpenGL: via MPV_RENDER_API_TYPE_OPENGL, see render_gl.h header.
  * Vulkan: via MPV_RENDER_API_TYPE_VULKAN, see render_vk.h header (fork).
+ * D3D11: via MPV_RENDER_API_TYPE_D3D11, see render_d3d11.h header (fork).
  * Software: via MPV_RENDER_API_TYPE_SW, see section "Software renderer"
  *
  * MPV_RENDER_PARAM_BACKEND can be used to request a renderer backend for the
@@ -457,6 +458,18 @@ typedef enum mpv_render_param_type {
      * Type: mpv_vulkan_image*
      */
     MPV_RENDER_PARAM_VULKAN_IMAGE = 23,
+    /**
+     * Fork extension. Direct3D 11 initialisation parameters, mandatory for
+     * MPV_RENDER_API_TYPE_D3D11.
+     * Type: mpv_d3d11_init_params*
+     */
+    MPV_RENDER_PARAM_D3D11_INIT_PARAMS = 24,
+    /**
+     * Fork extension. The texture to render into, mandatory for
+     * MPV_RENDER_API_TYPE_D3D11 and mpv_render_context_render().
+     * Type: mpv_d3d11_texture*
+     */
+    MPV_RENDER_PARAM_D3D11_TEXTURE = 25,
 } mpv_render_param_type;
 
 /**
@@ -505,6 +518,8 @@ typedef struct mpv_render_param {
 #define MPV_RENDER_API_TYPE_SW "sw"
 // Fork extension. See render_vk.h
 #define MPV_RENDER_API_TYPE_VULKAN "vulkan"
+// Fork extension. See render_d3d11.h
+#define MPV_RENDER_API_TYPE_D3D11 "d3d11"
 
 /**
  * Flags used in mpv_render_frame_info.flags. Each value represents a bit in it.

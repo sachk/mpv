@@ -66,6 +66,7 @@
 #include <libplacebo/d3d11.h>
 #include "video/out/d3d11/ra_d3d11.h"
 #include "osdep/windows_utils.h"
+#include "mpv/render_d3d11.h"
 #endif
 
 #if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
@@ -135,6 +136,14 @@ struct priv {
     struct libmpv_gpu_context *libmpv_context;
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
     pl_opengl libmpv_opengl;
+#endif
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    pl_d3d11 libmpv_d3d11;
+    // The caller's texture, wrapped once and again whenever it hands us a
+    // different one. There is no swapchain here either: the caller presents.
+    pl_tex libmpv_d3d11_target;
+    void *libmpv_d3d11_texture;
+    int libmpv_d3d11_w, libmpv_d3d11_h;
 #endif
 #if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
     pl_vulkan libmpv_vulkan;
@@ -3118,13 +3127,78 @@ static void libmpv_add_native_resources(struct priv *p, mpv_render_param *params
 
 static void libmpv_destroy(struct render_backend *ctx);
 
-#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
+#if (HAVE_VULKAN && defined(PL_HAVE_VULKAN)) || (HAVE_D3D11 && defined(PL_HAVE_D3D11))
 // An imported device presents nothing, so there is no swapchain behind this.
 // It exists because the renderer reaches for one to ask about dithering depth
 // and target colorimetry, and every one of those questions has the same answer
 // here: the caller already decided.
 static const struct ra_swapchain_fns libmpv_external_swapchain_fns = {0};
 
+// The renderer reaches for a ra_ctx for its timers and for the questions only
+// a swapchain can answer. An imported device has neither, so it gets one over
+// the device itself rather than null checks scattered through code with no
+// other reason to know about this.
+static int libmpv_external_ra_ctx(struct render_backend *ctx, struct priv *p)
+{
+    p->ra_ctx = talloc_zero(p, struct ra_ctx);
+    p->ra_ctx->log = ctx->log;
+    p->ra_ctx->global = ctx->global;
+    p->ra_ctx->opts = (struct ra_ctx_opts) { .allow_sw = true };
+    p->ra_ctx->ra = ra_create_pl(p->gpu, ctx->log);
+    if (!p->ra_ctx->ra)
+        return MPV_ERROR_UNSUPPORTED;
+    p->ra_ctx->swapchain = talloc_zero(p, struct ra_swapchain);
+    p->ra_ctx->swapchain->ctx = p->ra_ctx;
+    p->ra_ctx->swapchain->fns = &libmpv_external_swapchain_fns;
+    return 0;
+}
+#endif
+
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+static int libmpv_init_d3d11(struct render_backend *ctx, struct priv *p,
+                             mpv_render_param *params)
+{
+    mpv_d3d11_init_params *init =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_D3D11_INIT_PARAMS, NULL);
+    if (!init || !init->device)
+        return MPV_ERROR_INVALID_PARAMETER;
+
+    p->libmpv_d3d11 = pl_d3d11_create(p->pllog, pl_d3d11_params(
+        .device = (ID3D11Device *) init->device,
+    ));
+    if (!p->libmpv_d3d11) {
+        MP_FATAL(ctx, "Failed taking the caller's Direct3D 11 device.\n");
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    p->gpu = p->libmpv_d3d11->gpu;
+    return libmpv_external_ra_ctx(ctx, p);
+}
+
+// Wrap the caller's texture, reusing the wrapper while it keeps handing us the
+// same one. A Qt-style renderer returns the same texture until the item
+// resizes, and wrapping takes a reference each time.
+static int libmpv_d3d11_target(struct priv *p, mpv_d3d11_texture *texture)
+{
+    if (p->libmpv_d3d11_target && p->libmpv_d3d11_texture == texture->texture &&
+        p->libmpv_d3d11_w == texture->w && p->libmpv_d3d11_h == texture->h)
+        return 0;
+
+    pl_tex_destroy(p->gpu, &p->libmpv_d3d11_target);
+    p->libmpv_d3d11_target = pl_d3d11_wrap(p->gpu, pl_d3d11_wrap_params(
+        .tex = (ID3D11Resource *) texture->texture,
+    ));
+    if (!p->libmpv_d3d11_target) {
+        MP_ERR(p, "Failed wrapping the caller's Direct3D 11 texture.\n");
+        return MPV_ERROR_UNSUPPORTED;
+    }
+    p->libmpv_d3d11_texture = texture->texture;
+    p->libmpv_d3d11_w = texture->w;
+    p->libmpv_d3d11_h = texture->h;
+    return 0;
+}
+#endif
+
+#if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
 static int libmpv_init_vulkan(struct render_backend *ctx, struct priv *p,
                               mpv_render_param *params)
 {
@@ -3156,19 +3230,9 @@ static int libmpv_init_vulkan(struct render_backend *ctx, struct priv *p,
     }
     p->gpu = p->libmpv_vulkan->gpu;
 
-    // The renderer wants a ra_ctx for its timers and for the questions it asks
-    // a swapchain. Give it one over the imported device rather than scatter
-    // null checks through code that has no other reason to know about this.
-    p->ra_ctx = talloc_zero(p, struct ra_ctx);
-    p->ra_ctx->log = ctx->log;
-    p->ra_ctx->global = ctx->global;
-    p->ra_ctx->opts = (struct ra_ctx_opts) { .allow_sw = true };
-    p->ra_ctx->ra = ra_create_pl(p->gpu, ctx->log);
-    if (!p->ra_ctx->ra)
-        return MPV_ERROR_UNSUPPORTED;
-    p->ra_ctx->swapchain = talloc_zero(p, struct ra_swapchain);
-    p->ra_ctx->swapchain->ctx = p->ra_ctx;
-    p->ra_ctx->swapchain->fns = &libmpv_external_swapchain_fns;
+    int ra_err = libmpv_external_ra_ctx(ctx, p);
+    if (ra_err < 0)
+        return ra_err;
 
     p->libmpv_vk_hold_sem = pl_vulkan_sem_create(p->gpu, pl_vulkan_sem_params(
         .type = VK_SEMAPHORE_TYPE_TIMELINE,
@@ -3212,21 +3276,28 @@ static int libmpv_vulkan_target(struct priv *p, mpv_vulkan_image *image)
 
 static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
 {
-#if !((HAVE_GL && defined(PL_HAVE_OPENGL)) || (HAVE_VULKAN && defined(PL_HAVE_VULKAN)))
+#if !((HAVE_GL && defined(PL_HAVE_OPENGL)) || (HAVE_VULKAN && defined(PL_HAVE_VULKAN)) \
+    || (HAVE_D3D11 && defined(PL_HAVE_D3D11)))
     return MPV_ERROR_NOT_IMPLEMENTED;
 #else
     char *api = get_mpv_render_param(params, MPV_RENDER_PARAM_API_TYPE, NULL);
     if (!api)
         return MPV_ERROR_INVALID_PARAMETER;
     bool vulkan = strcmp(api, MPV_RENDER_API_TYPE_VULKAN) == 0;
-    if (!vulkan && strcmp(api, MPV_RENDER_API_TYPE_OPENGL) != 0)
+    bool d3d11 = strcmp(api, MPV_RENDER_API_TYPE_D3D11) == 0;
+    bool opengl = strcmp(api, MPV_RENDER_API_TYPE_OPENGL) == 0;
+    if (!vulkan && !d3d11 && !opengl)
         return MPV_ERROR_NOT_IMPLEMENTED;
 #if !(HAVE_VULKAN && defined(PL_HAVE_VULKAN))
     if (vulkan)
         return MPV_ERROR_NOT_IMPLEMENTED;
 #endif
+#if !(HAVE_D3D11 && defined(PL_HAVE_D3D11))
+    if (d3d11)
+        return MPV_ERROR_NOT_IMPLEMENTED;
+#endif
 #if !(HAVE_GL && defined(PL_HAVE_OPENGL))
-    if (!vulkan)
+    if (opengl)
         return MPV_ERROR_NOT_IMPLEMENTED;
 #endif
 
@@ -3255,8 +3326,18 @@ static int libmpv_init(struct render_backend *ctx, mpv_render_param *params)
         mppl_log_set_probing(p->pllog, false);
     }
 #endif
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (d3d11) {
+        err = libmpv_init_d3d11(ctx, p, params);
+        if (err < 0)
+            goto error;
+        err = MPV_ERROR_UNSUPPORTED;
+        libmpv_add_native_resources(p, params);
+        mppl_log_set_probing(p->pllog, false);
+    }
+#endif
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
-    if (!vulkan) {
+    if (opengl) {
     p->libmpv_context = talloc_zero(p, struct libmpv_gpu_context);
     *p->libmpv_context = (struct libmpv_gpu_context) {
         .global = ctx->global,
@@ -3398,6 +3479,17 @@ static int libmpv_get_target_size(struct render_backend *ctx,
                                   mpv_render_param *params,
                                   int *out_w, int *out_h)
 {
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    mpv_d3d11_texture *texture =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_D3D11_TEXTURE, NULL);
+    if (texture) {
+        if (texture->w < 1 || texture->h < 1)
+            return MPV_ERROR_INVALID_PARAMETER;
+        *out_w = texture->w;
+        *out_h = texture->h;
+        return 0;
+    }
+#endif
 #if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
     mpv_vulkan_image *image =
         get_mpv_render_param(params, MPV_RENDER_PARAM_VULKAN_IMAGE, NULL);
@@ -3421,6 +3513,31 @@ static int libmpv_get_target_size(struct render_backend *ctx,
 
 static int libmpv_start_frame(struct priv *p, mpv_render_param *params)
 {
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (p->libmpv_d3d11) {
+        mpv_d3d11_texture *texture =
+            get_mpv_render_param(params, MPV_RENDER_PARAM_D3D11_TEXTURE, NULL);
+        if (!texture || !texture->texture || texture->w < 1 || texture->h < 1)
+            return MPV_ERROR_INVALID_PARAMETER;
+
+        int err = libmpv_d3d11_target(p, texture);
+        if (err < 0)
+            return err;
+        // Nothing to hand over: one device, one immediate context, and the
+        // caller is not using it while this runs.
+        p->external_target = p->libmpv_d3d11_target;
+        return 0;
+    }
+#endif
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (p->libmpv_d3d11) {
+        // The wrapper goes and its reference with it; the caller's texture and
+        // device stay, because neither was ever ours.
+        pl_tex_destroy(p->gpu, &p->libmpv_d3d11_target);
+        pl_d3d11_destroy(&p->libmpv_d3d11);
+        p->external_target = NULL;
+    }
+#endif
 #if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
     if (p->libmpv_vulkan) {
         mpv_vulkan_image *image =
@@ -3481,6 +3598,16 @@ static int libmpv_render(struct render_backend *ctx, mpv_render_param *params,
         return err;
 
     bool ok = render_frame(p, p->libmpv_vo, frame);
+#if HAVE_D3D11 && defined(PL_HAVE_D3D11)
+    if (p->libmpv_d3d11 && p->external_target) {
+        // The immediate context orders this against whatever the caller draws
+        // next, so flushing is the whole of the handover.
+        pl_gpu_flush(p->gpu);
+        p->external_target = NULL;
+        p->frame_pending = false;
+        return ok ? 0 : MPV_ERROR_GENERIC;
+    }
+#endif
 #if HAVE_VULKAN && defined(PL_HAVE_VULKAN)
     if (p->external_target) {
         // Give the image back in the layout the caller will sample it from,
